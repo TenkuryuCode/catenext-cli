@@ -1,119 +1,178 @@
 # Catenext CLI
 
-Catenext membantu agen coding meneruskan tugas antar-IDE, terminal, dan perangkat. CLI dan server
-MCP lokal mengambil task dari antrean proyek, mencatat lease dan handoff, lalu menunjukkan kapan
-pekerjaan siap direview atau dipakai task hilir.
+Satu antrean untuk semua agen AI coding Anda. Catenext mengunci task agar dua agen tidak mengerjakan
+hal yang sama, meneruskan catatan serah terima (handoff) ke agen berikutnya, dan membuka task baru
+hanya setelah dependensinya selesai. Kode sumber tetap di repo Anda.
 
-[Dashboard](https://catenext.mapan.digital) · [Paket npm](https://www.npmjs.com/package/catenext) ·
-[Changelog](CHANGELOG.md) · [Laporkan masalah](https://github.com/TenkuryuCode/catenext-cli/issues)
+Paket ini berisi CLI `catenext` dan server MCP lokal untuk Claude Code, Cursor, Codex, OpenCode,
+dan agen lain.
 
-## Mulai dari repo Anda
+[Dokumentasi](https://catenext.mapan.digital/docs) ·
+[Dashboard](https://catenext.mapan.digital) ·
+[npm](https://www.npmjs.com/package/catenext) ·
+[Changelog](CHANGELOG.md) ·
+[Laporkan masalah](https://github.com/TenkuryuCode/catenext-cli/issues)
 
-Butuh Node.js **22 atau lebih baru** dan satu proyek Catenext. Buat proyek dan epic di Dashboard,
-lalu buat task atau setujui rencana yang diajukan agen. Salin ID proyek untuk langkah berikutnya.
+## Mulai dalam 10 menit
+
+Butuh Node.js **22 atau lebih baru** dan akun di [catenext.mapan.digital](https://catenext.mapan.digital/signup).
+
+1. **Buat proyek di Dashboard.** Setelah proyek dibuat, Dashboard menampilkan *master prompt*.
+2. **Login dari terminal**, sekali per komputer:
+
+   ```bash
+   npx -y catenext login
+   ```
+
+3. **Tempel master prompt ke agen utama Anda.** Agen itu menjadi *orchestrator*: menjalankan `init`
+   di setiap folder repo, mengusulkan persona, membuat subagent, dan menyusun blueprint bersama Anda.
+4. **Setujui rencana di Dashboard.** Task yang diajukan agen masuk DRAFT sampai Anda setujui.
+
+Lebih suka menjalankan sendiri? Ini setara dengan langkah 3:
 
 ```bash
-npx -y catenext login
-cd /path/ke/repo
-PROJECT_ID='ganti-dengan-id-proyek'
-npx -y catenext init --project "$PROJECT_ID" --dry-run
-npx -y catenext init --project "$PROJECT_ID"
-npx -y catenext next
+cd ~/code/backend
+npx -y catenext init --project <project_id> --repo be --dry-run   # lihat perubahan dulu
+npx -y catenext init --project <project_id> --repo be
+npx -y catenext sync                                               # subagent Claude Code per persona
 ```
 
-`login` meminta persetujuan lewat browser. Gunakan `--no-browser` untuk melihat tautan di terminal,
-atau `--with-key` untuk memakai API key dari **Keamanan & Akses**. Untuk server sendiri,
-tambahkan `--api-url` saat login, atau pakai `CATENEXT_API_URL`.
+`init` hanya menulis `.catenext/config.yaml`, entri MCP di `.mcp.json` dan `.cursor/mcp.json`,
+satu baris `.gitignore`, dan satu blok di `AGENTS.md`. Mulai ulang IDE setelahnya.
+`catenext remove` membersihkan semuanya.
 
-`init` memasang MCP untuk Claude Code dan Cursor, mencatat identitas repo di `.catenext/config.yaml`,
-dan menambahkan petunjuk ke `AGENTS.md`. Mulai ulang klien setelah setup. Untuk klien MCP stdio
-lain, arahkan server ke perintah `npx -y catenext mcp` dengan folder kerja di root repo, atau
-berikan `--root` saat klien memakai folder kerja lain. Gunakan `--repo` untuk menetapkan nama repo
-yang sama pada perangkat dan checkout berbeda.
+## Orchestrator dan subagent
 
-Jika lebih sering memakai terminal, instal dengan `npm install -g catenext`. Contoh di bawah
-memakai perintah `catenext`, yang juga bisa dijalankan dengan awalan `npx -y`.
-Perintah review, worktree, dan skill berbasis SHA memakai CLI **0.2.0 atau lebih baru**.
-Cek versi aktif dengan `catenext --version`.
+- **Orchestrator** adalah agen utama di IDE atau CLI Anda. Aturannya ditulis `init` ke `AGENTS.md`:
+  baca konteks proyek, pecah fitur menjadi task, delegasikan ke subagent, tinjau hasilnya, dan minta
+  revisi bila perlu.
+- **Persona** adalah subagent dengan nama, role, aturan, dan repo yang dipegang (mis. `bambang`,
+  backend, repo `be`). Persona tingkat workspace berlaku sebagai master; persona proyek dengan alias
+  yang sama mewarisi aturannya dan menambahkan repo.
+
+```bash
+catenext persona set bambang --role backend --repo be
+catenext persona set mira --role frontend --repo fe
+catenext board                      # semua task lintas repo
+```
 
 ## Ambil dan serahkan task
 
 ```bash
-catenext next
-TASK_ID='ganti-dengan-id-task'
-catenext claim "$TASK_ID"
-# Kerjakan task, jalankan tes, lalu commit.
-catenext done "$TASK_ID" --notes "Endpoint siap dipakai UI." --verify "pnpm test"
+catenext next --as bambang
+catenext claim <task_id> --as bambang
+# kerjakan, jalankan tes, commit
+catenext done <task_id> --notes "Endpoint /login siap dipakai UI." --verify "pnpm test"
 ```
 
-Gunakan `next --as bambang` dan `claim "$TASK_ID" --as bambang` untuk mengambil task sesuai
-persona yang sudah dibuat di proyek. Jika pekerjaan buntu, laporkan dengan
-`catenext block "$TASK_ID" --category missing_env --reason "Konfigurasi SMTP_HOST belum tersedia."`.
+Buntu? `catenext block <task_id> --category missing_env --reason "SMTP_HOST belum diisi."`
+Perlu berhenti tanpa blocker? `catenext release <task_id>`.
+
+## Banyak repo dalam satu proyek
+
+Jalankan `init` di setiap folder dengan nama repo berbeda:
+
+```bash
+cd ~/code/api && npx -y catenext init --project <project_id> --repo be
+cd ~/code/web && npx -y catenext init --project <project_id> --repo fe
+```
+
+Task milik persona yang memegang satu repo otomatis diarahkan ke repo itu. Persona hanya bisa
+mengambil task dari folder repo yang ia pegang, jadi subagent selalu bekerja di checkout yang benar.
+
+## Revisi tanpa task baru
+
+Hasil yang perlu diperbaiki kembali ke kolom **Revisi** sebagai task yang sama, lengkap dengan
+feedback, branch, dan PR-nya:
+
+```bash
+catenext revise <task_id> --feedback "Validasi email belum menolak spasi."
+catenext revise <task_id> --feedback "Perlu tes E2E." --to qori   # ganti penanggung jawab
+catenext assign <task_id> --to mira                                # untuk task yang belum dikerjakan
+```
+
+## Dokumen proyek
+
+Blueprint, ERD, kontrak API, dan keputusan arsitektur disimpan di Cloud agar sesi berikutnya, di
+IDE atau komputer mana pun, membaca konteks yang sama.
+
+```bash
+catenext doc list
+catenext doc get blueprint
+catenext doc save erd --kind erd --file erd.md --version 0
+```
+
+`--version` diisi versi yang terakhir Anda baca (`0` untuk dokumen baru). Bila sesi lain sudah
+menyimpan lebih dulu, simpanan ditolak alih-alih menimpa.
 
 ## Kerja paralel dan review PR
 
-Dari worktree dengan branch kerja sendiri, klaim task memakai `--worktree`. Salin ID lease dari
-hasil claim, lalu sertakan saat menyerahkan task, melaporkan blocker, atau melepasnya.
-`catenext next --lease "$LEASE_ID"` memperpanjang lease aktif.
+Dua agen bisa bekerja di repo yang sama bila branch-nya berbeda:
 
 ```bash
-TASK_ID='ganti-dengan-id-task-untuk-pr'
-catenext claim "$TASK_ID" --worktree
-LEASE_ID='ganti-dengan-id-lease-worktree'
-PR_URL='https://github.com/owner/repo/pull/42'
-# Setelah commit didorong dan PR dibuat.
-catenext done "$TASK_ID" --lease "$LEASE_ID" --notes "Kontrak API siap direview." \
-  --verify "pnpm test" --pr "$PR_URL" --base main
-```
-
-Handoff dengan PR masuk `NEEDS_REVIEW`. Reviewer agen memakai API key berbeda dari implementer.
-Manusia juga bisa review melalui tab **Pull request** di Dashboard. Jika pindah perangkat,
-isi `TASK_ID` dari hasil `review list`.
-
-```bash
+catenext claim <task_id> --worktree
+catenext done <task_id> --lease <lease_id> --notes "Kontrak API siap direview." \
+  --verify "pnpm test" --pr https://github.com/owner/repo/pull/42 --base main
 catenext review list
-catenext review claim "$TASK_ID"
-REVIEW_LEASE='ganti-dengan-lease-review'
-HEAD_SHA='ganti-dengan-sha-lengkap-dari-claim'
-catenext review submit "$TASK_ID" --lease "$REVIEW_LEASE" --sha "$HEAD_SHA" \
-  --decision approve --feedback "Kontrak API dan hasil tes sudah diperiksa."
-# Sesudah PR di-merge di GitHub.
-catenext review refresh "$TASK_ID"
+catenext review claim <task_id>
+catenext review submit <task_id> --lease <review_lease> --sha <head_sha> \
+  --decision approve --feedback "Kontrak API dan tes sudah diperiksa."
 ```
 
-Gunakan `--decision request_changes` untuk meminta revisi. Commit baru perlu review baru.
-Task hilir terbuka setelah persetujuan yang diwajibkan terpenuhi dan merge GitHub terverifikasi.
-PR privat memerlukan akses baca dari server Catenext ke repo GitHub tersebut.
+Task hilir terbuka setelah persetujuan terpenuhi dan merge di GitHub terverifikasi. Commit baru di
+PR butuh review baru.
 
-## Skill, konfigurasi, dan MCP
+## Daftar perintah
 
-- Bagikan skill melalui Git di `.catenext/skills/`. Gunakan `catenext skill load nama-skill` untuk
-  membaca versi checkout atau tambahkan `--revision "$HEAD_SHA"` untuk membaca versi commit PR.
-- `catenext sync` memperbarui konfigurasi yang dikelola CLI dan membuat file subagent Claude Code
-  dari persona proyek. Indeks skill bersama diperbarui dari checkout default branch `origin` yang
-  sejajar dengan ref remote. Gunakan `sync --dry-run` untuk meninjau perubahan atau `sync --fix`
-  untuk memperbaiki entri MCP yang basi atau duplikat.
-- `catenext remove --dry-run` menampilkan perubahan sebelum `remove` membersihkan setup repo.
-  Opsi `--all` ikut menghapus skill repo. Kredensial login tetap disimpan di luar repo.
-- `catenext epic`, `task create`, dan `persona` tersedia untuk merencanakan dari terminal.
-  Rencana agen masuk sebagai draft untuk ditinjau di Dashboard.
+| CLI | Tool MCP | Fungsi |
+| --- | --- | --- |
+| `login` | - | Masuk lewat browser (`--no-browser`, `--with-key`, `--api-url`) |
+| `init --project ID --repo NAMA` | - | Hubungkan folder repo |
+| `sync` | - | Perbarui setup, indeks skill, subagent per persona (`--dry-run`, `--fix`) |
+| `board` | `get_project_board` | Papan lintas repo untuk orchestrator |
+| `next` | `get_ready_tasks` | Task siap untuk repo ini |
+| `claim ID` | `claim_task` | Kunci task, baca instruksi dan handoff sebelumnya |
+| `done ID` | `complete_handoff` | Selesaikan dengan handoff |
+| `block ID` / `release ID` | `report_blocker` / `release_task` | Laporkan buntu / lepas task |
+| `revise ID` / `assign ID` | `manage_task` | Kembalikan ke Revisi / ganti penanggung jawab |
+| `persona list` / `persona set` | `list_personas` / `upsert_persona` | Kelola persona proyek |
+| `doc list` / `doc get` / `doc save` | `get_document` / `save_document` | Dokumen proyek di Cloud |
+| `epic`, `task create` | `list_epics`, `create_epic`, `create_tasks` | Rencanakan dari terminal (masuk DRAFT) |
+| `review` | `review_pull_request` | Antrean dan keputusan review PR |
+| `skill load NAMA` | `load_skill`, `save_repo_skill` | Skill repo di `.catenext/skills/` |
+| `remove` | - | Hapus setup Catenext dari repo |
 
-Tool MCP utama untuk eksekusi adalah `get_project_context`, `get_ready_tasks`, `claim_task`,
-`complete_handoff`, `report_blocker`, dan `release_task`. Gunakan `review_pull_request` untuk
-siklus review, serta `load_skill` dan `save_repo_skill` untuk skill. Jalankan `catenext --help`
-atau `catenext review --help` untuk opsi terminal.
+Semua perintah menerima `--json`. Jalankan `catenext --help` untuk opsi lengkap.
 
-## Data yang dibagikan
+## Data yang dikirim
 
-Kode sumber dan isi skill tetap di Git atau di perangkat. Catenext Cloud menerima metadata task,
-indeks skill, dan ringkasan handoff. CLI menyensor pola kredensial yang dikenal sebelum mengirim
-teks handoff. Simpan API key secara lokal di `~/.catenext/credentials.json`.
+| Disimpan di Cloud | Tetap di repo atau komputer Anda |
+| --- | --- |
+| Rencana, status, dan lock task | Seluruh kode sumber |
+| Ringkasan handoff (path file, keputusan, perintah tes) | Isi skill repo |
+| Indeks skill (nama dan kapan dipakai) | API key (`~/.catenext/credentials.json`) |
+| Dokumen proyek yang Anda simpan | Konfigurasi MCP IDE |
+
+CLI menyensor pola secret yang dikenal sebelum mengirim teks apa pun.
+
+## Kalau ada yang macet
+
+| Gejala | Yang perlu dilakukan |
+| --- | --- |
+| Task tidak muncul di `next` | Pastikan rencana sudah disetujui, dependensi sudah DONE, dan Anda di folder repo yang sesuai |
+| `repo_busy` | Selesaikan (`done`) atau lepas (`release`) task yang sedang dipegang, atau pakai `--worktree` |
+| `persona_repo_mismatch` | Pindah ke folder repo yang dipegang persona itu |
+| `document_version_conflict` | Baca ulang dokumen, gabungkan perubahan, lalu simpan lagi |
+| `quota_exceeded` | Kuota paket habis; pesan error menyebut kuota mana dan kapan direset |
+| Tool MCP tidak terbaca | Mulai ulang IDE, lalu `catenext sync --fix` |
+
+Panduan lengkap: [catenext.mapan.digital/docs](https://catenext.mapan.digital/docs).
 
 ## Build dari source
 
-Repo ini adalah mirror publik CLI. Rilis npm dibangun dari mirror ini dengan
-[npm provenance](https://docs.npmjs.com/generating-provenance-statements). Direktori `src/`
-berisi CLI dan server MCP. `shared/src/` berisi skema dan kontrak yang dipakai saat build.
+Repo ini adalah mirror publik CLI. Rilis npm dibangun dari sini dengan
+[npm provenance](https://docs.npmjs.com/generating-provenance-statements). `src/` berisi CLI dan
+server MCP; `shared/src/` berisi skema yang dipakai saat build.
 
 ```bash
 pnpm install --frozen-lockfile
