@@ -9,6 +9,7 @@ const adel = {
   alias: "adel",
   role: "backend",
   rules: ["Hanya apps/api"],
+  repos: ["be"],
   scope: "project" as const,
 };
 
@@ -19,6 +20,7 @@ describe("subagent persona", () => {
     expect(md).toContain(SUBAGENT_MARKER);
     expect(md).toContain('`agent_alias: "adel"`');
     expect(md).toContain("- Hanya apps/api");
+    expect(md).toContain("Repo yang dipegang: `be`");
   });
 
   it("membuat, memperbarui, menghapus file Catenext saja, dan tidak menimpa file manusia", async () => {
@@ -28,7 +30,7 @@ describe("subagent persona", () => {
 
     const first = await planSubagents(root, [
       adel,
-      { alias: "citra", role: "architect", rules: [], scope: "project" },
+      { alias: "citra", role: "architect", rules: [], repos: [], scope: "project" },
     ]);
     expect(first.skipped).toEqual([join(".claude", "agents", "citra.md")]);
     await applyFileEdits(root, first.edits);

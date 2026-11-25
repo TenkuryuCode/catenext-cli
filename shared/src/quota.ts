@@ -28,6 +28,16 @@ export const QUOTA_DIMENSIONS = [
   "personas",
   /** Indeks skill per repo yang disinkronkan ke Cloud. */
   "skills",
+  /** Dokumen proyek di Cloud (blueprint, ERD, ...) di workspace. */
+  "documents",
+  /** Panjang maksimum satu dokumen (karakter). Pemakaian = dokumen terpanjang. */
+  "document_chars",
+  /** Repo yang dikenal satu proyek (mis. be, fe, qa). Pemakaian = proyek dengan repo terbanyak. */
+  "repos_per_project",
+  /** Task yang dipindah ke kolom Revisi per bulan oleh manusia (Web) atau orchestrator. */
+  "revisions_per_month",
+  /** Task yang sedang dikerjakan bersamaan (IN_PROGRESS) di workspace. */
+  "active_tasks",
 ] as const;
 export const QuotaDimensionSchema = z.enum(QUOTA_DIMENSIONS);
 export type QuotaDimension = z.infer<typeof QuotaDimensionSchema>;
@@ -51,6 +61,11 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       read_calls_per_month: 5000,
       personas: 3,
       skills: 10,
+      documents: 2,
+      document_chars: 5_000,
+      repos_per_project: 2,
+      revisions_per_month: 5,
+      active_tasks: 1,
     },
     retention_days: 14,
     rate_per_minute: 60,
@@ -64,6 +79,11 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       read_calls_per_month: 200000,
       personas: null,
       skills: null,
+      documents: 50,
+      document_chars: 60_000,
+      repos_per_project: null,
+      revisions_per_month: null,
+      active_tasks: null,
     },
     retention_days: 90,
     rate_per_minute: 300,
@@ -77,6 +97,11 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       read_calls_per_month: 1000000,
       personas: null,
       skills: null,
+      documents: 50,
+      document_chars: 60_000,
+      repos_per_project: null,
+      revisions_per_month: null,
+      active_tasks: null,
     },
     retention_days: 365,
     rate_per_minute: 600,
@@ -97,6 +122,11 @@ export const QUOTA_LABELS: Record<QuotaDimension, string> = {
   read_calls_per_month: "Panggilan agen (baca) bulan ini",
   personas: "Persona",
   skills: "Indeks skill per repo",
+  documents: "Dokumen proyek",
+  document_chars: "Karakter per dokumen",
+  repos_per_project: "Repo per proyek",
+  revisions_per_month: "Revisi bulan ini",
+  active_tasks: "Task dikerjakan bersamaan",
 };
 
 /** `error.details` untuk kode `quota_exceeded` (HTTP 402). */

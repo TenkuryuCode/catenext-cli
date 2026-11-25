@@ -6,6 +6,7 @@ import {
   CompleteHandoffInput,
   HANDOFF_LIMITS,
   type HandoffSummary,
+  ManageTaskInput,
   type McpToolOutput,
   ReportBlockerInput,
   ReviewInput,
@@ -236,4 +237,26 @@ export async function taskReview(api: AgentApi, input: unknown, json: boolean) {
     if (result.warning) console.error(result.warning);
   }
   if ("warning" in result && result.warning) process.exitCode = 1;
+}
+
+/** Orchestrator: kembalikan task ke kolom Revisi atau tetapkan persona/role (manage_task). */
+export async function taskManage(api: AgentApi, input: unknown, json: boolean) {
+  const body = prepare(ManageTaskInput, input, ["action", "task_id", "agent_alias", "role"]);
+  const res = await api.post<McpToolOutput<"manage_task">>("tasks/manage", body);
+  if (json) return console.log(JSON.stringify(res, null, 2));
+  const owner = res.persona ? `@${res.persona}` : res.role ? `role ${res.role}` : "tanpa persona";
+  if (body.action === "request_revision") {
+    console.log(
+      `✓ Task dipindah ke kolom Revisi (revisi ke-${res.revision_count}) untuk ${owner}.`,
+    );
+    console.log(
+      res.persona
+        ? `  Delegasikan ke subagent ${res.persona}; ia akan mengambilnya lewat claim_task.`
+        : "  Subagent dengan role yang cocok dapat mengambilnya lewat claim_task.",
+    );
+    if (res.stale_task_ids.length > 0)
+      console.log(`  ${res.stale_task_ids.length} task hilir ditandai stale.`);
+  } else {
+    console.log(`✓ Penanggung jawab task: ${owner} (status ${res.status}).`);
+  }
 }

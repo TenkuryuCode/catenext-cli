@@ -10,6 +10,35 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.3.0] - 2026-11-25
+
+### Ditambahkan
+- Orchestrator: agen utama sesi menjadi orchestrator, persona menjadi subagent. `catenext init`
+  menulis aturan orchestrator di blok `AGENTS.md`; Web menampilkan **master prompt** yang sama
+  setelah proyek dibuat (tombol *Master prompt* di halaman proyek).
+- MCP `manage_task` (CLI `catenext revise`, `catenext assign`): revisi memindahkan task
+  NEEDS_REVIEW/DONE ke kolom Revisi tanpa membuat task baru, opsional mengganti persona;
+  `assign` menetapkan persona/role task yang belum dikerjakan.
+- Multi-repo: persona proyek memegang repo (`repos`, CLI `catenext persona set --repo be`); task
+  tanpa `target_repo` diarahkan ke repo persona; claim dari checkout repo lain ditolak
+  (`persona_repo_mismatch`). MCP `get_project_board` (CLI `catenext board`) menampilkan papan
+  lintas repo untuk orchestrator.
+- Dokumen proyek di Cloud (blueprint, ERD, arsitektur, kontrak API, keputusan): MCP
+  `get_document`/`save_document` (CLI `catenext doc list|get|save`) dengan `expected_version`
+  agar sesi lain tidak tertimpa; tab *Dokumen* di Web. `get_project_context` membawa
+  `project_repos` dan indeks dokumen.
+- Kuota Free per fitur: 2 dokumen (maks. 5.000 karakter), 2 repo per proyek, 5 revisi per bulan,
+  1 task dikerjakan bersamaan. Pro/Team longgar.
+
+### Diubah
+- `upsert_persona` / `catenext persona set` tanpa aturan kini mempertahankan aturan lama; persona
+  proyek baru mewarisi aturan persona master (workspace) beralias sama. Kirim `rules: []` untuk
+  mengosongkan.
+- Subagent Claude Code (`catenext sync`) memuat repo yang dipegang dan batas subagent.
+- Web: landing `/` menegaskan value prop literal (orkestrasi task antar-agen AI coding), brand
+  Catenext di hero, bagian masalah→solusi, fitur dirapikan, tipografi Bricolage/Figtree hanya di
+  landing (dashboard tetap system stack), dan metadata SEO diselaraskan.
+
 ## [0.2.0] - 2026-11-25
 
 ### Ditambahkan

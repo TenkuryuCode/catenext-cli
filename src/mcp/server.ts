@@ -3,9 +3,13 @@ import {
   CompleteHandoffInput,
   CreateEpicToolInput,
   CreateTasksInput,
+  GetDocumentInput,
+  GetProjectBoardInput,
+  ManageTaskInput,
   MCP_TOOLS,
   ReportBlockerInput,
   ReviewInput,
+  SaveDocumentInput,
   SaveRepoSkillInput,
   UpsertPersonaInput,
 } from "@catenext/shared";
@@ -25,6 +29,10 @@ export const LOCAL_TOOLS = [
   "report_blocker",
   "review_pull_request",
   "release_task",
+  "manage_task",
+  "get_project_board",
+  "get_document",
+  "save_document",
   "list_epics",
   "create_epic",
   "create_tasks",
@@ -38,7 +46,10 @@ export const SERVER_INSTRUCTIONS = [
   "Catenext mengatur estafet task antar-agen AI untuk repo ini.",
   "Alur: get_project_context -> get_ready_tasks -> claim_task -> kerjakan & tes -> complete_handoff.",
   "Merencanakan: list_epics/create_epic -> create_tasks (masuk DRAFT, disetujui manusia di Web sebelum bisa dikerjakan).",
+  "Orchestrator = agen utama sesi (bukan subagent persona): ia merencanakan, mendelegasikan task ke subagent per persona, dan meninjau hasilnya. Revisi atas task yang sudah diserahkan memakai manage_task action request_revision (task pindah ke kolom Revisi dan diambil lagi oleh persona penanggung jawabnya); jangan membuat task baru untuk revisi. manage_task action assign menetapkan persona/role task. Subagent persona tidak memakai manage_task maupun create_tasks.",
   'Persona: list_personas/upsert_persona untuk alias, role, dan aturan agen di proyek ini. Setiap task bisa punya persona penanggung jawab; bila diminta bekerja sebagai persona (mis. "adel, kerjakan"), kirim agent_alias-nya ke get_project_context, get_ready_tasks, dan claim_task, lalu patuhi aturan persona dari hasil claim_task.',
+  "Multi-repo: satu proyek bisa membawahi banyak repo (mis. be dan fe di folder terpisah). Orchestrator memakai get_project_board untuk melihat semua task lintas repo dan persona pemegang tiap repo, lalu mendelegasikan ke subagent yang bekerja dari folder repo tujuan.",
+  "Dokumen proyek (blueprint, ERD, arsitektur, keputusan) tersimpan di Cloud: indeksnya di get_project_context, isi lewat get_document, perbarui lewat save_document dengan expected_version. Baca dokumen relevan di awal sesi agar konteks tidak hilang antar sesi/IDE/CLI.",
   "Skill repo: indeksnya ada di get_project_context; panggil load_skill hanya bila relevan, dan save_repo_skill untuk mencatat konvensi/pitfall yang ditemukan (maks. 500 kata, tanpa code dump).",
   "Bila buntu, panggil report_blocker. Jangan menyalin kode atau secret ke handoff; rujuk path file.",
   "Jangan mengedit .catenext/config.yaml atau file konfigurasi MCP IDE.",
@@ -267,6 +278,42 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
         }
         return json(await send(api, parsed.data), notes);
       });
+
+  server.registerTool(
+    "manage_task",
+    { description: MCP_TOOLS.manage_task.description, inputSchema: MCP_TOOLS.manage_task.input },
+    scrubbedWrite(ManageTaskInput, ["action", "task_id", "agent_alias", "role"], (api, payload) =>
+      api.post("tasks/manage", payload),
+    ),
+  );
+
+  server.registerTool(
+    "get_project_board",
+    {
+      description: MCP_TOOLS.get_project_board.description,
+      inputSchema: MCP_TOOLS.get_project_board.input,
+    },
+    (input) =>
+      call(async ({ api }) => json(await api.post("board", GetProjectBoardInput.parse(input)))),
+  );
+
+  server.registerTool(
+    "get_document",
+    { description: MCP_TOOLS.get_document.description, inputSchema: MCP_TOOLS.get_document.input },
+    (input) =>
+      call(async ({ api }) => json(await api.post("documents/get", GetDocumentInput.parse(input)))),
+  );
+
+  server.registerTool(
+    "save_document",
+    {
+      description: MCP_TOOLS.save_document.description,
+      inputSchema: MCP_TOOLS.save_document.input,
+    },
+    scrubbedWrite(SaveDocumentInput, ["slug", "kind", "expected_version"], (api, payload) =>
+      api.put("documents", payload),
+    ),
+  );
 
   server.registerTool(
     "list_epics",

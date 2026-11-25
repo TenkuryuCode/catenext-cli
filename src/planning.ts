@@ -2,7 +2,11 @@ import { readFile } from "node:fs/promises";
 import {
   CreateEpicToolInput,
   CreateTasksInput,
+  type DocumentIndexEntry,
+  GetDocumentInput,
+  GetProjectBoardInput,
   type McpToolOutput,
+  SaveDocumentInput,
   UpsertPersonaInput,
 } from "@catenext/shared";
 import type { z } from "zod";
@@ -142,7 +146,10 @@ export async function personaList(api: AgentApi, asJson: boolean) {
     );
   }
   for (const p of res.personas) {
-    console.log(`${p.alias} (${p.role}, ${p.scope === "project" ? "proyek" : "workspace"})`);
+    const repos = p.repos.length > 0 ? `, repo ${p.repos.join("/")}` : "";
+    console.log(
+      `${p.alias} (${p.role}${repos}, ${p.scope === "project" ? "proyek" : "workspace"})`,
+    );
     for (const r of p.rules) console.log(`  - ${r}`);
   }
 }
@@ -153,11 +160,100 @@ export async function personaSet(
   role: string,
   rules: string[],
   asJson: boolean,
+  repos?: string[],
 ) {
-  const body = prepare(UpsertPersonaInput, { alias, role, rules }, ["alias", "role"]);
+  const body = prepare(
+    UpsertPersonaInput,
+    {
+      alias,
+      role,
+      // Tanpa --rule: aturan lama dipertahankan (persona baru mewarisi persona master).
+      ...(rules.length > 0 ? { rules } : {}),
+      ...(repos ? { repos } : {}),
+    },
+    ["alias", "role", "repos"],
+  );
   const res = await api.put<McpToolOutput<"upsert_persona">>("personas", body);
   if (asJson) return console.log(JSON.stringify(res, null, 2));
   console.log(
-    `✓ Persona "${res.persona.alias}" (${res.persona.role}) ${res.created ? "dibuat" : "diperbarui"} untuk proyek ini, ${res.persona.rules.length} aturan.`,
+    `✓ Persona "${res.persona.alias}" (${res.persona.role}) ${res.created ? "dibuat" : "diperbarui"} untuk proyek ini, ${res.persona.rules.length} aturan${res.persona.repos.length > 0 ? `, memegang repo ${res.persona.repos.join(", ")}` : ""}.`,
+  );
+}
+
+/** Papan proyek lintas repo untuk orchestrator (setara get_project_board). */
+export async function boardShow(
+  api: AgentApi,
+  opts: { epic?: string; status?: string[]; json?: boolean },
+) {
+  const body = prepare(
+    GetProjectBoardInput,
+    {
+      ...(opts.epic ? { epic_id: opts.epic } : {}),
+      ...(opts.status?.length ? { status: opts.status } : {}),
+    },
+    ["epic_id", "status"],
+  );
+  const res = await api.post<McpToolOutput<"get_project_board">>("board", body);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log("Repo:");
+  for (const r of res.repos)
+    console.log(
+      `  ${r.repo}: ${r.personas.length ? r.personas.join(", ") : "(belum ada persona)"}`,
+    );
+  for (const e of res.epics) {
+    console.log(`\n# ${e.title}  ${JSON.stringify(e.counts)}`);
+    for (const t of res.tasks.filter((x) => x.epic_id === e.id)) {
+      const who = t.persona ? `@${t.persona}` : t.role ? `role ${t.role}` : "-";
+      const flags = [t.is_ready ? "siap" : null, t.is_stale ? "stale" : null]
+        .filter(Boolean)
+        .join(",");
+      console.log(
+        `  ${t.status.padEnd(18)} ${t.id}  ${t.title}  [${t.target_repo ?? "repo bebas"} · ${who}]${flags ? ` (${flags})` : ""}`,
+      );
+    }
+  }
+  if (res.truncated) console.log("\n(daftar dipotong; pakai --epic untuk mempersempit)");
+}
+
+export async function docList(api: AgentApi, asJson: boolean) {
+  const res = await api.post<{ documents: DocumentIndexEntry[] }>("documents/list");
+  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  if (res.documents.length === 0)
+    return console.log(
+      "Belum ada dokumen proyek. Buat dengan: catenext doc save <slug> --file <path.md>",
+    );
+  for (const d of res.documents)
+    console.log(`${d.slug}  v${d.version}  ${d.kind}  ${d.title}  (${d.size} karakter)`);
+}
+
+export async function docGet(api: AgentApi, slug: string, asJson: boolean) {
+  const body = prepare(GetDocumentInput, { slug }, ["slug"]);
+  const res = await api.post<McpToolOutput<"get_document">>("documents/get", body);
+  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  console.log(`<!-- ${res.slug} v${res.version} (${res.kind}) -->`);
+  console.log(res.content);
+}
+
+export async function docSave(
+  api: AgentApi,
+  slug: string,
+  opts: { file: string; title?: string; kind: string; version?: string; json?: boolean },
+) {
+  const content = await readFile(opts.file, "utf8");
+  const body = prepare(
+    SaveDocumentInput,
+    {
+      slug,
+      title: opts.title ?? slug,
+      kind: opts.kind,
+      content,
+      ...(opts.version !== undefined ? { expected_version: Number(opts.version) } : {}),
+    },
+    ["slug", "kind", "expected_version"],
+  );
+  const res = await api.put<McpToolOutput<"save_document">>("documents", body);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(
+    `✓ Dokumen "${res.document.slug}" ${res.created ? "dibuat" : "diperbarui"} (v${res.document.version}).`,
   );
 }

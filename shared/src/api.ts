@@ -69,6 +69,7 @@ export const AgentPersonaSchema = z.object({
   alias: AgentAliasSchema,
   role: RoleSchema,
   rules: z.array(z.string()),
+  repos: z.array(z.string()),
   created_at: IsoDateTimeSchema,
   updated_at: IsoDateTimeSchema,
 });
@@ -189,6 +190,7 @@ export const PersonaInput = z.object({
   alias: AgentAliasSchema,
   role: RoleSchema,
   rules: z.array(z.string().trim().min(1).max(300)).max(30).default([]),
+  repos: z.array(RepoNameSchema).max(10).default([]),
   project_id: IdSchema.nullish(),
 });
 
@@ -197,6 +199,7 @@ export const UpdatePersonaInput = z.object({
   alias: AgentAliasSchema.optional(),
   role: RoleSchema.optional(),
   rules: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+  repos: z.array(RepoNameSchema).max(10).optional(),
   project_id: IdSchema.nullish(),
 });
 

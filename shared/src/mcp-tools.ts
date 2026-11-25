@@ -8,6 +8,13 @@ import {
   RoleSchema,
 } from "./common.js";
 import { findCycle } from "./dag.js";
+import {
+  DocumentIndexEntrySchema,
+  GetDocumentInput,
+  ProjectDocumentSchema,
+  SaveDocumentInput,
+  SaveDocumentOutput,
+} from "./documents.js";
 import { HandoffSummarySchema } from "./handoff.js";
 import { CommitShaSchema, ReviewInput, ReviewOutput } from "./review.js";
 import {
@@ -31,10 +38,14 @@ const PersonaFilter = {
   role: RoleSchema.optional(),
 };
 
+/** Repo yang dipegang persona. Kosong = boleh semua repo proyek. */
+export const PersonaReposSchema = z.array(RepoNameSchema).max(10);
+
 export const PersonaSchema = z.object({
   alias: AgentAliasSchema,
   role: RoleSchema,
   rules: z.array(z.string().min(1).max(300)).max(30),
+  repos: PersonaReposSchema.default([]),
 });
 export type Persona = z.infer<typeof PersonaSchema>;
 
@@ -67,6 +78,51 @@ export const GetProjectContextOutput = z.object({
    * task aktif: handoff dependensi task yang siap diklaim (maks. 5).
    */
   recent_handoffs: z.array(DependencyHandoffSchema),
+  /** Repo yang dikenal proyek, agar orchestrator tahu ke mana task bisa diarahkan. */
+  project_repos: z.array(RepoNameSchema).default([]),
+  /** Indeks dokumen proyek di Cloud (blueprint, ERD, ...); isi lewat get_document. */
+  documents: z.array(DocumentIndexEntrySchema).default([]),
+});
+
+// --- get_project_board (orchestrator) ---------------------------------------
+
+/** Tampilan seluruh proyek lintas repo untuk orchestrator: siapa memegang apa, apa berikutnya. */
+export const GetProjectBoardInput = z.object({
+  epic_id: IdSchema.optional(),
+  /** Tanpa filter: semua status. */
+  status: z.array(TaskStatusSchema).max(7).optional(),
+  limit: z.number().int().min(1).max(200).default(100),
+});
+export const BoardTaskSchema = z.object({
+  id: IdSchema,
+  title: z.string(),
+  epic_id: IdSchema,
+  status: TaskStatusSchema,
+  target_repo: RepoNameSchema.nullable(),
+  role: RoleSchema.nullable(),
+  persona: AgentAliasSchema.nullable(),
+  depends_on: z.array(IdSchema),
+  /** TODO/REVISION_REQUESTED dengan semua dependensi DONE. */
+  is_ready: z.boolean(),
+  is_stale: z.boolean(),
+  revision_count: z.number().int().min(0),
+  /** Repo yang sedang memegang lease (IN_PROGRESS). */
+  locked_by_repo: RepoNameSchema.nullable(),
+  blocker_reason: z.string().nullable(),
+});
+export const GetProjectBoardOutput = z.object({
+  epics: z.array(
+    z.object({
+      id: IdSchema,
+      title: z.string(),
+      counts: z.record(z.string(), z.number().int()),
+    }),
+  ),
+  /** Repo yang dikenal proyek (dari task, skill, dan persona) beserta persona pemegangnya. */
+  repos: z.array(z.object({ repo: RepoNameSchema, personas: z.array(AgentAliasSchema) })),
+  personas: z.array(PersonaSchema),
+  tasks: z.array(BoardTaskSchema),
+  truncated: z.boolean(),
 });
 
 // --- get_ready_tasks --------------------------------------------------------
@@ -150,6 +206,50 @@ export const ReportBlockerInput = z.object({
 export const ReportBlockerOutput = z.object({
   task_id: IdSchema,
   status: z.literal("BLOCKED"),
+});
+
+// --- manage_task (orchestrator) ---------------------------------------------
+
+/**
+ * Aksi orchestrator (agen utama sesi) atas task yang sudah ada. Revisi tidak membuat task
+ * baru: task dipindah ke REVISION_REQUESTED dan diambil lagi oleh persona penanggung jawab.
+ */
+export const MANAGE_TASK_ACTIONS = ["request_revision", "assign"] as const;
+
+export const ManageTaskInput = z
+  .object({
+    action: z.enum(MANAGE_TASK_ACTIONS),
+    task_id: IdSchema,
+    /** Wajib untuk request_revision: apa yang harus diperbaiki (feedback manusia/orchestrator). */
+    feedback: z.string().trim().min(5).max(2000).optional(),
+    /** Persona penanggung jawab baru. null = lepas persona (task diambil berdasarkan role). */
+    agent_alias: AgentAliasSchema.nullable().optional(),
+    /** Role task tanpa persona tertentu. Diabaikan bila agent_alias diisi (role ikut persona). */
+    role: RoleSchema.nullable().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.action === "request_revision" && !v.feedback) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["feedback"],
+        message: "request_revision butuh feedback: apa yang harus diperbaiki.",
+      });
+    }
+    if (v.action === "assign" && v.agent_alias === undefined && v.role === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["agent_alias"],
+        message: "assign butuh agent_alias atau role.",
+      });
+    }
+  });
+export const ManageTaskOutput = z.object({
+  task_id: IdSchema,
+  status: TaskStatusSchema,
+  persona: AgentAliasSchema.nullable(),
+  role: RoleSchema.nullable(),
+  revision_count: z.number().int().min(0),
+  stale_task_ids: z.array(IdSchema),
 });
 
 // --- create_tasks -----------------------------------------------------------
@@ -301,7 +401,13 @@ export const ListPersonasOutput = z.object({
 
 /** Agen hanya boleh membuat/mengubah persona khusus proyeknya sendiri, bukan tingkat workspace. */
 export const UpsertPersonaInput = PersonaSchema.extend({
-  rules: z.array(z.string().trim().min(1).max(300)).max(30).default([]),
+  /**
+   * Tidak dikirim = aturan dipertahankan; persona proyek baru mewarisi aturan persona master
+   * (workspace) dengan alias yang sama.
+   */
+  rules: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+  /** Tidak dikirim = repo persona yang ada dipertahankan. */
+  repos: PersonaReposSchema.optional(),
 });
 export const UpsertPersonaOutput = z.object({
   persona: PersonaSchema,
@@ -329,6 +435,26 @@ export const MCP_TOOLS = {
     "Lepas lease task supaya sesi lain bisa mengambilnya.",
     ReleaseTaskInput,
     z.object({ task_id: IdSchema, status: z.enum(["TODO", "REVISION_REQUESTED"]) }),
+  ),
+  get_project_board: tool(
+    "Khusus orchestrator: papan seluruh proyek lintas repo (epic, task, status, persona, repo, dependensi) untuk membagi, melanjutkan, dan menyerahkan task.",
+    GetProjectBoardInput,
+    GetProjectBoardOutput,
+  ),
+  get_document: tool(
+    "Baca isi dokumen proyek di Cloud (blueprint, ERD, arsitektur, kontrak API, keputusan) berdasarkan slug dari get_project_context.",
+    GetDocumentInput,
+    ProjectDocumentSchema,
+  ),
+  save_document: tool(
+    "Buat/perbarui dokumen proyek di Cloud agar sesi/IDE/CLI lain tidak kehilangan konteks. Markdown ringkas, tanpa code dump atau secret. Kirim expected_version dari versi yang Anda baca (0 = baru).",
+    SaveDocumentInput,
+    SaveDocumentOutput,
+  ),
+  manage_task: tool(
+    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback (bukan membuat task baru) dan opsional mengganti persona; assign mengatur persona/role task yang belum dikerjakan.",
+    ManageTaskInput,
+    ManageTaskOutput,
   ),
   review_pull_request: tool(
     "Antrean, claim, hasil review, atau cek merge pull request.",

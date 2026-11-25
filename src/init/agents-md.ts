@@ -1,5 +1,8 @@
+import { CLI_FALLBACK_RULES, GENERAL_RULES, ORCHESTRATOR_RULES } from "@catenext/shared";
+
 /**
- * Blok Catenext di AGENTS.md untuk agen tanpa MCP (Codex, Aider, dll.). Dibatasi penanda
+ * Blok Catenext di AGENTS.md: aturan orchestrator untuk agen utama (dibaca Claude Code,
+ * Cursor, Codex, OpenCode, dll.) plus fallback CLI untuk agen tanpa MCP. Dibatasi penanda
  * agar `init` idempoten dan `remove` bisa membersihkannya tanpa menyentuh isi lain.
  */
 export const AGENTS_MD = "AGENTS.md";
@@ -9,25 +12,15 @@ export const BLOCK_END = "<!-- catenext:end -->";
 export function renderAgentsBlock(): string {
   return [
     BLOCK_START,
-    "## Catenext: estafet task antar-agen",
+    "## Catenext: orchestrator & subagent",
     "",
-    "Repo ini memakai Catenext. Bila Anda punya tool MCP `catenext`, pakai tool itu",
-    "(`get_project_context` -> `get_ready_tasks` -> `claim_task` -> `complete_handoff`).",
-    "Bila tidak, pakai CLI berikut:",
+    "Repo ini memakai Catenext lewat tool MCP `catenext` (atau CLI `catenext` bila MCP tidak ada).",
     "",
-    "1. `catenext next`: lihat task yang siap untuk repo ini.",
-    "2. `catenext claim <task_id>`: kunci task dan baca instruksi + handoff dependensinya.",
-    "3. Kerjakan, jalankan tes, lalu commit.",
-    '4. `catenext done <task_id> --notes "<ringkasan>" --verify "<perintah tes>" [--decision "..."]`',
-    '5. Bila buntu: `catenext block <task_id> --category <missing_env|ambiguous_requirement|failing_tests|dependency_issue|other> --reason "..."`',
+    ...ORCHESTRATOR_RULES,
     "",
-    "Persona: tiap task bisa punya persona penanggung jawab (mis. `adel`). Bila diminta",
-    '"adel, kerjakan", pakai `catenext next --as adel` lalu `catenext claim <task_id> --as adel`',
-    "(dengan MCP: kirim `agent_alias` ke get_ready_tasks dan claim_task), dan patuhi aturannya.",
-    "Di Claude Code, `catenext sync` membuat subagent per persona di `.claude/agents/`.",
+    ...CLI_FALLBACK_RULES,
     "",
-    "Aturan: satu task per sesi; jangan menyalin kode atau secret ke handoff (rujuk path file);",
-    "jangan mengedit `.catenext/config.yaml`. Skill repo ada di `.catenext/skills/`.",
+    ...GENERAL_RULES,
     BLOCK_END,
   ].join("\n");
 }

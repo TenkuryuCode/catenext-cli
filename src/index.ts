@@ -3,7 +3,12 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { BLOCKER_CATEGORIES, type McpToolOutput, ReleaseTaskInput } from "@catenext/shared";
+import {
+  BLOCKER_CATEGORIES,
+  DOCUMENT_KINDS,
+  type McpToolOutput,
+  ReleaseTaskInput,
+} from "@catenext/shared";
 import { Command } from "commander";
 import { ApiRequestError } from "./api-client.js";
 import { ConfigError, findProjectRoot, readConfig } from "./config.js";
@@ -16,14 +21,18 @@ import {
   validateApiKey,
 } from "./credentials.js";
 import { deviceLogin } from "./device-login.js";
-import { taskBlock, taskClaim, taskDone, taskNext, taskReview } from "./fallback.js";
+import { taskBlock, taskClaim, taskDone, taskManage, taskNext, taskReview } from "./fallback.js";
 import { applyInit, planInit, renderDiff } from "./init/index.js";
 import { McpConfigError } from "./init/mcp-config.js";
 import { applyFileEdits, planRemove, planSync, summarize, syncSkills } from "./maintenance.js";
 import { runMcpServer } from "./mcp/run.js";
 import { hasVersionedSegment, npxLaunch, stableNodeCommand } from "./node-command.js";
 import {
+  boardShow,
   cliApi,
+  docGet,
+  docList,
+  docSave,
   epicCreate,
   epicList,
   PlanningInputError,
@@ -265,11 +274,63 @@ persona
     (v: string, prev: string[]) => [...prev, v],
     [] as string[],
   )
+  .option(
+    "--repo <name>",
+    "Repo yang dipegang persona di proyek ini, mis. be (boleh diulang)",
+    (v: string, prev: string[] | undefined) => [...(prev ?? []), v],
+  )
   .option("--json", "Keluaran JSON")
-  .action((alias: string, opts: { role: string; rule: string[]; json?: boolean }) =>
-    friendly(async () =>
-      personaSet(await cliApi(), alias, opts.role, opts.rule, Boolean(opts.json)),
-    ),
+  .action(
+    (alias: string, opts: { role: string; rule: string[]; repo?: string[]; json?: boolean }) =>
+      friendly(async () =>
+        personaSet(await cliApi(), alias, opts.role, opts.rule, Boolean(opts.json), opts.repo),
+      ),
+  );
+
+program
+  .command("board")
+  .description("Orchestrator: papan proyek lintas repo (task, status, persona, repo)")
+  .option("--epic <id>", "Batasi ke satu epic")
+  .option(
+    "--status <status>",
+    "Filter status (boleh diulang)",
+    (v: string, p: string[]) => [...p, v],
+    [] as string[],
+  )
+  .option("--json", "Keluaran JSON")
+  .action((opts: { epic?: string; status: string[]; json?: boolean }) =>
+    friendly(async () => boardShow(await cliApi(), opts)),
+  );
+
+const doc = program
+  .command("doc")
+  .description("Dokumen proyek di Cloud (blueprint, ERD, arsitektur, keputusan)");
+doc
+  .command("list")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { json?: boolean }) =>
+    friendly(async () => docList(await cliApi(), Boolean(opts.json))),
+  );
+doc
+  .command("get")
+  .argument("<slug>")
+  .option("--json", "Keluaran JSON")
+  .action((slug: string, opts: { json?: boolean }) =>
+    friendly(async () => docGet(await cliApi(), slug, Boolean(opts.json))),
+  );
+doc
+  .command("save")
+  .argument("<slug>", "Slug dokumen, mis. blueprint atau erd")
+  .requiredOption("--file <path>", "File Markdown berisi dokumen")
+  .option("--title <text>", "Judul dokumen (default: slug)")
+  .option("--kind <kind>", `Salah satu: ${DOCUMENT_KINDS.join(", ")}`, "other")
+  .option("--version <n>", "Versi yang Anda baca (0 = dokumen baru); mencegah menimpa sesi lain")
+  .option("--json", "Keluaran JSON")
+  .action(
+    (
+      slug: string,
+      opts: { file: string; title?: string; kind: string; version?: string; json?: boolean },
+    ) => friendly(async () => docSave(await cliApi(), slug, opts)),
   );
 
 // --- Fallback untuk agen tanpa MCP (blok AGENTS.md menunjuk ke sini) ---------
@@ -379,6 +440,62 @@ program
       const api = await cliApi(opts.agent);
       console.log(JSON.stringify(await api.post("release", input), null, 2));
     }),
+  );
+
+program
+  .command("revise")
+  .description(
+    "Orchestrator: kembalikan task NEEDS_REVIEW/DONE ke kolom Revisi (bukan task baru; setara manage_task)",
+  )
+  .argument("<task_id>")
+  .requiredOption("--feedback <text>", "Apa yang harus diperbaiki (min. 5 karakter)")
+  .option("--to <alias>", "Ganti persona penanggung jawab revisi")
+  .option(...AGENT_OPT)
+  .option("--json", "Keluaran JSON")
+  .action(
+    (taskId: string, opts: { feedback: string; to?: string; agent: string; json?: boolean }) =>
+      friendly(async () =>
+        taskManage(
+          await cliApi(opts.agent),
+          {
+            action: "request_revision",
+            task_id: taskId,
+            feedback: opts.feedback,
+            ...(opts.to ? { agent_alias: opts.to } : {}),
+          },
+          Boolean(opts.json),
+        ),
+      ),
+  );
+
+program
+  .command("assign")
+  .description(
+    "Orchestrator: tetapkan persona atau role penanggung jawab task (setara manage_task)",
+  )
+  .argument("<task_id>")
+  .option("--to <alias>", "Persona penanggung jawab")
+  .option("--role <role>", "Role task tanpa persona tertentu")
+  .option("--unassign", "Lepas persona (task diambil berdasarkan role)")
+  .option(...AGENT_OPT)
+  .option("--json", "Keluaran JSON")
+  .action(
+    (
+      taskId: string,
+      opts: { to?: string; role?: string; unassign?: boolean; agent: string; json?: boolean },
+    ) =>
+      friendly(async () =>
+        taskManage(
+          await cliApi(opts.agent),
+          {
+            action: "assign",
+            task_id: taskId,
+            ...(opts.unassign ? { agent_alias: null } : opts.to ? { agent_alias: opts.to } : {}),
+            ...(opts.role ? { role: opts.role } : {}),
+          },
+          Boolean(opts.json),
+        ),
+      ),
   );
 
 const review = program.command("review").description("Antrean dan keputusan review pull request");

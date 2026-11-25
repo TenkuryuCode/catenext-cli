@@ -8,6 +8,14 @@ describe("blok AGENTS.md", () => {
     expect(upsertAgentsBlock(once)).toBe(once);
   });
 
+  it("memuat aturan orchestrator: revisi lewat manage_task, bukan task baru", () => {
+    const block = upsertAgentsBlock(null);
+    expect(block).toContain("**orchestrator**");
+    expect(block).toContain("request_revision");
+    expect(block).toContain("jangan membuat task baru untuk revisi");
+    expect(block).toContain("catenext revise");
+  });
+
   it("mengganti blok lama di tempatnya tanpa menyentuh teks lain", () => {
     const src = `# Tim\n\nA\n\n${BLOCK_START}\nlama\n<!-- catenext:end -->\n\n## Lain\nB\n`;
     const out = upsertAgentsBlock(src);
