@@ -37,7 +37,7 @@ describe("credentials", () => {
   });
 
   it("urutan api_url: env > config > credentials > default", () => {
-    expect(resolveApiUrl(undefined, undefined)).toBe("http://localhost:8787");
+    expect(resolveApiUrl(undefined, undefined)).toBe("https://catenext.mapan.digital");
     expect(resolveApiUrl(undefined, "http://c/")).toBe("http://c");
     expect(resolveApiUrl("http://cfg", "http://c")).toBe("http://cfg");
     process.env.CATENEXT_API_URL = "http://env";

@@ -14,7 +14,9 @@ export function credentialsPath(): string {
 }
 
 /** URL API bila config & kredensial tidak menyebutkannya. Rilis npm menanam URL produksi saat build. */
-export const DEFAULT_API_URL = process.env.CATENEXT_BUILD_API_URL || "http://localhost:8787";
+/** Server Catenext resmi. Bisa ditimpa saat build (CATENEXT_DEFAULT_API_URL) atau runtime (CATENEXT_API_URL / --api-url). */
+export const PRODUCTION_API_URL = "https://catenext.mapan.digital";
+export const DEFAULT_API_URL = process.env.CATENEXT_BUILD_API_URL || PRODUCTION_API_URL;
 
 const CredentialsSchema = z.object({
   api_key: z.string().startsWith(API_KEY_PREFIX),

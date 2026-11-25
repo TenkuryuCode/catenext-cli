@@ -1,6 +1,6 @@
 {
   "name": "catenext",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Estafet task & konteks antar-agen AI coding (Claude Code, Cursor, Codex, ...) lewat MCP lokal",
   "keywords": [
     "mcp",
@@ -27,7 +27,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=22"
