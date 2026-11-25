@@ -6,6 +6,7 @@ import { applyInit, planInit } from "./init/index.js";
 import {
   applyFileEdits,
   countEntries,
+  entryIsStale,
   planRemove,
   planSync,
   removeMcpEntries,
@@ -77,5 +78,17 @@ describe("catenext remove", () => {
     await expect(readFile(join(root, "AGENTS.md"))).rejects.toThrow();
     await expect(readFile(join(root, ".gitignore"))).rejects.toThrow();
     expect(await planRemove({ root, all: false })).toEqual([]);
+  });
+});
+
+describe("entryIsStale", () => {
+  it("menganggap skrip di cache npx basi meski filenya masih ada", () => {
+    expect(
+      entryIsStale({
+        command: "node",
+        args: ["/home/a/.npm/_npx/ab12/node_modules/catenext/dist/index.js", "mcp"],
+      }),
+    ).toBe(true);
+    expect(entryIsStale({ command: "npx", args: ["-y", "catenext", "mcp"] })).toBe(false);
   });
 });

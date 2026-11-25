@@ -14,6 +14,7 @@ import {
   readMcpEntry,
   upsertMcpEntry,
 } from "./init/mcp-config.js";
+import { npxLaunch } from "./node-command.js";
 import { listSkills, SKILLS_DIR, skillIndex } from "./skills.js";
 
 /** Perubahan file; `after: null` berarti file dihapus. */
@@ -85,7 +86,9 @@ function isValidJsonObject(source: string): boolean {
 export function entryIsStale(entry: McpServerEntry): boolean {
   if (isAbsolute(entry.command) && !existsSync(entry.command)) return true;
   const script = entry.args[0];
-  return Boolean(script && isAbsolute(script) && /\.[cm]?js$/.test(script) && !existsSync(script));
+  if (!script || !isAbsolute(script) || !/\.[cm]?js$/.test(script)) return false;
+  // Skrip di cache npx (dari `npx catenext init` versi <= 0.1.1) bisa hilang kapan saja.
+  return !existsSync(script) || npxLaunch(script) !== null;
 }
 
 /** Perintah dasar (tanpa "mcp" + argumen adapter) dari entri yang ada. */

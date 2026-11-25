@@ -21,7 +21,7 @@ import { applyInit, planInit, renderDiff } from "./init/index.js";
 import { McpConfigError } from "./init/mcp-config.js";
 import { applyFileEdits, planRemove, planSync, summarize, syncSkills } from "./maintenance.js";
 import { runMcpServer } from "./mcp/run.js";
-import { hasVersionedSegment, stableNodeCommand } from "./node-command.js";
+import { hasVersionedSegment, npxLaunch, stableNodeCommand } from "./node-command.js";
 import {
   cliApi,
   epicCreate,
@@ -72,6 +72,8 @@ async function friendly(fn: () => Promise<void>) {
 function defaultMcpCommand(): { command: string; args: string[] } {
   const self = fileURLToPath(import.meta.url);
   const entry = self.endsWith(".ts") ? resolve(dirname(self), "../dist/index.js") : self;
+  const viaNpx = npxLaunch(entry);
+  if (viaNpx) return viaNpx;
   if (!existsSync(entry)) {
     console.error(
       `! ${entry} belum ada. Jalankan \`pnpm --filter catenext build\` agar IDE bisa menjalankan server MCP.`,

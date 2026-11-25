@@ -10,6 +10,28 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+### Diperbaiki
+- Workflow Release CLI: typecheck/test lewat turbo sehingga `@catenext/shared` di-build lebih dulu;
+  root monorepo diganti nama `catenext-monorepo` agar `--filter catenext` tidak ikut menjalankan root.
+- `scripts/build-cli-mirror.mjs` menyalin file dengan baca/tulis biasa, bukan `fs.cpSync`, yang gagal
+  EACCES di workspace runner self-hosted.
+- CI dan Release CLI memakai `shell: bash` (di container, default `sh` gagal "Bad substitution"
+  pada `${GITHUB_SHA::7}` saat push ke mirror).
+
+### Diubah
+- CI dan Release CLI di repo `catenext` berjalan di runner self-hosted (`docs/runner.md`);
+  job berjalan di container `node:22-bookworm` (Postgres lewat nama service, store pnpm di volume Docker lokal tanpa cache GitHub). Publish npm tetap di runner GitHub demi provenance.
+
+## [0.1.2] - 2026-11-25
+
+### Diperbaiki
+- `npx catenext init` kini menulis entri MCP `npx -y catenext mcp`. Di 0.1.1 entri menunjuk ke
+  skrip di cache `~/.npm/_npx/...` yang bisa terhapus kapan saja, sehingga server MCP berhenti
+  jalan. Pasang ulang dengan `npx -y catenext@latest sync --fix` atau `init` ulang.
+
+### Diubah
+- README CLI: alur pemasangan per repo tanpa instalasi global.
+
 ## [0.1.1] - 2026-11-25
 
 ### Diperbaiki

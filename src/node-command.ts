@@ -49,3 +49,12 @@ function defaultIsExecutable(p: string): boolean {
     return false;
   }
 }
+
+/**
+ * Bila CLI sedang dijalankan lewat `npx` (file ada di cache `_npx`), path skripnya bersifat
+ * sementara: cache bisa dibersihkan kapan saja. Entri MCP lalu memakai `npx -y catenext`
+ * agar tetap jalan per repo tanpa instalasi global.
+ */
+export function npxLaunch(entry: string): { command: string; args: string[] } | null {
+  return /[\\/]_npx[\\/]/.test(entry) ? { command: "npx", args: ["-y", "catenext"] } : null;
+}
