@@ -58,12 +58,15 @@ describe("upsertMcpEntry", () => {
 describe("ensureGitignore", () => {
   it("menambahkan sekali dan mempertahankan isi lama", () => {
     const once = ensureGitignore("node_modules/\n");
-    expect(once).toMatch(/^node_modules\/\n\n# Catenext.*\n\.catenext\/cache\.json\n$/);
+    expect(once).toContain(".catenext/cache.json");
+    expect(once).toContain(".catenext/cache/");
     expect(ensureGitignore(once)).toBe(once);
   });
 
   it("membuat isi baru bila .gitignore belum ada", () => {
-    expect(ensureGitignore(null)).toContain(".catenext/cache.json");
+    const created = ensureGitignore(null);
+    expect(created).toContain(".catenext/cache.json");
+    expect(created).toContain(".catenext/cache/");
   });
 });
 

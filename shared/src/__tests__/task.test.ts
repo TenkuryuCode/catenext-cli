@@ -32,17 +32,20 @@ describe("status task", () => {
 });
 
 describe("state machine", () => {
-  it("menjalankan jalur bahagia DRAFT -> TODO -> IN_PROGRESS -> DONE", () => {
+  it("menjalankan jalur bahagia DRAFT -> TODO -> IN_PROGRESS -> NEEDS_REVIEW -> DONE", () => {
     let s = transition("DRAFT", "approve_plan");
     expect(s).toBe("TODO");
     s = transition(s, "claim");
     expect(s).toBe("IN_PROGRESS");
     s = transition(s, "complete");
+    expect(s).toBe("NEEDS_REVIEW");
+    s = transition(s, "approve");
     expect(s).toBe("DONE");
   });
 
-  it("mengarahkan complete ke NEEDS_REVIEW bila ada approval gate", () => {
-    expect(transition("IN_PROGRESS", "complete", { requiresApproval: true })).toBe("NEEDS_REVIEW");
+  it("complete selalu ke NEEDS_REVIEW (PR wajib; requiresApproval diabaikan)", () => {
+    expect(transition("IN_PROGRESS", "complete")).toBe("NEEDS_REVIEW");
+    expect(transition("IN_PROGRESS", "complete", { requiresApproval: false })).toBe("NEEDS_REVIEW");
     expect(transition("NEEDS_REVIEW", "approve")).toBe("DONE");
   });
 

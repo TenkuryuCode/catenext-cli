@@ -46,7 +46,7 @@ export const TASK_EVENTS = [
   "approve_plan", // human: DRAFT -> TODO
   "return_to_draft", // human: TODO -> DRAFT
   "claim", // agent: TODO | REVISION_REQUESTED -> IN_PROGRESS
-  "complete", // agent: IN_PROGRESS -> DONE, atau NEEDS_REVIEW bila requires_approval
+  "complete", // agent: IN_PROGRESS -> NEEDS_REVIEW (PR wajib di complete_handoff)
   "report_blocker", // agent: IN_PROGRESS -> BLOCKED
   "release", // agent: IN_PROGRESS -> TODO (melepas lock tanpa blocker)
   "lease_expired", // system: IN_PROGRESS -> TODO
@@ -79,8 +79,8 @@ const TRANSITIONS: TransitionTable = {
   approve_plan: { DRAFT: "TODO" },
   return_to_draft: { TODO: "DRAFT" },
   claim: { TODO: "IN_PROGRESS", REVISION_REQUESTED: "IN_PROGRESS" },
-  // Target "DONE" diganti NEEDS_REVIEW di transition() bila requires_approval.
-  complete: { IN_PROGRESS: "DONE" },
+  // PR wajib di complete_handoff; manusia approve/merge → DONE.
+  complete: { IN_PROGRESS: "NEEDS_REVIEW" },
   report_blocker: { IN_PROGRESS: "BLOCKED" },
   release: { IN_PROGRESS: "TODO" },
   lease_expired: { IN_PROGRESS: "TODO" },
@@ -90,7 +90,9 @@ const TRANSITIONS: TransitionTable = {
 };
 
 export interface TransitionContext {
-  /** Approval gate: complete diarahkan ke NEEDS_REVIEW, bukan DONE. */
+  /**
+   * @deprecated Complete selalu ke NEEDS_REVIEW (PR wajib). Dipertahankan untuk kompatibilitas.
+   */
   requiresApproval?: boolean;
 }
 
@@ -112,7 +114,7 @@ export function nextStatus(
 ): TaskStatus | null {
   const to = TRANSITIONS[event][from];
   if (to === undefined) return null;
-  if (event === "complete" && ctx.requiresApproval) return "NEEDS_REVIEW";
+  void ctx; // requiresApproval diabaikan: complete selalu NEEDS_REVIEW
   return to;
 }
 

@@ -10,6 +10,39 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.5.0] - 2026-11-26
+
+### Ditambahkan
+- Semantic search: embedding cache (`embedding_cache`) + indeks proyek
+  (`embedding_index`), tool MCP `search_context`, `POST /api/v1/agent/search`, Web **Cari**,
+  CLI `catenext search`, indeks kode lokal di `.catenext/cache/code-embeddings/`.
+- Rerank opsional (`CATENEXT_RERANK_API_KEY`); tanpa key → degraded (cosine saja).
+- Kuota `search_queries_per_day` dan `indexed_chars`.
+- Docs `/docs/search`. Migrasi API `0009_embedding_search.sql`.
+
+## [0.4.0] - 2026-11-26
+
+### Ditambahkan
+- Proyek: `layout` `monorepo` | `polyrepo` (default). Monorepo: `claim_task` / `catenext claim`
+  wajib worktree (`worktree_required`). Polyrepo: worktree tetap opsional. Diset di Web
+  (pengaturan proyek), bukan autodetect.
+- `complete_handoff` / `catenext done` wajib `pull_request` (`--pr` + `--base`); status selalu
+  `NEEDS_REVIEW` sampai manusia approve/merge PR. Tanpa status ship tambahan sebelum commit.
+- Web: tombol **Salin prompt orchestrator** per task (prompt delegasi ke subagent, termasuk
+  worktree/PR bila monorepo).
+- Web: halaman dokumentasi produk `/docs` (konsep, mulai cepat, orchestrator & subagent, multi-repo,
+  revisi, dokumen proyek, review PR, daftar perintah, data, kuota, dan pemecahan masalah), ditautkan
+  dari header dan footer landing. Header/footer/font halaman publik dipindah ke
+  `components/site/chrome.tsx`.
+- Migrasi API `0008_project_layout.sql`.
+
+### Diubah
+- CLI: `catenext doc save` memakai `--expected-version` (bukan `--version`, bentrok flag versi CLI).
+- Kanban: kolom **Menunggu review PR**; DONE dari NEEDS_REVIEW lewat panel PR, bukan drag Approve.
+- MCP/CLI/subagent: instruksi claim/handoff selaras (commit di branch OK; serahkan lewat PR).
+- README mirror publik `catenext-cli`: alur master prompt, orchestrator dan persona, multi-repo,
+  revisi, dokumen proyek, tabel perintah CLI ↔ MCP, data yang dikirim, dan pemecahan masalah.
+
 ## [0.3.0] - 2026-11-25
 
 ### Ditambahkan

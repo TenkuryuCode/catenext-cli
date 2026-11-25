@@ -17,6 +17,7 @@ import {
 } from "./documents.js";
 import { HandoffSummarySchema } from "./handoff.js";
 import { CommitShaSchema, ReviewInput, ReviewOutput } from "./review.js";
+import { SearchContextInput, SearchContextOutput } from "./search.js";
 import {
   SKILL_LIMITS,
   SkillContentSchema,
@@ -65,6 +66,7 @@ export const GetProjectContextOutput = z.object({
     name: z.string(),
     repo_name: RepoNameSchema,
     stack: z.array(z.string()),
+    layout: z.enum(["monorepo", "polyrepo"]).default("polyrepo"),
   }),
   /** Aturan keras untuk agen (mis. jangan mengedit config MCP). Statis di atas agar ramah cache. */
   directives: z.array(z.string()),
@@ -182,14 +184,25 @@ export const ClaimTaskOutput = z.object({
 
 // --- complete_handoff -------------------------------------------------------
 
-export const CompleteHandoffInput = z.object({
-  lease_id: IdSchema.optional(),
-  task_id: IdSchema,
-  handoff_summary: HandoffSummarySchema,
-});
+export const CompleteHandoffInput = z
+  .object({
+    lease_id: IdSchema.optional(),
+    task_id: IdSchema,
+    handoff_summary: HandoffSummarySchema,
+  })
+  .superRefine((input, ctx) => {
+    if (!input.handoff_summary.pull_request) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "pull_request wajib: buat PR di branch kerja lalu sertakan url, base_branch, dan head_sha.",
+        path: ["handoff_summary", "pull_request"],
+      });
+    }
+  });
 export const CompleteHandoffOutput = z.object({
   task_id: IdSchema,
-  status: z.enum(["DONE", "NEEDS_REVIEW"]),
+  status: z.literal("NEEDS_REVIEW"),
   unlocked_task_ids: z.array(IdSchema),
   /** Mis. saran mereset sesi chat (1 Task = 1 Fresh Session). */
   next_step_hint: z.string(),
@@ -441,6 +454,11 @@ export const MCP_TOOLS = {
     GetProjectBoardInput,
     GetProjectBoardOutput,
   ),
+  search_context: tool(
+    "Cari semantik di dokumen Cloud, indeks skill, dan task proyek (embedding + cache; rerank bila tersedia). Pakai sebelum load_skill/get_document buta.",
+    SearchContextInput,
+    SearchContextOutput,
+  ),
   get_document: tool(
     "Baca isi dokumen proyek di Cloud (blueprint, ERD, arsitektur, kontrak API, keputusan) berdasarkan slug dari get_project_context.",
     GetDocumentInput,
@@ -472,12 +490,12 @@ export const MCP_TOOLS = {
     GetReadyTasksOutput,
   ),
   claim_task: tool(
-    "Kunci task (lease 30 menit) dan ambil instruksi lengkap, handoff dependensi, serta aturan persona penanggung jawabnya. Kirim agent_alias bila bekerja sebagai persona tertentu.",
+    "Kunci task (lease 30 menit) dan ambil instruksi lengkap, handoff dependensi, serta aturan persona. Bila project.layout=monorepo, kirim worktree (branch + session_id). Polyrepo: worktree opsional. Kirim agent_alias bila bekerja sebagai persona tertentu.",
     ClaimTaskInput,
     ClaimTaskOutput,
   ),
   complete_handoff: tool(
-    "Selesaikan task dengan ringkasan handoff terstruktur (DONE, atau NEEDS_REVIEW bila ada approval gate).",
+    "Selesaikan task dengan handoff terstruktur; pull_request wajib (url, base_branch, head_sha). Status selalu NEEDS_REVIEW sampai manusia approve/merge PR. Commit di branch kerja OK; jangan merge ke default branch sendiri.",
     CompleteHandoffInput,
     CompleteHandoffOutput,
   ),

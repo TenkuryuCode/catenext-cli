@@ -99,7 +99,7 @@ IDE atau komputer mana pun, membaca konteks yang sama.
 ```bash
 catenext doc list
 catenext doc get blueprint
-catenext doc save erd --kind erd --file erd.md --version 0
+catenext doc save erd --kind erd --file erd.md --expected-version 0
 ```
 
 `--version` diisi versi yang terakhir Anda baca (`0` untuk dokumen baru). Bila sesi lain sudah

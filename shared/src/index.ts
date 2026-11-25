@@ -9,6 +9,7 @@ export * from "./mcp-tools.js";
 export * from "./orchestrator.js";
 export * from "./quota.js";
 export * from "./review.js";
+export * from "./search.js";
 export * from "./skill.js";
 export * from "./task.js";
 export * from "./templates.js";

@@ -3,6 +3,7 @@ import {
   AgentAliasSchema,
   IdSchema,
   IsoDateTimeSchema,
+  ProjectLayoutSchema,
   RepoNameSchema,
   RoleSchema,
 } from "./common.js";
@@ -30,6 +31,8 @@ export const ProjectSchema = z.object({
   workspace_id: IdSchema,
   name: z.string().min(1).max(120),
   detected_stack: z.array(z.string()),
+  /** monorepo = satu git (claim wajib worktree); polyrepo = clone terpisah per Cloud repo. */
+  layout: ProjectLayoutSchema.default("polyrepo"),
   agent_connected_at: IsoDateTimeSchema.nullable(),
   created_at: IsoDateTimeSchema,
   updated_at: IsoDateTimeSchema,
@@ -118,6 +121,7 @@ export type ProjectMetrics = z.infer<typeof ProjectMetricsSchema>;
 export const CreateProjectInput = z.object({
   name: z.string().trim().min(1).max(120),
   detected_stack: z.array(z.string().min(1).max(40)).max(20).default([]),
+  layout: ProjectLayoutSchema.default("polyrepo"),
 });
 
 // Skema update ditulis eksplisit, bukan CreateX.partial(): di Zod 4 field ber-.default() tetap
@@ -125,6 +129,7 @@ export const CreateProjectInput = z.object({
 export const UpdateProjectInput = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   detected_stack: z.array(z.string().min(1).max(40)).max(20).optional(),
+  layout: ProjectLayoutSchema.optional(),
 });
 
 export const CreateEpicInput = z.object({

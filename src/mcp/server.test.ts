@@ -89,13 +89,19 @@ async function setup(
 const textOf = (r: unknown) =>
   ((r as { content: { text: string }[] }).content ?? []).map((c) => c.text).join("\n");
 
+const HANDOFF_SHA = "a".repeat(40);
 const HANDOFF = {
   files_modified: ["apps/api/src/app.ts"],
   key_decisions: ["Pakai Hono"],
   verification_command: "pnpm test",
   notes_for_next_agent: "Endpoint siap dipakai frontend.",
   git_branch: "feat/x",
-  last_commit_hash: "abcdef1",
+  last_commit_hash: HANDOFF_SHA,
+  pull_request: {
+    url: "https://github.com/example/repo/pull/1",
+    base_branch: "main",
+    head_sha: HANDOFF_SHA,
+  },
 };
 
 describe("server MCP catenext", () => {
@@ -130,8 +136,25 @@ describe("server MCP catenext", () => {
       name: "claim_task",
       arguments: { task_id: TASK, project_id: "00000000-0000-4000-8000-000000000000" },
     });
-    expect(calls[0]?.body).toEqual({ task_id: TASK });
-    expect(calls[0]?.headers["x-catenext-project"]).toBe(CONFIG.project_id);
+    // Tanpa worktree: cek layout dulu (context), lalu claim.
+    expect(calls.map((c) => c.url.replace("http://api.test", ""))).toEqual([
+      "/api/v1/agent/context",
+      "/api/v1/agent/claim",
+    ]);
+    expect(calls[1]?.body).toEqual({ task_id: TASK });
+    expect(calls[1]?.headers["x-catenext-project"]).toBe(CONFIG.project_id);
+  });
+
+  it("claim_task monorepo tanpa worktree ditolak lokal", async () => {
+    const { client, calls } = await setup((c) =>
+      c.url.includes("/context")
+        ? { status: 200, body: { project: { layout: "monorepo" } } }
+        : { status: 200, body: { ok: 1 } },
+    );
+    const res = await client.callTool({ name: "claim_task", arguments: { task_id: TASK } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/worktree/);
+    expect(calls.some((c) => c.url.includes("/claim"))).toBe(false);
   });
 
   it("menyensor secret di handoff sebelum dikirim dan memberi tahu agen", async () => {
@@ -170,12 +193,16 @@ describe("server MCP catenext", () => {
   });
 
   it("menampilkan pesan error API yang ramah manusia", async () => {
-    const { client } = await setup(() => ({
-      status: 409,
-      body: {
-        error: { code: "repo_locked", message: "Repo backend sedang mengerjakan task lain." },
-      },
-    }));
+    const { client } = await setup((c) =>
+      c.url.includes("/context")
+        ? { status: 200, body: { project: { layout: "polyrepo" } } }
+        : {
+            status: 409,
+            body: {
+              error: { code: "repo_locked", message: "Repo backend sedang mengerjakan task lain." },
+            },
+          },
+    );
     const res = await client.callTool({ name: "claim_task", arguments: { task_id: TASK } });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("Repo backend sedang mengerjakan task lain. [repo_locked]");

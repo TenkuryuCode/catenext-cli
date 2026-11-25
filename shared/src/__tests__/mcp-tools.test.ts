@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CompleteHandoffInput,
   CreateTasksInput,
   findCycle,
   GetReadyTasksInput,
@@ -32,6 +33,7 @@ describe("registry tool MCP", () => {
         "review_pull_request",
         "save_document",
         "save_repo_skill",
+        "search_context",
         "upsert_persona",
       ].sort(),
     );
@@ -50,6 +52,35 @@ describe("registry tool MCP", () => {
     expect(GetReadyTasksInput.parse({})).toEqual({ limit: 10 });
     const parsed = GetReadyTasksInput.parse({ repo_name: "frontend" } as never);
     expect(parsed).not.toHaveProperty("repo_name");
+  });
+
+  it("complete_handoff menolak handoff tanpa pull_request", () => {
+    const task_id = EXISTING;
+    const base = {
+      task_id,
+      handoff_summary: {
+        files_modified: ["apps/api/src/x.ts"],
+        key_decisions: ["Keputusan singkat"],
+        verification_command: "pnpm test",
+        notes_for_next_agent: "Siap review.",
+        git_branch: "feat/x",
+        last_commit_hash: "a".repeat(40),
+      },
+    };
+    expect(CompleteHandoffInput.safeParse(base).success).toBe(false);
+    expect(
+      CompleteHandoffInput.safeParse({
+        ...base,
+        handoff_summary: {
+          ...base.handoff_summary,
+          pull_request: {
+            url: "https://github.com/org/repo/pull/1",
+            base_branch: "main",
+            head_sha: "a".repeat(40),
+          },
+        },
+      }).success,
+    ).toBe(true);
   });
 
   it("manage_task: revisi butuh feedback, assign butuh persona atau role", () => {

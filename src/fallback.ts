@@ -70,8 +70,9 @@ export async function taskNext(
     console.log(`${t.id}  ${t.title}${tags ? `  [${tags}]` : ""}`);
   }
   console.log(
-    `\nAmbil satu: catenext claim ${res.tasks[0]?.id}${opts.as ? ` --as ${opts.as}` : ""}`,
+    `\nAmbil satu: catenext claim ${res.tasks[0]?.id}${opts.as ? ` --as ${opts.as}` : ""} [--worktree]`,
   );
+  console.log("  (Monorepo: --worktree wajib. Polyrepo: opsional.)");
 }
 
 export function renderClaim(res: McpToolOutput<"claim_task">): string {
@@ -112,7 +113,8 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   out.push(
     "## Setelah selesai",
     "",
-    `catenext done ${res.task.id} --notes "<ringkasan untuk agen berikutnya>" --verify "<perintah tes>"`,
+    "Commit di branch/worktree ini OK. Jangan merge ke default branch — serahkan lewat PR.",
+    `catenext done ${res.task.id} --notes "<ringkasan>" --verify "<perintah tes>" --pr <url> --base <branch>${res.lease_id ? ` --lease ${res.lease_id}` : ""}`,
     `Bila buntu: catenext block ${res.task.id} --category <kategori> --reason "<alasan spesifik>"`,
   );
   return out.join("\n");
@@ -123,6 +125,16 @@ export async function taskClaim(
   taskId: string,
   opts: { as?: string; json?: boolean; worktree?: boolean },
 ) {
+  if (!opts.worktree) {
+    const ctx = await api.post<McpToolOutput<"get_project_context">>("context", {
+      ...(opts.as ? { agent_alias: opts.as } : {}),
+    });
+    if (ctx.project.layout === "monorepo") {
+      throw new PlanningInputError(
+        "Proyek ini layout monorepo: claim wajib --worktree (branch/sesi terpisah). Contoh: catenext claim <id> --worktree",
+      );
+    }
+  }
   const branch = opts.worktree
     ? await git(["symbolic-ref", "--short", "HEAD"], process.cwd())
     : null;
@@ -167,8 +179,11 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
       "Tidak bisa membaca branch/commit git. Jalankan di dalam repo git dan commit pekerjaan Anda dulu.",
     );
   }
-  if (Boolean(opts.pr) !== Boolean(opts.base))
-    throw new PlanningInputError("Gunakan --pr dan --base bersama.");
+  if (!opts.pr || !opts.base) {
+    throw new PlanningInputError(
+      "--pr dan --base wajib: buat PR di branch kerja lalu `catenext done … --pr <url> --base <branch>`.",
+    );
+  }
   const files = opts.file.length ? opts.file : gitState.changedFiles;
   return {
     files_modified: files.slice(0, HANDOFF_LIMITS.maxFilesModified),
@@ -177,9 +192,7 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
     notes_for_next_agent: opts.notes,
     git_branch: gitState.branch,
     last_commit_hash: gitState.commit,
-    ...(opts.pr && opts.base
-      ? { pull_request: { url: opts.pr, base_branch: opts.base, head_sha: gitState.commit } }
-      : {}),
+    pull_request: { url: opts.pr, base_branch: opts.base, head_sha: gitState.commit },
   };
 }
 
@@ -194,11 +207,7 @@ export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions)
   );
   const res = await api.post<McpToolOutput<"complete_handoff">>("complete", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
-  console.log(
-    res.status === "DONE"
-      ? `✓ Task selesai (DONE). ${res.unlocked_task_ids.length} task hilir terbuka.`
-      : "✓ Handoff terkirim, menunggu review (NEEDS_REVIEW).",
-  );
+  console.log("✓ Handoff + PR terkirim (NEEDS_REVIEW). Menunggu review/merge manusia.");
   console.log(`  ${res.next_step_hint}`);
 }
 

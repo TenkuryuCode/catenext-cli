@@ -5,7 +5,7 @@ import { applyEdits, modify, type ParseError, parse, visit } from "jsonc-parser"
 import type { AgentApi } from "./api-client.js";
 import { CONFIG_PATH } from "./config.js";
 import { AGENTS_MD, BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./init/agents-md.js";
-import { CACHE_IGNORE, ensureGitignore } from "./init/gitignore.js";
+import { CACHE_DIR_IGNORE, CACHE_IGNORE, ensureGitignore } from "./init/gitignore.js";
 import {
   ADAPTERS,
   type ClientAdapter,
@@ -245,11 +245,16 @@ export async function planRemove(opts: { root: string; all: boolean }): Promise<
   if (gitignore !== null) {
     const eol = gitignore.includes("\r\n") ? "\r\n" : "\n";
     const lines = gitignore.split(/\r?\n/);
-    const kept = lines.filter(
-      (l, i) =>
-        l.trim() !== CACHE_IGNORE &&
-        !(l.startsWith("# Catenext:") && lines[i + 1]?.trim() === CACHE_IGNORE),
-    );
+    const catenextIgnore = new Set([CACHE_IGNORE, CACHE_DIR_IGNORE, ".catenext/cache"]);
+    const kept = lines.filter((l, i) => {
+      const t = l.trim();
+      if (catenextIgnore.has(t)) return false;
+      if (l.startsWith("# Catenext:")) {
+        const next = lines[i + 1]?.trim();
+        if (next && catenextIgnore.has(next)) return false;
+      }
+      return true;
+    });
     if (kept.length !== lines.length) {
       const text = kept.join(eol).replace(/(\r?\n)+$/, "");
       edits.push({ path: ".gitignore", before: gitignore, after: text ? `${text}${eol}` : null });

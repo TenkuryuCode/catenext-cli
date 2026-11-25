@@ -38,6 +38,10 @@ export const QUOTA_DIMENSIONS = [
   "revisions_per_month",
   /** Task yang sedang dikerjakan bersamaan (IN_PROGRESS) di workspace. */
   "active_tasks",
+  /** Panggilan search_context per hari kalender. */
+  "search_queries_per_day",
+  /** Total karakter teks yang diindeks embedding per workspace. */
+  "indexed_chars",
 ] as const;
 export const QuotaDimensionSchema = z.enum(QUOTA_DIMENSIONS);
 export type QuotaDimension = z.infer<typeof QuotaDimensionSchema>;
@@ -66,6 +70,8 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       repos_per_project: 2,
       revisions_per_month: 5,
       active_tasks: 1,
+      search_queries_per_day: 50,
+      indexed_chars: 100_000,
     },
     retention_days: 14,
     rate_per_minute: 60,
@@ -84,6 +90,8 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       repos_per_project: null,
       revisions_per_month: null,
       active_tasks: null,
+      search_queries_per_day: 2000,
+      indexed_chars: 2_000_000,
     },
     retention_days: 90,
     rate_per_minute: 300,
@@ -102,6 +110,8 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
       repos_per_project: null,
       revisions_per_month: null,
       active_tasks: null,
+      search_queries_per_day: 10000,
+      indexed_chars: 10_000_000,
     },
     retention_days: 365,
     rate_per_minute: 600,
@@ -127,6 +137,8 @@ export const QUOTA_LABELS: Record<QuotaDimension, string> = {
   repos_per_project: "Repo per proyek",
   revisions_per_month: "Revisi bulan ini",
   active_tasks: "Task dikerjakan bersamaan",
+  search_queries_per_day: "Pencarian semantik per hari",
+  indexed_chars: "Karakter terindeks embedding",
 };
 
 /** `error.details` untuk kode `quota_exceeded` (HTTP 402). */

@@ -11,6 +11,7 @@ import {
   ReviewInput,
   SaveDocumentInput,
   SaveRepoSkillInput,
+  SearchContextInput,
   UpsertPersonaInput,
 } from "@catenext/shared";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -33,6 +34,7 @@ export const LOCAL_TOOLS = [
   "get_project_board",
   "get_document",
   "save_document",
+  "search_context",
   "list_epics",
   "create_epic",
   "create_tasks",
@@ -44,12 +46,13 @@ export const LOCAL_TOOLS = [
 
 export const SERVER_INSTRUCTIONS = [
   "Catenext mengatur estafet task antar-agen AI untuk repo ini.",
-  "Alur: get_project_context -> get_ready_tasks -> claim_task -> kerjakan & tes -> complete_handoff.",
+  "Alur: get_project_context -> get_ready_tasks -> claim_task (worktree wajib jika layout=monorepo) -> kerjakan & commit di branch -> buat PR -> complete_handoff (pull_request wajib → NEEDS_REVIEW).",
   "Merencanakan: list_epics/create_epic -> create_tasks (masuk DRAFT, disetujui manusia di Web sebelum bisa dikerjakan).",
   "Orchestrator = agen utama sesi (bukan subagent persona): ia merencanakan, mendelegasikan task ke subagent per persona, dan meninjau hasilnya. Revisi atas task yang sudah diserahkan memakai manage_task action request_revision (task pindah ke kolom Revisi dan diambil lagi oleh persona penanggung jawabnya); jangan membuat task baru untuk revisi. manage_task action assign menetapkan persona/role task. Subagent persona tidak memakai manage_task maupun create_tasks.",
   'Persona: list_personas/upsert_persona untuk alias, role, dan aturan agen di proyek ini. Setiap task bisa punya persona penanggung jawab; bila diminta bekerja sebagai persona (mis. "adel, kerjakan"), kirim agent_alias-nya ke get_project_context, get_ready_tasks, dan claim_task, lalu patuhi aturan persona dari hasil claim_task.',
   "Multi-repo: satu proyek bisa membawahi banyak repo (mis. be dan fe di folder terpisah). Orchestrator memakai get_project_board untuk melihat semua task lintas repo dan persona pemegang tiap repo, lalu mendelegasikan ke subagent yang bekerja dari folder repo tujuan.",
   "Dokumen proyek (blueprint, ERD, arsitektur, keputusan) tersimpan di Cloud: indeksnya di get_project_context, isi lewat get_document, perbarui lewat save_document dengan expected_version. Baca dokumen relevan di awal sesi agar konteks tidak hilang antar sesi/IDE/CLI.",
+  "Sebelum load_skill atau get_document buta, boleh search_context (query singkat) untuk menemukan dokumen/skill/task relevan (embedding + cache; rerank bila tersedia).",
   "Skill repo: indeksnya ada di get_project_context; panggil load_skill hanya bila relevan, dan save_repo_skill untuk mencatat konvensi/pitfall yang ditemukan (maks. 500 kata, tanpa code dump).",
   "Bila buntu, panggil report_blocker. Jangan menyalin kode atau secret ke handoff; rujuk path file.",
   "Jangan mengedit .catenext/config.yaml atau file konfigurasi MCP IDE.",
@@ -162,15 +165,27 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     "claim_task",
     { description: MCP_TOOLS.claim_task.description, inputSchema: MCP_TOOLS.claim_task.input },
     (input) =>
-      call(async ({ api, config }) =>
-        json(
+      call(async ({ api, config }) => {
+        const agentAlias = input.agent_alias ?? config.overrides?.default_agent_alias;
+        if (!input.worktree) {
+          const ctx = (await api.post("context", {
+            ...(agentAlias ? { agent_alias: agentAlias } : {}),
+          })) as { project?: { layout?: string } };
+          if (ctx.project?.layout === "monorepo") {
+            return text(
+              "Proyek layout monorepo: claim_task wajib worktree { branch, session_id }. Checkout branch kerja lalu kirim worktree, atau catenext claim <id> --worktree.",
+              true,
+            );
+          }
+        }
+        return json(
           await api.post("claim", {
             task_id: input.task_id,
             worktree: input.worktree,
-            agent_alias: input.agent_alias ?? config.overrides?.default_agent_alias,
+            agent_alias: agentAlias,
           }),
-        ),
-      ),
+        );
+      }),
   );
 
   server.registerTool(
@@ -313,6 +328,29 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     scrubbedWrite(SaveDocumentInput, ["slug", "kind", "expected_version"], (api, payload) =>
       api.put("documents", payload),
     ),
+  );
+
+  server.registerTool(
+    "search_context",
+    {
+      description: MCP_TOOLS.search_context.description,
+      inputSchema: MCP_TOOLS.search_context.input,
+    },
+    (input) =>
+      call(async ({ api }) => {
+        const scrubbed = scrubDeep(input, new Set(["sources", "limit"]));
+        const parsed = SearchContextInput.safeParse(scrubbed.value);
+        if (!parsed.success) {
+          return text(`Input ditolak sebelum dikirim:\n${zodIssues(parsed.error)}`, true);
+        }
+        const notes: string[] = [];
+        if (scrubbed.total > 0) {
+          const note = describeRedactions(scrubbed);
+          log(note);
+          notes.push(note);
+        }
+        return json(await api.post("search", parsed.data), notes);
+      }),
   );
 
   server.registerTool(

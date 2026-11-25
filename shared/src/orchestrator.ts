@@ -37,11 +37,11 @@ export const ORCHESTRATOR_RULES: readonly string[] = [
   "",
   "### Alur subagent (persona)",
   "",
-  "1. Pastikan berada di folder repo yang dipegang. `get_ready_tasks` dan `claim_task` dengan `agent_alias: <alias>`; patuhi aturan persona di hasil claim. Task di kolom Revisi didahulukan dan membawa feedback revisinya.",
+  "1. Pastikan berada di folder repo yang dipegang. `get_ready_tasks` dan `claim_task` dengan `agent_alias: <alias>`; patuhi aturan persona di hasil claim. Bila `layout` proyek = `monorepo`, claim wajib mode worktree. Task di kolom Revisi didahulukan dan membawa feedback revisinya.",
   "2. Baca dokumen proyek yang dirujuk task (`get_document`) bila perlu konteks desain.",
-  "3. Kerjakan, jalankan tes, commit di branch kerja.",
-  "4. `complete_handoff` dengan ringkasan terstruktur, atau `report_blocker` bila buntu.",
-  "5. Laporkan ke orchestrator: task, status, dan perintah verifikasi.",
+  "3. Kerjakan, jalankan tes, commit di branch/worktree kerja (boleh commit sewaktu-waktu; jangan merge ke default branch).",
+  "4. Buat PR, lalu `complete_handoff` dengan `pull_request` wajib (status → NEEDS_REVIEW), atau `report_blocker` bila buntu.",
+  "5. Laporkan ke orchestrator: task, status, URL PR, dan perintah verifikasi.",
   "",
   "Subagent hanya mengerjakan satu task per pemanggilan dan tidak memanggil `create_tasks`, `manage_task`, `upsert_persona`, atau `save_document`.",
 ];
@@ -51,7 +51,7 @@ export const CLI_FALLBACK_RULES: readonly string[] = [
   "### Tanpa tool MCP",
   "",
   "- Orchestrator: `catenext board`, `catenext doc list|get|save`, `catenext persona list|set`, `catenext revise`, `catenext assign`.",
-  '- Subagent: `catenext next --as <alias>`, `catenext claim <task_id> --as <alias>`, kerjakan & commit, lalu `catenext done <task_id> --notes "<ringkasan>" --verify "<perintah tes>"`.',
+  '- Subagent: `catenext next --as <alias>`, `catenext claim <task_id> --as <alias> [--worktree]` (wajib `--worktree` di monorepo), kerjakan & commit di branch, buat PR, lalu `catenext done <task_id> --notes "..." --verify "..." --pr <url> --base <branch>`.',
   '- Bila buntu: `catenext block <task_id> --category <missing_env|ambiguous_requirement|failing_tests|dependency_issue|other> --reason "..."`.',
 ];
 
@@ -66,6 +66,24 @@ export interface MasterPromptInput {
   repos?: readonly string[] | undefined;
   /** Diisi bila API bukan default (self-host / dev lokal). */
   apiUrl?: string | undefined;
+}
+
+/** Input untuk prompt delegasi satu task (salin dari Web → tempel ke orchestrator). */
+export interface TaskDelegatePromptInput {
+  taskId: string;
+  title: string;
+  promptInstruction: string;
+  status: string;
+  /** Alias persona penanggung jawab, bila ada. */
+  personaAlias?: string | null;
+  role?: string | null;
+  targetRepo?: string | null;
+  /** Feedback revisi bila status REVISION_REQUESTED / sedang revisi. */
+  reviewFeedback?: string | null;
+  /** monorepo → claim wajib worktree. */
+  layout?: "monorepo" | "polyrepo";
+  /** Path folder lokal hint (mis. apps/api); opsional. */
+  folderHint?: string | null;
 }
 
 /**
@@ -96,4 +114,66 @@ export function renderMasterPrompt(input: MasterPromptInput): string {
     "",
     ...GENERAL_RULES,
   ].join("\n");
+}
+
+/**
+ * Prompt singkat per task untuk ditempel ke orchestrator (IDE).
+ * Orchestrator mendelegasikan ke subagent persona; tidak memuat API key atau code dump.
+ */
+export function renderTaskDelegatePrompt(input: TaskDelegatePromptInput): string {
+  const alias = input.personaAlias?.trim() || null;
+  const repo = input.targetRepo?.trim() || null;
+  const folder =
+    input.folderHint?.trim() ||
+    (repo ? `folder checkout yang repo_name-nya \`${repo}\`` : "folder repo yang sesuai");
+  const monorepo = input.layout === "monorepo";
+  const who = alias
+    ? `\`${alias}\`${input.role ? ` (role ${input.role})` : ""}`
+    : input.role
+      ? `persona ber-role \`${input.role}\``
+      : "persona penanggung jawab yang cocok";
+
+  const lines = [
+    `Delegasikan task Catenext berikut ke subagent ${who}. Jangan kerjakan sendiri kecuali saya meminta.`,
+    "",
+    `## Task`,
+    "",
+    `- **ID:** \`${input.taskId}\``,
+    `- **Judul:** ${input.title}`,
+    `- **Status:** ${input.status}`,
+    ...(repo ? [`- **target_repo:** \`${repo}\``] : []),
+    ...(alias ? [`- **persona:** \`${alias}\``] : []),
+    ...(input.role && !alias ? [`- **role:** \`${input.role}\``] : []),
+    "",
+    "## Instruksi task",
+    "",
+    input.promptInstruction.trim(),
+    "",
+  ];
+
+  if (input.reviewFeedback?.trim()) {
+    lines.push("## Feedback revisi", "", input.reviewFeedback.trim(), "");
+  }
+
+  const sub = alias ? `\`${alias}\`` : "yang tepat";
+  const claimHint = monorepo
+    ? "3. Claim wajib mode worktree (branch/sesi terpisah). Commit di branch OK; jangan merge ke default branch."
+    : "3. Claim task; worktree opsional kecuali ada reservasi branch. Commit di branch OK; jangan merge ke default branch.";
+  const example = alias
+    ? `Contoh perintah ke subagent: "${alias}, kerjakan task ${input.taskId}${repo ? ` di repo ${repo}` : ""}${monorepo ? " dengan worktree" : ""}."`
+    : `Contoh: "Kerjakan task ${input.taskId}${repo ? ` di repo ${repo}` : ""} lewat persona yang tepat${monorepo ? ", claim dengan worktree" : ""}."`;
+
+  lines.push(
+    "## Yang harus dilakukan orchestrator",
+    "",
+    `1. Pastikan subagent bekerja dari ${folder} (.catenext/config.yaml dengan repo yang benar).`,
+    `2. Panggil subagent ${sub}: kerjakan **hanya** task \`${input.taskId}\`.`,
+    claimHint,
+    "4. Setelah selesai: buat PR, lalu complete_handoff / catenext done dengan pull_request wajib → NEEDS_REVIEW.",
+    "5. Laporkan ke saya: status, URL PR, dan perintah verifikasi.",
+    "",
+    example,
+  );
+
+  return lines.join("\n");
 }

@@ -39,6 +39,7 @@ import {
   personaList,
   personaSet,
   prepare,
+  searchShow,
   taskCreate,
 } from "./planning.js";
 import { loadSkill, SkillError } from "./skills.js";
@@ -324,13 +325,53 @@ doc
   .requiredOption("--file <path>", "File Markdown berisi dokumen")
   .option("--title <text>", "Judul dokumen (default: slug)")
   .option("--kind <kind>", `Salah satu: ${DOCUMENT_KINDS.join(", ")}`, "other")
-  .option("--version <n>", "Versi yang Anda baca (0 = dokumen baru); mencegah menimpa sesi lain")
+  .option(
+    "--expected-version <n>",
+    "Versi yang Anda baca (0 = dokumen baru); mencegah menimpa sesi lain. Jangan pakai --version (bentrok flag versi CLI).",
+  )
   .option("--json", "Keluaran JSON")
   .action(
     (
       slug: string,
-      opts: { file: string; title?: string; kind: string; version?: string; json?: boolean },
-    ) => friendly(async () => docSave(await cliApi(), slug, opts)),
+      opts: {
+        file: string;
+        title?: string;
+        kind: string;
+        expectedVersion?: string;
+        json?: boolean;
+      },
+    ) =>
+      friendly(async () =>
+        docSave(await cliApi(), slug, {
+          file: opts.file,
+          title: opts.title,
+          kind: opts.kind,
+          version: opts.expectedVersion,
+          json: opts.json,
+        }),
+      ),
+  );
+
+program
+  .command("search")
+  .description("Cari semantik di dokumen/skill/task Cloud dan/atau kode lokal")
+  .argument("<query>", "Query pencarian")
+  .option(
+    "--source <src>",
+    "Sumber: document|skill|task|code (bisa diulang)",
+    (v, prev: string[]) => [...prev, v],
+    [] as string[],
+  )
+  .option("-n, --limit <n>", "Jumlah hasil", (v) => Number.parseInt(v, 10), 8)
+  .option("--json", "Keluaran JSON")
+  .action((query: string, opts: { source: string[]; limit: number; json?: boolean }) =>
+    friendly(async () =>
+      searchShow(await cliApi(), query, {
+        source: opts.source.length ? opts.source : undefined,
+        limit: opts.limit,
+        json: opts.json,
+      }),
+    ),
   );
 
 // --- Fallback untuk agen tanpa MCP (blok AGENTS.md menunjuk ke sini) ---------
@@ -359,7 +400,7 @@ program
   .description("Kunci task dan cetak instruksi + handoff dependensinya (setara claim_task)")
   .argument("<task_id>")
   .option("--as <alias>", "Bekerja sebagai persona ini; task milik persona lain ditolak")
-  .option("--worktree", "Reservasi branch checkout dan ambil lease sesi terpisah")
+  .option("--worktree", "Reservasi branch checkout + lease sesi (wajib di proyek layout monorepo)")
   .option(...AGENT_OPT)
   .option("--json", "Keluaran JSON")
   .action(
@@ -385,8 +426,8 @@ program
     [] as string[],
   )
   .option("--verify <cmd>", "Perintah verifikasi, mis. pnpm test")
-  .option("--pr <url>", "URL pull request GitHub")
-  .option("--base <branch>", "Branch tujuan PR")
+  .option("--pr <url>", "URL pull request GitHub (wajib bersama --base)")
+  .option("--base <branch>", "Branch tujuan PR (wajib bersama --pr)")
   .option("--lease <id>", "Lease worktree dari claim")
   .option("--handoff <file>", "File JSON handoff_summary lengkap, atau '-' untuk stdin")
   .option(...AGENT_OPT)

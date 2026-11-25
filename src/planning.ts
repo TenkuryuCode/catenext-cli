@@ -7,10 +7,14 @@ import {
   GetProjectBoardInput,
   type McpToolOutput,
   SaveDocumentInput,
+  SEARCH_SOURCES,
+  SearchContextInput,
+  type SearchContextOutputType,
   UpsertPersonaInput,
 } from "@catenext/shared";
 import type { z } from "zod";
 import { AgentApi } from "./api-client.js";
+import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { ConfigError, findProjectRoot, readConfig } from "./config.js";
 import { loadCredentials, resolveApiUrl } from "./credentials.js";
 import { describeRedactions, scrubDeep } from "./scrubber.js";
@@ -256,4 +260,74 @@ export async function docSave(
   console.log(
     `✓ Dokumen "${res.document.slug}" ${res.created ? "dibuat" : "diperbarui"} (v${res.document.version}).`,
   );
+}
+
+const CLOUD_SOURCES = new Set(SEARCH_SOURCES);
+
+/** `catenext search` — Cloud (document/skill/task) dan/atau indeks kode lokal. */
+export async function searchShow(
+  api: AgentApi,
+  query: string,
+  opts: { source?: string[]; limit?: number; json?: boolean },
+) {
+  const scrubbed = scrubDeep({ query }, new Set());
+  if (scrubbed.total > 0) console.error(`! ${describeRedactions(scrubbed)}`);
+  const q = String((scrubbed.value as { query: string }).query).trim();
+  if (!q) throw new PlanningInputError("Query kosong.");
+
+  const wanted = opts.source?.length ? opts.source : ["document", "skill", "task", "code"];
+  const cloudSources = wanted.filter((s): s is (typeof SEARCH_SOURCES)[number] =>
+    CLOUD_SOURCES.has(s as (typeof SEARCH_SOURCES)[number]),
+  );
+  const wantCode = wanted.includes("code");
+  const limit = opts.limit ?? 8;
+
+  let cloud: SearchContextOutputType | null = null;
+  if (cloudSources.length > 0) {
+    const body = prepare(SearchContextInput, { query: q, sources: cloudSources, limit }, [
+      "sources",
+      "limit",
+    ]);
+    cloud = await api.post<SearchContextOutputType>("search", body);
+  }
+
+  let codeHits: Awaited<ReturnType<typeof searchLocalCode>>["hits"] = [];
+  let codeNote: string | undefined;
+  if (wantCode) {
+    const root = await findProjectRoot();
+    if (root) {
+      try {
+        const local = await searchLocalCode(root, q, limit);
+        codeHits = local.hits;
+        codeNote = local.note;
+        if (codeHits.length === 0) codeHits = await keywordFallback(root, q, limit);
+      } catch (err) {
+        codeNote = `Indeks kode gagal: ${(err as Error).message}. Fallback keyword.`;
+        codeHits = await keywordFallback(root, q, limit);
+      }
+    }
+  }
+
+  const merged = [
+    ...(cloud?.hits ?? []).map((h) => ({ ...h, origin: "cloud" as const })),
+    ...codeHits.map((h) => ({ ...h, origin: "local" as const })),
+  ]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  const payload = {
+    hits: merged,
+    reranked: cloud?.reranked ?? false,
+    degraded: cloud?.degraded ?? true,
+    ...(codeNote ? { note: codeNote } : {}),
+  };
+  if (opts.json) return console.log(JSON.stringify(payload, null, 2));
+  if (merged.length === 0) return console.log("Tidak ada hasil.");
+  for (const h of merged) {
+    console.log(
+      `${h.score.toFixed(3)}  [${h.source}]  ${h.ref}  ${h.title}\n    ${h.snippet.slice(0, 120)}`,
+    );
+  }
+  if (payload.degraded) console.error("! Mode degraded (embedding/rerank lokal atau tanpa key).");
+  if (codeNote) console.error(`! ${codeNote}`);
 }
