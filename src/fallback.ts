@@ -1,0 +1,167 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  CompleteHandoffInput,
+  HANDOFF_LIMITS,
+  type HandoffSummary,
+  type McpToolOutput,
+  ReportBlockerInput,
+} from "@catenext/shared";
+import type { AgentApi } from "./api-client.js";
+import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
+
+/**
+ * Fallback CLI untuk agen tanpa MCP (blueprint §4.3): `catenext next/claim/done/block`.
+ * Endpoint, sensor secret, dan validasi Zod sama persis dengan tool MCP.
+ */
+
+const exec = promisify(execFile);
+
+async function git(args: string[], cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec("git", args, { cwd });
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+export interface GitState {
+  branch: string | null;
+  commit: string | null;
+  /** File yang berubah di commit terakhir + perubahan yang belum di-commit. */
+  changedFiles: string[];
+}
+
+export async function readGitState(cwd: string = process.cwd()): Promise<GitState> {
+  const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const commit = await git(["rev-parse", "HEAD"], cwd);
+  const lastCommit = (await git(["show", "--name-only", "--format=", "HEAD"], cwd)) ?? "";
+  const dirty = (await git(["diff", "--name-only", "HEAD"], cwd)) ?? "";
+  const changedFiles = [
+    ...new Set([...dirty.split("\n"), ...lastCommit.split("\n")].filter(Boolean)),
+  ];
+  return { branch, commit, changedFiles };
+}
+
+export async function taskNext(api: AgentApi, opts: { limit?: number; json?: boolean }) {
+  const res = await api.post<McpToolOutput<"get_ready_tasks">>("ready-tasks", {
+    limit: opts.limit ?? 10,
+  });
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  if (res.tasks.length === 0) {
+    return console.log(
+      "Tidak ada task siap untuk repo ini. Cek Dashboard untuk task DRAFT/BLOCKED.",
+    );
+  }
+  for (const t of res.tasks) {
+    const tags = [t.role, t.revision ? "revisi" : null].filter(Boolean).join(", ");
+    console.log(`${t.id}  ${t.title}${tags ? `  [${tags}]` : ""}`);
+  }
+  console.log(`\nAmbil satu: catenext claim ${res.tasks[0]?.id}`);
+}
+
+export function renderClaim(res: McpToolOutput<"claim_task">): string {
+  const out: string[] = [];
+  out.push(`# Task: ${res.task.title}`, "");
+  out.push(`- ID: ${res.task.id}`);
+  out.push(`- Lease sampai: ${res.lease_expires_at} (diperpanjang setiap perintah catenext)`);
+  if (res.task.role) out.push(`- Role: ${res.task.role}`);
+  if (res.task.revision_count > 0) out.push(`- Revisi ke-${res.task.revision_count}`);
+  out.push("", "## Instruksi", "", res.task.prompt_instruction.trim(), "");
+  if (res.revision) {
+    out.push("## Feedback revisi dari reviewer", "", res.revision.review_feedback.trim(), "");
+  }
+  if (res.dependencies.length > 0) {
+    out.push("## Handoff dari task dependensi", "");
+    for (const d of res.dependencies) {
+      const h = d.handoff_summary;
+      out.push(`### ${d.title}`, "");
+      out.push(`- Branch/commit: ${h.git_branch} @ ${h.last_commit_hash}`);
+      if (h.files_modified.length) out.push(`- File: ${h.files_modified.join(", ")}`);
+      for (const k of h.key_decisions) out.push(`- Keputusan: ${k}`);
+      if (h.verification_command) out.push(`- Verifikasi: \`${h.verification_command}\``);
+      out.push(`- Catatan: ${h.notes_for_next_agent}`, "");
+    }
+  }
+  for (const w of res.warnings) out.push(`! ${w}`);
+  out.push(
+    "## Setelah selesai",
+    "",
+    `catenext done ${res.task.id} --notes "<ringkasan untuk agen berikutnya>" --verify "<perintah tes>"`,
+    `Bila buntu: catenext block ${res.task.id} --category <kategori> --reason "<alasan spesifik>"`,
+  );
+  return out.join("\n");
+}
+
+export async function taskClaim(api: AgentApi, taskId: string, opts: { json?: boolean }) {
+  const res = await api.post<McpToolOutput<"claim_task">>("claim", { task_id: taskId });
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(renderClaim(res));
+}
+
+export interface DoneOptions {
+  notes?: string;
+  decision: string[];
+  file: string[];
+  verify?: string;
+  /** File JSON berisi handoff_summary lengkap, atau '-' untuk stdin. */
+  handoff?: string;
+  json?: boolean;
+}
+
+/** Susun handoff dari flag + git lokal. Flag eksplisit selalu menang atas deteksi git. */
+export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<HandoffSummary> {
+  if (!opts.notes) {
+    throw new PlanningInputError(
+      "--notes wajib: tulis ringkasan untuk agen berikutnya (atau pakai --handoff <file.json>).",
+    );
+  }
+  if (!gitState.branch || !gitState.commit) {
+    throw new PlanningInputError(
+      "Tidak bisa membaca branch/commit git. Jalankan di dalam repo git dan commit pekerjaan Anda dulu.",
+    );
+  }
+  const files = opts.file.length ? opts.file : gitState.changedFiles;
+  return {
+    files_modified: files.slice(0, HANDOFF_LIMITS.maxFilesModified),
+    key_decisions: opts.decision,
+    verification_command: opts.verify ?? null,
+    notes_for_next_agent: opts.notes,
+    git_branch: gitState.branch,
+    last_commit_hash: gitState.commit,
+  };
+}
+
+export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions) {
+  const summary = opts.handoff
+    ? await readJsonInput(opts.handoff)
+    : buildHandoff(opts, await readGitState());
+  const body = prepare(CompleteHandoffInput, { task_id: taskId, handoff_summary: summary }, [
+    "task_id",
+    "last_commit_hash",
+  ]);
+  const res = await api.post<McpToolOutput<"complete_handoff">>("complete", body);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(
+    res.status === "DONE"
+      ? `✓ Task selesai (DONE). ${res.unlocked_task_ids.length} task hilir terbuka.`
+      : "✓ Handoff terkirim, menunggu review manusia (NEEDS_REVIEW).",
+  );
+  console.log(`  ${res.next_step_hint}`);
+}
+
+export async function taskBlock(
+  api: AgentApi,
+  taskId: string,
+  opts: { category: string; reason: string; json?: boolean },
+) {
+  const body = prepare(
+    ReportBlockerInput,
+    { task_id: taskId, category: opts.category, reason: opts.reason },
+    ["task_id", "category"],
+  );
+  const res = await api.post<McpToolOutput<"report_blocker">>("blocker", body);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log("✓ Task ditandai BLOCKED dan lock dilepas. Manusia akan meninjau di Dashboard.");
+}

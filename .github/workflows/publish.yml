@@ -1,0 +1,36 @@
+# Rilis npm dengan provenance. Dipicu oleh tag v* yang didorong workflow sinkron dari repo utama.
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # wajib untuk npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - name: Versi tag harus sama dengan package.json
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+        env:
+          # URL Catenext Cloud yang dipakai bila pengguna tidak mengisi --api-url.
+          CATENEXT_DEFAULT_API_URL: ${{ vars.CATENEXT_DEFAULT_API_URL }}
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

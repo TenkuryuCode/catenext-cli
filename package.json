@@ -1,0 +1,61 @@
+{
+  "name": "catenext",
+  "version": "0.1.0",
+  "description": "Estafet task & konteks antar-agen AI coding (Claude Code, Cursor, Codex, ...) lewat MCP lokal",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "claude-code",
+    "cursor",
+    "handoff",
+    "cli"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/TenkuryuCode/catenext-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TenkuryuCode/catenext-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TenkuryuCode/catenext-cli/issues"
+  },
+  "type": "module",
+  "bin": {
+    "catenext": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "commander": "^15.1.0",
+    "diff": "^9.0.0",
+    "jsonc-parser": "^3.3.1",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1",
+    "esbuild": "0.25.12"
+  },
+  "packageManager": "pnpm@12.23.0+sha512.02da94ffaf133f46074322afe552f90d40b5f71ae259aefbccdacc5085b1d617e98d65e0131f5748b9b67445978ee5055d7d59a473f1eef0d504854fefcd5975"
+}
