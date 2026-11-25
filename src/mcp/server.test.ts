@@ -265,7 +265,7 @@ describe("server MCP catenext", () => {
     });
   });
 
-  it("save_repo_skill menulis file lokal, menyensor secret, dan hanya mengirim indeks", async () => {
+  it("save_repo_skill menulis file lokal dan menyensor secret tanpa mengubah indeks Cloud", async () => {
     const { client, calls, root: dir } = await setup();
     const res = await client.callTool({
       name: "save_repo_skill",
@@ -283,12 +283,8 @@ describe("server MCP catenext", () => {
     const file = await readFile(join(dir, ".catenext/skills/db-migrations.md"), "utf8");
     expect(file).toContain("name: db-migrations");
     expect(file).not.toContain("sk_live_abcdefghijklmnop1234");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.method).toBe("PUT");
-    expect(calls[0]?.url).toBe("http://api.test/api/v1/agent/skills");
-    expect(calls[0]?.body).toEqual({
-      skills: [{ name: "db-migrations", when_to_use: "Saat mengubah skema database" }],
-    });
+    expect(calls).toHaveLength(0);
+    expect(textOf(res)).toContain("catenext sync");
 
     const loaded = await client.callTool({
       name: "load_skill",
@@ -299,20 +295,6 @@ describe("server MCP catenext", () => {
       name: "db-migrations",
       when_to_use: "Saat mengubah skema database",
     });
-  });
-
-  it("save_repo_skill tetap menyimpan lokal bila sinkron indeks gagal", async () => {
-    const { client, root: dir } = await setup(() => ({
-      status: 503,
-      body: { error: { code: "unavailable", message: "API mati" } },
-    }));
-    const res = await client.callTool({
-      name: "save_repo_skill",
-      arguments: { name: "testing", when_to_use: "Saat menulis tes", content: "Pakai vitest." },
-    });
-    expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain("catenext sync");
-    expect(await readFile(join(dir, ".catenext/skills/testing.md"), "utf8")).toContain("vitest");
   });
 
   it("save_repo_skill menolak code dump", async () => {

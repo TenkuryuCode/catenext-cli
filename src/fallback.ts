@@ -1,11 +1,14 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import {
+  ClaimTaskInput,
   CompleteHandoffInput,
   HANDOFF_LIMITS,
   type HandoffSummary,
   type McpToolOutput,
   ReportBlockerInput,
+  ReviewInput,
 } from "@catenext/shared";
 import type { AgentApi } from "./api-client.js";
 import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
@@ -44,9 +47,14 @@ export async function readGitState(cwd: string = process.cwd()): Promise<GitStat
   return { branch, commit, changedFiles };
 }
 
-export async function taskNext(api: AgentApi, opts: { limit?: number; json?: boolean }) {
+export async function taskNext(
+  api: AgentApi,
+  opts: { as?: string; limit?: number; json?: boolean; lease?: string },
+) {
   const res = await api.post<McpToolOutput<"get_ready_tasks">>("ready-tasks", {
     limit: opts.limit ?? 10,
+    ...(opts.lease ? { lease_id: opts.lease } : {}),
+    ...(opts.as ? { agent_alias: opts.as } : {}),
   });
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   if (res.tasks.length === 0) {
@@ -55,10 +63,14 @@ export async function taskNext(api: AgentApi, opts: { limit?: number; json?: boo
     );
   }
   for (const t of res.tasks) {
-    const tags = [t.role, t.revision ? "revisi" : null].filter(Boolean).join(", ");
+    const tags = [t.persona ? `@${t.persona}` : null, t.role, t.revision ? "revisi" : null]
+      .filter(Boolean)
+      .join(", ");
     console.log(`${t.id}  ${t.title}${tags ? `  [${tags}]` : ""}`);
   }
-  console.log(`\nAmbil satu: catenext claim ${res.tasks[0]?.id}`);
+  console.log(
+    `\nAmbil satu: catenext claim ${res.tasks[0]?.id}${opts.as ? ` --as ${opts.as}` : ""}`,
+  );
 }
 
 export function renderClaim(res: McpToolOutput<"claim_task">): string {
@@ -66,9 +78,17 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   out.push(`# Task: ${res.task.title}`, "");
   out.push(`- ID: ${res.task.id}`);
   out.push(`- Lease sampai: ${res.lease_expires_at} (diperpanjang setiap perintah catenext)`);
+  if (res.lease_id)
+    out.push(`- Gunakan --lease ${res.lease_id} saat memperbarui atau menyerahkan task.`);
   if (res.task.role) out.push(`- Role: ${res.task.role}`);
   if (res.task.revision_count > 0) out.push(`- Revisi ke-${res.task.revision_count}`);
   out.push("", "## Instruksi", "", res.task.prompt_instruction.trim(), "");
+  if (res.persona) {
+    out.push(`## Persona: ${res.persona.alias} (${res.persona.role})`, "");
+    out.push("Patuhi aturan dan batas wilayah berikut:", "");
+    for (const r of res.persona.rules) out.push(`- ${r}`);
+    out.push("");
+  }
   if (res.revision) {
     out.push("## Feedback revisi dari reviewer", "", res.revision.review_feedback.trim(), "");
   }
@@ -78,6 +98,9 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
       const h = d.handoff_summary;
       out.push(`### ${d.title}`, "");
       out.push(`- Branch/commit: ${h.git_branch} @ ${h.last_commit_hash}`);
+      if (d.integrated_commit) {
+        out.push(`- Terintegrasi: ${d.integrated_commit.branch} @ ${d.integrated_commit.sha}`);
+      }
       if (h.files_modified.length) out.push(`- File: ${h.files_modified.join(", ")}`);
       for (const k of h.key_decisions) out.push(`- Keputusan: ${k}`);
       if (h.verification_command) out.push(`- Verifikasi: \`${h.verification_command}\``);
@@ -94,8 +117,26 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   return out.join("\n");
 }
 
-export async function taskClaim(api: AgentApi, taskId: string, opts: { json?: boolean }) {
-  const res = await api.post<McpToolOutput<"claim_task">>("claim", { task_id: taskId });
+export async function taskClaim(
+  api: AgentApi,
+  taskId: string,
+  opts: { as?: string; json?: boolean; worktree?: boolean },
+) {
+  const branch = opts.worktree
+    ? await git(["symbolic-ref", "--short", "HEAD"], process.cwd())
+    : null;
+  if (opts.worktree && !branch)
+    throw new PlanningInputError("Checkout branch kerja sebelum memakai --worktree.");
+  const payload = prepare(
+    ClaimTaskInput,
+    {
+      task_id: taskId,
+      ...(opts.as ? { agent_alias: opts.as } : {}),
+      ...(branch ? { worktree: { branch, session_id: randomUUID() } } : {}),
+    },
+    ["task_id", "session_id"],
+  );
+  const res = await api.post<McpToolOutput<"claim_task">>("claim", payload);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log(renderClaim(res));
 }
@@ -105,6 +146,9 @@ export interface DoneOptions {
   decision: string[];
   file: string[];
   verify?: string;
+  pr?: string;
+  base?: string;
+  lease?: string;
   /** File JSON berisi handoff_summary lengkap, atau '-' untuk stdin. */
   handoff?: string;
   json?: boolean;
@@ -122,6 +166,8 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
       "Tidak bisa membaca branch/commit git. Jalankan di dalam repo git dan commit pekerjaan Anda dulu.",
     );
   }
+  if (Boolean(opts.pr) !== Boolean(opts.base))
+    throw new PlanningInputError("Gunakan --pr dan --base bersama.");
   const files = opts.file.length ? opts.file : gitState.changedFiles;
   return {
     files_modified: files.slice(0, HANDOFF_LIMITS.maxFilesModified),
@@ -130,6 +176,9 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
     notes_for_next_agent: opts.notes,
     git_branch: gitState.branch,
     last_commit_hash: gitState.commit,
+    ...(opts.pr && opts.base
+      ? { pull_request: { url: opts.pr, base_branch: opts.base, head_sha: gitState.commit } }
+      : {}),
   };
 }
 
@@ -137,16 +186,17 @@ export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions)
   const summary = opts.handoff
     ? await readJsonInput(opts.handoff)
     : buildHandoff(opts, await readGitState());
-  const body = prepare(CompleteHandoffInput, { task_id: taskId, handoff_summary: summary }, [
-    "task_id",
-    "last_commit_hash",
-  ]);
+  const body = prepare(
+    CompleteHandoffInput,
+    { task_id: taskId, handoff_summary: summary, lease_id: opts.lease },
+    ["task_id", "last_commit_hash", "head_sha", "lease_id"],
+  );
   const res = await api.post<McpToolOutput<"complete_handoff">>("complete", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log(
     res.status === "DONE"
       ? `✓ Task selesai (DONE). ${res.unlocked_task_ids.length} task hilir terbuka.`
-      : "✓ Handoff terkirim, menunggu review manusia (NEEDS_REVIEW).",
+      : "✓ Handoff terkirim, menunggu review (NEEDS_REVIEW).",
   );
   console.log(`  ${res.next_step_hint}`);
 }
@@ -154,14 +204,36 @@ export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions)
 export async function taskBlock(
   api: AgentApi,
   taskId: string,
-  opts: { category: string; reason: string; json?: boolean },
+  opts: { category: string; reason: string; json?: boolean; lease?: string },
 ) {
   const body = prepare(
     ReportBlockerInput,
-    { task_id: taskId, category: opts.category, reason: opts.reason },
-    ["task_id", "category"],
+    { task_id: taskId, category: opts.category, reason: opts.reason, lease_id: opts.lease },
+    ["task_id", "category", "lease_id"],
   );
   const res = await api.post<McpToolOutput<"report_blocker">>("blocker", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log("✓ Task ditandai BLOCKED dan lock dilepas. Manusia akan meninjau di Dashboard.");
+}
+
+export async function taskReview(api: AgentApi, input: unknown, json: boolean) {
+  const body = prepare(ReviewInput, input, ["task_id", "lease_id", "head_sha"]);
+  const result = await api.post<McpToolOutput<"review_pull_request">>(
+    body.action === "list" ? "review/list" : "review",
+    body,
+  );
+  if (json) console.log(JSON.stringify(result, null, 2));
+  else if ("reviews" in result) {
+    if (!result.reviews.length) console.log("Belum ada PR yang bisa Anda review di repo ini.");
+    for (const item of result.reviews)
+      console.log(`${item.task_id}  ${item.title}  ${item.review.url}`);
+  } else {
+    console.log(`${result.title}  ${result.status} · ${result.review.stage}`);
+    console.log(`${result.review.url} @ ${result.review.head_sha}`);
+    if (result.lease_id)
+      console.log(`Lease review: ${result.lease_id} (sampai ${result.lease_expires_at})`);
+    if (result.notes_for_next_agent) console.log(result.notes_for_next_agent);
+    if (result.warning) console.error(result.warning);
+  }
+  if ("warning" in result && result.warning) process.exitCode = 1;
 }

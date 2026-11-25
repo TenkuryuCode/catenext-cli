@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ReleaseTaskInput } from "./api.js";
 import {
   AgentAliasSchema,
   IdSchema,
@@ -8,6 +9,7 @@ import {
 } from "./common.js";
 import { findCycle } from "./dag.js";
 import { HandoffSummarySchema } from "./handoff.js";
+import { CommitShaSchema, ReviewInput, ReviewOutput } from "./review.js";
 import {
   SKILL_LIMITS,
   SkillContentSchema,
@@ -40,11 +42,12 @@ const DependencyHandoffSchema = z.object({
   task_id: IdSchema,
   title: z.string(),
   handoff_summary: HandoffSummarySchema,
+  integrated_commit: z.object({ branch: z.string(), sha: CommitShaSchema }).optional(),
 });
 
 // --- get_project_context ----------------------------------------------------
 
-export const GetProjectContextInput = z.object(PersonaFilter);
+export const GetProjectContextInput = z.object({ ...PersonaFilter, lease_id: IdSchema.optional() });
 export const GetProjectContextOutput = z.object({
   project: z.object({
     id: IdSchema,
@@ -58,6 +61,7 @@ export const GetProjectContextOutput = z.object({
   epic_summary: z.string().max(1000).optional(),
   /** Tier 1: indeks skill saja, isi lengkap lewat load_skill. */
   skills: z.array(SkillIndexEntrySchema),
+  skill_revision: CommitShaSchema.optional(),
   /**
    * Handoff dari dependensi langsung task aktif (dependency-scoped context). Jika belum ada
    * task aktif: handoff dependensi task yang siap diklaim (maks. 5).
@@ -69,6 +73,7 @@ export const GetProjectContextOutput = z.object({
 
 export const GetReadyTasksInput = z.object({
   ...PersonaFilter,
+  lease_id: IdSchema.optional(),
   limit: z.number().int().min(1).max(50).default(10),
 });
 export const GetReadyTasksOutput = z.object({
@@ -78,7 +83,20 @@ export const GetReadyTasksOutput = z.object({
 // --- claim_task -------------------------------------------------------------
 
 export const ClaimTaskInput = z.object({
+  worktree: z
+    .object({
+      session_id: IdSchema,
+      branch: z
+        .string()
+        .min(1)
+        .max(255)
+        .regex(/^[a-zA-Z0-9_./-]+$/)
+        .refine((s) => s !== "HEAD" && !s.startsWith("-") && !s.includes("..")),
+    })
+    .optional(),
   task_id: IdSchema,
+  /** Alias persona yang sedang dipakai agen. Task milik persona lain ditolak. */
+  agent_alias: AgentAliasSchema.optional(),
 });
 export const ClaimTaskOutput = z.object({
   task: z.object({
@@ -90,7 +108,10 @@ export const ClaimTaskOutput = z.object({
     target_repo: RepoNameSchema.optional(),
     revision_count: z.number().int().min(0),
   }),
+  /** Persona penanggung jawab task (atau persona agen): ikuti aturan dan batas wilayahnya. */
+  persona: PersonaSchema.optional(),
   lease_expires_at: IsoDateTimeSchema,
+  lease_id: IdSchema.optional(),
   dependencies: z.array(DependencyHandoffSchema),
   /** Diisi bila task diambil dari REVISION_REQUESTED. */
   revision: z
@@ -106,6 +127,7 @@ export const ClaimTaskOutput = z.object({
 // --- complete_handoff -------------------------------------------------------
 
 export const CompleteHandoffInput = z.object({
+  lease_id: IdSchema.optional(),
   task_id: IdSchema,
   handoff_summary: HandoffSummarySchema,
 });
@@ -120,6 +142,7 @@ export const CompleteHandoffOutput = z.object({
 // --- report_blocker ---------------------------------------------------------
 
 export const ReportBlockerInput = z.object({
+  lease_id: IdSchema.optional(),
   task_id: IdSchema,
   category: BlockerCategorySchema,
   reason: z.string().min(10).max(1000),
@@ -151,6 +174,8 @@ export const PlannedTaskSchema = z.object({
     .default([]),
   target_repo: RepoNameSchema.optional(),
   role: RoleSchema.optional(),
+  /** Alias persona penanggung jawab (lihat list_personas). Role task mengikuti persona ini. */
+  persona: AgentAliasSchema.optional(),
   requires_approval: z.boolean().default(false),
 });
 
@@ -218,9 +243,11 @@ export const CreateTasksOutput = z.object({
 
 export const LoadSkillInput = z.object({
   name: SkillNameSchema,
+  revision: CommitShaSchema.optional(),
 });
 export const LoadSkillOutput = z.object({
   name: SkillNameSchema,
+  revision: CommitShaSchema.optional(),
   when_to_use: z.string(),
   content: z.string(),
 });
@@ -298,18 +325,28 @@ function tool<I extends z.ZodType, O extends z.ZodType>(
 }
 
 export const MCP_TOOLS = {
+  release_task: tool(
+    "Lepas lease task supaya sesi lain bisa mengambilnya.",
+    ReleaseTaskInput,
+    z.object({ task_id: IdSchema, status: z.enum(["TODO", "REVISION_REQUESTED"]) }),
+  ),
+  review_pull_request: tool(
+    "Antrean, claim, hasil review, atau cek merge pull request.",
+    z.object({ request: ReviewInput }),
+    ReviewOutput,
+  ),
   get_project_context: tool(
     "Baca konteks proyek: identitas repo, aturan persona, indeks skill, dan handoff dependensi langsung.",
     GetProjectContextInput,
     GetProjectContextOutput,
   ),
   get_ready_tasks: tool(
-    "Daftar ringkas task siap dikerjakan untuk repo ini (semua dependensi DONE).",
+    "Daftar ringkas task siap dikerjakan untuk repo ini (semua dependensi DONE). Dengan agent_alias, hanya task milik persona itu (dan task tanpa penanggung jawab yang role-nya cocok).",
     GetReadyTasksInput,
     GetReadyTasksOutput,
   ),
   claim_task: tool(
-    "Kunci task (lease 30 menit) dan ambil instruksi lengkap beserta handoff dependensinya.",
+    "Kunci task (lease 30 menit) dan ambil instruksi lengkap, handoff dependensi, serta aturan persona penanggung jawabnya. Kirim agent_alias bila bekerja sebagai persona tertentu.",
     ClaimTaskInput,
     ClaimTaskOutput,
   ),

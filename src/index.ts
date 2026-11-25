@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { BLOCKER_CATEGORIES } from "@catenext/shared";
+import { BLOCKER_CATEGORIES, type McpToolOutput, ReleaseTaskInput } from "@catenext/shared";
 import { Command } from "commander";
 import { ApiRequestError } from "./api-client.js";
 import { ConfigError, findProjectRoot, readConfig } from "./config.js";
@@ -16,7 +16,7 @@ import {
   validateApiKey,
 } from "./credentials.js";
 import { deviceLogin } from "./device-login.js";
-import { taskBlock, taskClaim, taskDone, taskNext } from "./fallback.js";
+import { taskBlock, taskClaim, taskDone, taskNext, taskReview } from "./fallback.js";
 import { applyInit, planInit, renderDiff } from "./init/index.js";
 import { McpConfigError } from "./init/mcp-config.js";
 import { applyFileEdits, planRemove, planSync, summarize, syncSkills } from "./maintenance.js";
@@ -29,8 +29,11 @@ import {
   PlanningInputError,
   personaList,
   personaSet,
+  prepare,
   taskCreate,
 } from "./planning.js";
+import { loadSkill, SkillError } from "./skills.js";
+import { planSubagents, SUBAGENTS_DIR } from "./subagents.js";
 import { formatChecks, verifySetup } from "./verify.js";
 
 /** Diisi build.mjs dari package.json; "dev" saat dijalankan lewat tsc/tsx. */
@@ -52,6 +55,7 @@ async function friendly(fn: () => Promise<void>) {
       err instanceof ConfigError ||
       err instanceof CredentialsError ||
       err instanceof McpConfigError ||
+      err instanceof SkillError ||
       err instanceof PlanningInputError
     ) {
       console.error(`✗ ${err.message}`);
@@ -281,9 +285,11 @@ program
   .command("next")
   .description("Daftar task siap untuk repo ini (setara get_ready_tasks)")
   .option("-n, --limit <n>", "Jumlah maksimal", (v) => Number.parseInt(v, 10), 10)
+  .option("--as <alias>", "Bekerja sebagai persona ini: hanya task miliknya (mis. adel)")
+  .option("--lease <id>", "Perpanjang lease worktree yang aktif")
   .option(...AGENT_OPT)
   .option("--json", "Keluaran JSON")
-  .action((opts: { limit: number; agent: string; json?: boolean }) =>
+  .action((opts: { limit: number; as?: string; agent: string; json?: boolean; lease?: string }) =>
     friendly(async () => taskNext(await cliApi(opts.agent), opts)),
   );
 
@@ -291,10 +297,13 @@ program
   .command("claim")
   .description("Kunci task dan cetak instruksi + handoff dependensinya (setara claim_task)")
   .argument("<task_id>")
+  .option("--as <alias>", "Bekerja sebagai persona ini; task milik persona lain ditolak")
+  .option("--worktree", "Reservasi branch checkout dan ambil lease sesi terpisah")
   .option(...AGENT_OPT)
   .option("--json", "Keluaran JSON")
-  .action((taskId: string, opts: { agent: string; json?: boolean }) =>
-    friendly(async () => taskClaim(await cliApi(opts.agent), taskId, opts)),
+  .action(
+    (taskId: string, opts: { as?: string; agent: string; json?: boolean; worktree?: boolean }) =>
+      friendly(async () => taskClaim(await cliApi(opts.agent), taskId, opts)),
   );
 
 program
@@ -315,6 +324,9 @@ program
     [] as string[],
   )
   .option("--verify <cmd>", "Perintah verifikasi, mis. pnpm test")
+  .option("--pr <url>", "URL pull request GitHub")
+  .option("--base <branch>", "Branch tujuan PR")
+  .option("--lease <id>", "Lease worktree dari claim")
   .option("--handoff <file>", "File JSON handoff_summary lengkap, atau '-' untuk stdin")
   .option(...AGENT_OPT)
   .option("--json", "Keluaran JSON")
@@ -327,6 +339,9 @@ program
         file: string[];
         verify?: string;
         handoff?: string;
+        pr?: string;
+        base?: string;
+        lease?: string;
         agent: string;
         json?: boolean;
       },
@@ -339,11 +354,128 @@ program
   .argument("<task_id>")
   .requiredOption("--category <category>", `Salah satu: ${BLOCKER_CATEGORIES.join(", ")}`)
   .requiredOption("--reason <text>", "Alasan spesifik (min. 10 karakter)")
+  .option("--lease <id>", "Lease worktree dari claim")
   .option(...AGENT_OPT)
   .option("--json", "Keluaran JSON")
   .action(
-    (taskId: string, opts: { category: string; reason: string; agent: string; json?: boolean }) =>
-      friendly(async () => taskBlock(await cliApi(opts.agent), taskId, opts)),
+    (
+      taskId: string,
+      opts: { category: string; reason: string; agent: string; json?: boolean; lease?: string },
+    ) => friendly(async () => taskBlock(await cliApi(opts.agent), taskId, opts)),
+  );
+
+program
+  .command("release")
+  .description("Lepas task untuk sesi lain")
+  .argument("<task_id>")
+  .option("--lease <id>", "Lease worktree dari claim")
+  .option(...AGENT_OPT)
+  .action((taskId: string, opts: { agent: string; lease?: string }) =>
+    friendly(async () => {
+      const input = prepare(ReleaseTaskInput, { task_id: taskId, lease_id: opts.lease }, [
+        "task_id",
+        "lease_id",
+      ]);
+      const api = await cliApi(opts.agent);
+      console.log(JSON.stringify(await api.post("release", input), null, 2));
+    }),
+  );
+
+const review = program.command("review").description("Antrean dan keputusan review pull request");
+review
+  .command("list")
+  .option("-n, --limit <n>", "Jumlah maksimal", Number, 10)
+  .option(...AGENT_OPT)
+  .option("--json")
+  .action((opts: { limit: number; agent: string; json?: boolean }) =>
+    friendly(async () =>
+      taskReview(
+        await cliApi(opts.agent),
+        { action: "list", limit: opts.limit },
+        Boolean(opts.json),
+      ),
+    ),
+  );
+review
+  .command("claim")
+  .argument("<task_id>")
+  .option("--as <alias>", "Persona reviewer")
+  .option(...AGENT_OPT)
+  .option("--json")
+  .action((taskId: string, opts: { as?: string; agent: string; json?: boolean }) =>
+    friendly(async () =>
+      taskReview(
+        await cliApi(opts.agent),
+        { action: "claim", task_id: taskId, agent_alias: opts.as },
+        Boolean(opts.json),
+      ),
+    ),
+  );
+review
+  .command("refresh")
+  .argument("<task_id>")
+  .option(...AGENT_OPT)
+  .option("--json")
+  .action((taskId: string, opts: { agent: string; json?: boolean }) =>
+    friendly(async () =>
+      taskReview(
+        await cliApi(opts.agent),
+        { action: "refresh", task_id: taskId },
+        Boolean(opts.json),
+      ),
+    ),
+  );
+review
+  .command("submit")
+  .argument("<task_id>")
+  .requiredOption("--lease <id>")
+  .requiredOption("--sha <sha>")
+  .requiredOption("--decision <approve|request_changes>")
+  .requiredOption("--feedback <text>")
+  .option(...AGENT_OPT)
+  .option("--json")
+  .action(
+    (
+      taskId: string,
+      opts: {
+        lease: string;
+        sha: string;
+        decision: string;
+        feedback: string;
+        agent: string;
+        json?: boolean;
+      },
+    ) =>
+      friendly(async () =>
+        taskReview(
+          await cliApi(opts.agent),
+          {
+            action: "submit",
+            task_id: taskId,
+            lease_id: opts.lease,
+            head_sha: opts.sha,
+            decision: opts.decision,
+            feedback: opts.feedback,
+          },
+          Boolean(opts.json),
+        ),
+      ),
+  );
+
+program
+  .command("skill")
+  .description("Baca skill repo dari checkout atau revisi Git")
+  .command("load")
+  .argument("<name>")
+  .option("--revision <sha>", "SHA commit Git untuk paritas lintas perangkat")
+  .option("--json")
+  .action((name: string, opts: { revision?: string; json?: boolean }) =>
+    friendly(async () => {
+      const skill = await loadSkill(await requireRoot(), name, opts.revision);
+      console.log(
+        opts.json ? JSON.stringify({ ...skill, revision: opts.revision }, null, 2) : skill.content,
+      );
+    }),
   );
 
 /** Root repo (berisi .catenext/config.yaml) atau error yang ramah manusia. */
@@ -385,9 +517,9 @@ program
       for (const f of plan.findings) console.log(`${f.level === "ok" ? "•" : "!"} ${f.message}`);
       if (opts.dryRun) {
         for (const l of summarize(plan.edits)) console.log(l);
-        const { count, invalid } = await syncSkills(root, null);
+        const { count, invalid, skipped } = await syncSkills(root, null);
         console.log(
-          `(dry-run) ${plan.edits.length} file akan berubah; indeks ${count} skill akan dikirim.`,
+          `(dry-run) ${plan.edits.length} file akan berubah; ${skipped ? "indeks skill tidak akan diubah." : `indeks ${count} skill akan dikirim.`}`,
         );
         for (const i of invalid) console.log(`! Skill dilewati: ${i.error}`);
         return;
@@ -398,12 +530,26 @@ program
       if (plan.edits.length === 0 && !fixable) console.log("✓ File lokal sudah selaras.");
 
       try {
-        const { count, invalid } = await syncSkills(root, await cliApi());
-        console.log(`✓ Indeks ${count} skill tersinkron ke Cloud (isi skill tetap lokal).`);
+        const api = await cliApi();
+        const { count, invalid, skipped } = await syncSkills(root, api);
+        console.log(
+          skipped
+            ? "• Indeks Cloud mengikuti branch utama origin. Sinkronkan dari checkout branch itu setelah fetch."
+            : `✓ Indeks ${count} skill tersinkron ke Cloud (isi skill tetap di Git).`,
+        );
         for (const i of invalid) console.log(`! Skill dilewati: ${i.error}`);
+        const { personas } = await api.post<McpToolOutput<"list_personas">>("personas/list");
+        const sub = await planSubagents(root, personas);
+        await applyFileEdits(root, sub.edits);
+        for (const l of summarize(sub.edits)) console.log(l);
+        for (const s of sub.skipped)
+          console.log(`! ${s} sudah ada dan bukan buatan Catenext; tidak ditimpa.`);
+        console.log(
+          `✓ ${personas.length} persona tersedia sebagai subagent Claude Code di ${SUBAGENTS_DIR}/.`,
+        );
       } catch (err) {
         if (!(err instanceof CredentialsError || err instanceof ApiRequestError)) throw err;
-        console.log(`! Indeks skill belum tersinkron: ${err.message}`);
+        console.log(`! Skill/persona belum tersinkron: ${err.message}`);
       }
       console.log("");
       console.log(formatChecks(await verifySetup(root, config)));

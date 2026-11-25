@@ -6,6 +6,7 @@ import {
   RepoNameSchema,
   RoleSchema,
 } from "./common.js";
+import { CommitShaSchema, PullRequestStateSchema } from "./review.js";
 import { BlockerCategorySchema, TaskSchema } from "./task.js";
 
 /**
@@ -49,6 +50,8 @@ export type Epic = z.infer<typeof EpicSchema>;
 
 /** Task seperti yang dikirim API: TaskSchema + urutan Kanban dan kategori blocker. */
 export const TaskDtoSchema = TaskSchema.extend({
+  pull_request: PullRequestStateSchema.nullable().optional(),
+  worktree_branch: z.string().nullable().optional(),
   position: z.number(),
   lock_repo: RepoNameSchema.nullable(),
   blocker_category: BlockerCategorySchema.nullable(),
@@ -116,7 +119,12 @@ export const CreateProjectInput = z.object({
   detected_stack: z.array(z.string().min(1).max(40)).max(20).default([]),
 });
 
-export const UpdateProjectInput = CreateProjectInput.partial();
+// Skema update ditulis eksplisit, bukan CreateX.partial(): di Zod 4 field ber-.default() tetap
+// terisi default saat tidak dikirim, sehingga PATCH { name } diam-diam mengosongkan detected_stack.
+export const UpdateProjectInput = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  detected_stack: z.array(z.string().min(1).max(40)).max(20).optional(),
+});
 
 export const CreateEpicInput = z.object({
   title: z.string().trim().min(1).max(200),
@@ -131,6 +139,8 @@ export const CreateTaskInput = z.object({
   prompt_instruction: z.string().min(1).max(8000),
   target_repo: RepoNameSchema.nullish(),
   role: RoleSchema.nullish(),
+  /** Persona penanggung jawab; role task otomatis mengikuti role persona. */
+  persona_id: IdSchema.nullish(),
   requires_approval: z.boolean().default(false),
   depends_on: z.array(IdSchema).max(10).default([]),
   /** Task buatan manusia langsung TODO; DRAFT bila ingin ditinjau bersama rencana agen. */
@@ -142,6 +152,7 @@ export const UpdateTaskInput = z.object({
   prompt_instruction: z.string().min(1).max(8000).optional(),
   target_repo: RepoNameSchema.nullable().optional(),
   role: RoleSchema.nullable().optional(),
+  persona_id: IdSchema.nullable().optional(),
   requires_approval: z.boolean().optional(),
   assignee_id: IdSchema.nullable().optional(),
   position: z.number().finite().optional(),
@@ -181,7 +192,13 @@ export const PersonaInput = z.object({
   project_id: IdSchema.nullish(),
 });
 
-export const UpdatePersonaInput = PersonaInput.partial();
+// Eksplisit, bukan PersonaInput.partial(): lihat catatan di UpdateProjectInput (rules ber-default).
+export const UpdatePersonaInput = z.object({
+  alias: AgentAliasSchema.optional(),
+  role: RoleSchema.optional(),
+  rules: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+  project_id: IdSchema.nullish(),
+});
 
 export const CreateApiKeyInput = z.object({
   name: z.string().trim().min(1).max(80),
@@ -205,9 +222,11 @@ export const AGENT_HEADERS = {
 
 export const API_KEY_PREFIX = "ctnx_";
 
-export const ReleaseTaskInput = z.object({ task_id: IdSchema });
+export const ReleaseTaskInput = z.object({ task_id: IdSchema, lease_id: IdSchema.optional() });
 
 export const SyncSkillsInput = z.object({
+  revision: CommitShaSchema.optional(),
+  previous_revision: CommitShaSchema.nullable().optional(),
   skills: z
     .array(
       z.object({

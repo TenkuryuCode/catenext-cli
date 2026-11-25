@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { IdSchema, IsoDateTimeSchema, RepoNameSchema, RoleSchema } from "./common.js";
+import {
+  AgentAliasSchema,
+  IdSchema,
+  IsoDateTimeSchema,
+  RepoNameSchema,
+  RoleSchema,
+} from "./common.js";
 import { HandoffSummarySchema } from "./handoff.js";
 
 /**
@@ -177,6 +183,8 @@ export const TaskSchema = z.object({
   requires_approval: z.boolean().default(false),
   target_repo: RepoNameSchema.nullable(),
   role: RoleSchema.nullable(),
+  /** Persona penanggung jawab. Bila diisi, hanya agen dengan alias persona ini yang boleh mengambilnya. */
+  persona_id: IdSchema.nullable(),
   assignee_id: IdSchema.nullable(),
   locked_by: z.string().max(200).nullable(),
   locked_at: IsoDateTimeSchema.nullable(),
@@ -199,6 +207,8 @@ export const TaskSummarySchema = z.object({
   title: z.string().min(1).max(200),
   depends_on: z.array(IdSchema),
   role: RoleSchema.optional(),
+  /** Alias persona penanggung jawab. */
+  persona: AgentAliasSchema.optional(),
   target_repo: RepoNameSchema.optional(),
   revision: z.boolean().optional(),
 });

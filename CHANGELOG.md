@@ -10,7 +10,38 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.2.0] - 2026-11-25
+
+### Ditambahkan
+- CLI dan MCP: antrean, klaim, keputusan, dan pengecekan merge PR GitHub. Handoff lewat PR menahan
+  task hilir sampai merge terverifikasi dan persetujuan pada SHA yang tepat terpenuhi.
+- `catenext claim --worktree` memakai lease sesi dan reservasi branch sehingga task independen
+  dapat berjalan paralel dalam satu repo. `catenext release` melepas lease untuk sesi lain.
+- `catenext skill load --revision <sha>` dan MCP `load_skill` membaca versi skill yang sama dari Git.
+  Indeks bersama diterbitkan lewat `sync` dari default branch origin yang sudah diperbarui.
+- Dashboard: tab Pull request, progres implementasi hingga merge, dan persetujuan per commit.
+- Persona penanggung jawab per task (`persona_id`). Role task mengikuti persona; bila hanya satu
+  persona yang cocok dengan role, persona itu dipasang otomatis. Dipilih di form task baru dan drawer
+  task, tampil sebagai badge di kartu.
+- Agen: `get_ready_tasks`/`claim_task` dengan `agent_alias` hanya mengambil task milik persona itu
+  (claim task milik persona lain ditolak 403); `claim_task` mengembalikan aturan persona; `create_tasks`
+  menerima `persona` (alias). CLI: `catenext next --as <alias>` dan `catenext claim <id> --as <alias>`.
+- `catenext sync` membuat subagent Claude Code per persona di `.claude/agents/<alias>.md`, sehingga
+  orchestrator cukup memanggil persona (mis. "adel, kerjakan"). `catenext remove` ikut membersihkannya.
+- Web: landing page publik di `/` (sebelumnya redirect ke `/projects`): hero, cara kerja, fitur,
+  mulai cepat dengan perintah CLI, harga dari `PLAN_LIMITS`, dan footer ke mirror CLI + npm.
+  Header menampilkan "Buka dashboard" bila sudah login. Dashboard tetap di `/projects`.
+- Web: metadata SEO untuk landing (title, description, OpenGraph, Twitter) dengan `metadataBase`
+  dari `PUBLIC_URL`; `app/robots.ts` dan `app/sitemap.ts` (izinkan `/`, `/login`, `/signup`;
+  blokir dashboard dan `/api`).
+- Dashboard: ubah nama proyek (ikon pensil di samping judul), serta edit dan hapus epic dari kartu
+  epic. Hapus epic meminta konfirmasi dan menyebut jumlah task yang ikut terhapus.
+- API: `DELETE /epics/:id` menolak (409 `epic_in_progress`) bila ada task di epic itu yang sedang
+  dikerjakan agen, sama seperti hapus task.
+
 ### Diperbaiki
+- API: `PATCH /projects/:id` dan `PATCH /personas/:id` tidak lagi mengosongkan `detected_stack` /
+  `rules` yang tidak dikirim (skema update dari `.partial()` Zod 4 tetap mengisi nilai default).
 - Workflow Release CLI: typecheck/test lewat turbo sehingga `@catenext/shared` di-build lebih dulu;
   root monorepo diganti nama `catenext-monorepo` agar `--filter catenext` tidak ikut menjalankan root.
 - `scripts/build-cli-mirror.mjs` menyalin file dengan baca/tulis biasa, bukan `fs.cpSync`, yang gagal
@@ -19,6 +50,8 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
   pada `${GITHUB_SHA::7}` saat push ke mirror).
 
 ### Diubah
+- Web: halaman Paket & kuota (`/upgrade`) kini menampilkan retensi handoff untuk setiap paket;
+  label harga & fitur paket dipindah ke `apps/web/lib/plans.ts` dan dipakai bersama landing page.
 - CI dan Release CLI di repo `catenext` berjalan di runner self-hosted (`docs/runner.md`);
   job berjalan di container `node:22-bookworm` (Postgres lewat nama service, store pnpm di volume Docker lokal tanpa cache GitHub). Publish npm tetap di runner GitHub demi provenance.
 

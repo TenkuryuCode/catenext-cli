@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { estimateTokens } from "./common.js";
+import { PullRequestRefSchema } from "./review.js";
 
 /** Batas payload handoff agar tetap ~300–600 token. */
 export const HANDOFF_LIMITS = {
@@ -43,8 +44,12 @@ export const HandoffSummarySchema = z
       .max(HANDOFF_LIMITS.maxVerificationCommandLength)
       .nullable(),
     notes_for_next_agent: NoCodeText(HANDOFF_LIMITS.maxNotesLength),
+    pull_request: PullRequestRefSchema.optional(),
     git_branch: z.string().min(1).max(255),
     last_commit_hash: z.string().regex(/^[0-9a-f]{7,64}$/, "Hash commit git (hex, 7–64 karakter)"),
+  })
+  .refine((h) => !h.pull_request || h.last_commit_hash === h.pull_request.head_sha, {
+    message: "SHA handoff harus sama dengan head SHA PR.",
   })
   .refine((h) => estimateHandoffTokens(h) <= HANDOFF_LIMITS.maxTokens, {
     message: `Ringkasan handoff melebihi ~${HANDOFF_LIMITS.maxTokens} token; ringkas lagi`,

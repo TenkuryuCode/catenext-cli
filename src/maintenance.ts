@@ -15,7 +15,8 @@ import {
   upsertMcpEntry,
 } from "./init/mcp-config.js";
 import { npxLaunch } from "./node-command.js";
-import { listSkills, SKILLS_DIR, skillIndex } from "./skills.js";
+import { committedSkillIndex, listSkills, SKILLS_DIR } from "./skills.js";
+import { catenextSubagentFiles, SUBAGENTS_DIR } from "./subagents.js";
 
 /** Perubahan file; `after: null` berarti file dihapus. */
 export interface FileEdit {
@@ -206,10 +207,20 @@ export async function planSync(opts: {
 export async function syncSkills(
   root: string,
   api: AgentApi | null,
-): Promise<{ count: number; invalid: { file: string; error: string }[] }> {
-  const { skills, invalid } = await listSkills(root);
-  if (api) await api.put("skills", { skills: skillIndex(skills) });
-  return { count: skills.length, invalid };
+): Promise<{ count: number; invalid: { file: string; error: string }[]; skipped: boolean }> {
+  const { revision: previous } = api
+    ? await api.post<{ revision: string | null }>("skills/ref")
+    : { revision: null };
+  const index = await committedSkillIndex(root, previous);
+  if (!index) return { count: 0, invalid: [], skipped: true };
+  if (api && previous !== index.revision) {
+    await api.put("skills", {
+      revision: index.revision,
+      previous_revision: previous,
+      skills: index.skills,
+    });
+  }
+  return { count: index.skills.length, invalid: index.invalid, skipped: false };
 }
 
 /** Rencana `catenext remove`. Skill repo disimpan kecuali `all`. */
@@ -250,6 +261,10 @@ export async function planRemove(opts: { root: string; all: boolean }): Promise<
     edits.push({ path: AGENTS_MD, before: agents, after: removeAgentsBlock(agents) });
   }
 
+  for (const p of await catenextSubagentFiles(root)) {
+    edits.push({ path: p, before: await readOrNull(join(root, p)), after: null });
+  }
+
   for (const p of [CONFIG_PATH, join(".catenext", "cache.json")]) {
     const before = await readOrNull(join(root, p));
     if (before !== null) edits.push({ path: p, before, after: null });
@@ -279,7 +294,7 @@ export async function applyFileEdits(root: string, edits: FileEdit[]): Promise<v
     await writeFile(tmp, e.after);
     await rename(tmp, target);
   }
-  for (const dir of [SKILLS_DIR, ".catenext", ".cursor"]) {
+  for (const dir of [SKILLS_DIR, ".catenext", ".cursor", SUBAGENTS_DIR, ".claude"]) {
     await rmdir(join(base, dir)).catch(() => {}); // hanya berhasil bila kosong
   }
 }

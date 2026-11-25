@@ -5,6 +5,7 @@ import {
   CreateTasksInput,
   MCP_TOOLS,
   ReportBlockerInput,
+  ReviewInput,
   SaveRepoSkillInput,
   UpsertPersonaInput,
 } from "@catenext/shared";
@@ -13,7 +14,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
 import { type AgentApi, ApiRequestError } from "../api-client.js";
 import { describeRedactions, scrubDeep } from "../scrubber.js";
-import { listSkills, loadSkill, SkillError, saveSkill, skillIndex } from "../skills.js";
+import { loadSkill, SkillError, saveSkill } from "../skills.js";
 
 /** Semua tool yang diekspos server MCP lokal. */
 export const LOCAL_TOOLS = [
@@ -22,6 +23,8 @@ export const LOCAL_TOOLS = [
   "claim_task",
   "complete_handoff",
   "report_blocker",
+  "review_pull_request",
+  "release_task",
   "list_epics",
   "create_epic",
   "create_tasks",
@@ -35,7 +38,7 @@ export const SERVER_INSTRUCTIONS = [
   "Catenext mengatur estafet task antar-agen AI untuk repo ini.",
   "Alur: get_project_context -> get_ready_tasks -> claim_task -> kerjakan & tes -> complete_handoff.",
   "Merencanakan: list_epics/create_epic -> create_tasks (masuk DRAFT, disetujui manusia di Web sebelum bisa dikerjakan).",
-  "Persona: list_personas/upsert_persona untuk alias, role, dan aturan agen di proyek ini.",
+  'Persona: list_personas/upsert_persona untuk alias, role, dan aturan agen di proyek ini. Setiap task bisa punya persona penanggung jawab; bila diminta bekerja sebagai persona (mis. "adel, kerjakan"), kirim agent_alias-nya ke get_project_context, get_ready_tasks, dan claim_task, lalu patuhi aturan persona dari hasil claim_task.',
   "Skill repo: indeksnya ada di get_project_context; panggil load_skill hanya bila relevan, dan save_repo_skill untuk mencatat konvensi/pitfall yang ditemukan (maks. 500 kata, tanpa code dump).",
   "Bila buntu, panggil report_blocker. Jangan menyalin kode atau secret ke handoff; rujuk path file.",
   "Jangan mengedit .catenext/config.yaml atau file konfigurasi MCP IDE.",
@@ -119,6 +122,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
           await api.post("context", {
             agent_alias: input.agent_alias ?? config.overrides?.default_agent_alias,
             role: input.role ?? config.overrides?.default_role,
+            lease_id: input.lease_id,
           }),
         ),
       ),
@@ -137,6 +141,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
             agent_alias: input.agent_alias ?? config.overrides?.default_agent_alias,
             role: input.role ?? config.overrides?.default_role,
             limit: input.limit,
+            lease_id: input.lease_id,
           }),
         ),
       ),
@@ -145,7 +150,16 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
   server.registerTool(
     "claim_task",
     { description: MCP_TOOLS.claim_task.description, inputSchema: MCP_TOOLS.claim_task.input },
-    (input) => call(async ({ api }) => json(await api.post("claim", { task_id: input.task_id }))),
+    (input) =>
+      call(async ({ api, config }) =>
+        json(
+          await api.post("claim", {
+            task_id: input.task_id,
+            worktree: input.worktree,
+            agent_alias: input.agent_alias ?? config.overrides?.default_agent_alias,
+          }),
+        ),
+      ),
   );
 
   server.registerTool(
@@ -156,7 +170,10 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     },
     (input) =>
       call(async ({ api }) => {
-        const scrubbed = scrubDeep(input, new Set(["task_id", "last_commit_hash"]));
+        const scrubbed = scrubDeep(
+          input,
+          new Set(["task_id", "last_commit_hash", "head_sha", "lease_id"]),
+        );
         // Validasi ulang setelah sensor: batas ukuran Zod tetap berlaku pada payload final.
         const parsed = CompleteHandoffInput.safeParse(scrubbed.value);
         if (!parsed.success) {
@@ -183,7 +200,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     },
     (input) =>
       call(async ({ api }) => {
-        const scrubbed = scrubDeep(input, new Set(["task_id", "category"]));
+        const scrubbed = scrubDeep(input, new Set(["task_id", "category", "lease_id"]));
         const parsed = ReportBlockerInput.safeParse(scrubbed.value);
         if (!parsed.success) {
           return text(`Laporan blocker tidak valid:\n${zodIssues(parsed.error)}`, true);
@@ -195,6 +212,33 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
           notes.push(note);
         }
         return json(await api.post("blocker", parsed.data), notes);
+      }),
+  );
+
+  server.registerTool(
+    "release_task",
+    { description: MCP_TOOLS.release_task.description, inputSchema: MCP_TOOLS.release_task.input },
+    (input) => call(async ({ api }) => json(await api.post("release", input))),
+  );
+
+  server.registerTool(
+    "review_pull_request",
+    {
+      description: MCP_TOOLS.review_pull_request.description,
+      inputSchema: MCP_TOOLS.review_pull_request.input,
+    },
+    ({ request }) =>
+      call(async ({ api, config }) => {
+        const scrubbed = scrubDeep(request, new Set(["task_id", "head_sha", "lease_id"]));
+        const input = ReviewInput.parse(scrubbed.value);
+        if (
+          input.action === "claim" &&
+          !input.agent_alias &&
+          config.overrides?.default_role === "reviewer"
+        ) {
+          input.agent_alias = config.overrides.default_agent_alias;
+        }
+        return json(await api.post(input.action === "list" ? "review/list" : "review", input));
       }),
   );
 
@@ -244,7 +288,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     },
     scrubbedWrite(
       CreateTasksInput,
-      ["epic_id", "ref", "depends_on", "target_repo", "role"],
+      ["epic_id", "ref", "depends_on", "target_repo", "role", "persona"],
       (api, body) => api.post("tasks", body),
     ),
   );
@@ -272,19 +316,24 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     { description: MCP_TOOLS.load_skill.description, inputSchema: MCP_TOOLS.load_skill.input },
     (input) =>
       call(async ({ root }) => {
-        const skill = await loadSkill(root, input.name);
-        return json({ name: skill.name, when_to_use: skill.when_to_use, content: skill.content });
+        const skill = await loadSkill(root, input.name, input.revision);
+        return json({
+          name: skill.name,
+          when_to_use: skill.when_to_use,
+          content: skill.content,
+          ...(input.revision ? { revision: input.revision } : {}),
+        });
       }),
   );
 
   server.registerTool(
     "save_repo_skill",
     {
-      description: `${MCP_TOOLS.save_repo_skill.description} Isi tetap di repo; hanya indeks (nama + when_to_use) yang dikirim ke Cloud.`,
+      description: `${MCP_TOOLS.save_repo_skill.description} File disimpan di checkout. Indeks Cloud diperbarui lewat sync dari branch utama.`,
       inputSchema: MCP_TOOLS.save_repo_skill.input,
     },
     (input) =>
-      call(async ({ api, root }) => {
+      call(async ({ root }) => {
         const scrubbed = scrubDeep(input, new Set(["name"]));
         const parsed = SaveRepoSkillInput.safeParse(scrubbed.value);
         if (!parsed.success) {
@@ -300,15 +349,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
           notes.push(note);
         }
         const saved = await saveSkill(root, parsed.data);
-        // Indeks Tier 1 ke Cloud. Gagal sinkron tidak membatalkan file lokal.
-        try {
-          const { skills } = await listSkills(root);
-          await api.put("skills", { skills: skillIndex(skills) });
-        } catch (err) {
-          notes.push(
-            `Skill tersimpan lokal, tetapi indeks belum tersinkron ke Cloud (${(err as Error).message}). Jalankan \`catenext sync\` nanti.`,
-          );
-        }
+        notes.push("Commit dan merge file skill, lalu jalankan catenext sync di branch utama.");
         return json({ path: saved.path, created: saved.created }, notes);
       }),
   );

@@ -11,7 +11,7 @@ const EPIC = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 const EXISTING = "0e1d2c3b-4a59-4687-9a5b-4c3d2e1f0a9b";
 
 describe("registry tool MCP", () => {
-  it("mengekspos tepat 12 tool", () => {
+  it("mengekspos tool yang didaftarkan server", () => {
     expect(MCP_TOOL_NAMES.sort()).toEqual(
       [
         "claim_task",
@@ -24,6 +24,8 @@ describe("registry tool MCP", () => {
         "list_personas",
         "load_skill",
         "report_blocker",
+        "release_task",
+        "review_pull_request",
         "save_repo_skill",
         "upsert_persona",
       ].sort(),
