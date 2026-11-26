@@ -796,6 +796,66 @@ describe("LocalService reviews and context", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("supports complete_handoff and review_pull_request with pull_request without url for local review", async () => {
+    await service.callTool("upsert_persona", { alias: "dev", role: "backend", repos: ["be"] });
+    await service.callTool("upsert_persona", { alias: "rev", role: "reviewer", repos: ["be"] });
+    const { id } = await draft([plan("local-rev")]);
+    const task_id = id("local-rev");
+    await manage("approve_plan", task_id);
+    const { lease_id } = await service.callTool("claim_task", { task_id, agent_alias: "dev" });
+
+    const done = await service.callTool("complete_handoff", {
+      lease_id,
+      task_id,
+      handoff_summary: handoff({
+        pull_request: { base_branch: "main", head_sha: heads.current },
+      }),
+    });
+    expect(done).toMatchObject({
+      status: "NEEDS_REVIEW",
+      next_step_hint: expect.stringContaining("Review lokal"),
+    });
+
+    const listed = await service.callTool("review_pull_request", { request: { action: "list" } });
+    expect(listed).toMatchObject({
+      reviews: [
+        {
+          task_id,
+          status: "NEEDS_REVIEW",
+          review: {
+            base_branch: "main",
+            head_sha: heads.current,
+            stage: "awaiting_review",
+            merge_sha: null,
+          },
+        },
+      ],
+    });
+    if ("reviews" in listed) {
+      expect(listed.reviews[0]?.review.url).toBeUndefined();
+    }
+
+    const claimed = await service.callTool("review_pull_request", {
+      request: { action: "claim", task_id, agent_alias: "rev" },
+    });
+    if (!("lease_id" in claimed) || !claimed.lease_id) throw new Error("Missing review lease");
+
+    const submitted = await service.callTool("review_pull_request", {
+      request: {
+        action: "submit",
+        task_id,
+        lease_id: claimed.lease_id,
+        head_sha: heads.current,
+        decision: "approve",
+        feedback: "Local review approved.",
+      },
+    });
+    expect(submitted).toMatchObject({
+      status: "NEEDS_REVIEW",
+      review: { stage: "awaiting_human_approval", head_sha: heads.current },
+    });
+  });
+
   it("searches versioned project documents, tasks and local skill index without remote services", async () => {
     const doc = {
       slug: "design",
@@ -1080,5 +1140,127 @@ describe("LocalService state persistence", () => {
 
     const limited = await new LocalService(root, config).readTaskEvents({ limit: 3 });
     expect(limited).toHaveLength(3);
+  });
+
+  it("exposes session_prefs.locale in session_brief and get_project_context when configured", async () => {
+    const beforeBrief = await service.callTool("session_brief", {});
+    const beforeCtx = await service.callTool("get_project_context", {});
+    expect(beforeBrief.locale).toBeUndefined();
+    expect(beforeCtx.locale).toBeUndefined();
+
+    await service.ensureSeed({ locale: "id" });
+
+    const afterBrief = await service.callTool("session_brief", {});
+    const afterCtx = await service.callTool("get_project_context", {});
+    expect(afterBrief.locale).toBe("id");
+    expect(afterCtx.locale).toBe("id");
+  });
+
+  it("supports updateEpic, updateTask, setTaskDependencies, and cancelTask with DAG/safety/agent checks", async () => {
+    await service.callTool("upsert_persona", { alias: "be", role: "backend", repos: ["be"] });
+    await service.callTool("upsert_persona", { alias: "fe", role: "frontend", repos: ["fe"] });
+    const { epic, id } = await draft([plan("a"), plan("b", { depends_on: ["a"] }), plan("c")]);
+
+    const updatedEpic = await service.updateEpic(epic.id, {
+      title: "Delivery v2",
+      description: "Updated scope",
+    });
+    expect(updatedEpic.title).toBe("Delivery v2");
+    expect(updatedEpic.description).toBe("Updated scope");
+    expect(updatedEpic.task_counts).toEqual({ DRAFT: 3 });
+
+    // Trigger stale=true on b via complete -> approve -> request_revision on a
+    await manage("approve_plan", id("a"));
+    await manage("approve_plan", id("b"));
+    const claimA = await service.callTool("claim_task", { task_id: id("a") });
+    await service.callTool("complete_handoff", {
+      task_id: id("a"),
+      lease_id: claimA.lease_id,
+      handoff_summary: handoff(),
+    });
+    await manage("approve", id("a"));
+    const claimB = await service.callTool("claim_task", { task_id: id("b") });
+    await service.callTool("complete_handoff", {
+      task_id: id("b"),
+      lease_id: claimB.lease_id,
+      handoff_summary: handoff(),
+    });
+    await manage("request_revision", id("a"), { feedback: "Need extra test coverage" });
+
+    const boardStale = await service.callTool("get_project_board", {});
+    expect(boardStale.tasks.find((t) => t.id === id("b"))?.is_stale).toBe(true);
+
+    // Update task b: clear stale, change title, prompt, persona, requires_approval
+    const updatedB = await service.updateTask(id("b"), {
+      title: "Task b updated",
+      prompt_instruction: "Updated instructions",
+      persona: "be",
+      requires_approval: true,
+      is_stale: false,
+    });
+    expect(updatedB.title).toBe("Task b updated");
+    expect(updatedB.instruction).toBe("Updated instructions");
+    expect(updatedB.persona).toBe("be");
+    expect(updatedB.role).toBe("backend");
+    expect(updatedB.requiresApproval).toBe(true);
+    expect(updatedB.stale).toBe(false);
+
+    // Reject persona/repo mismatch
+    await expect(
+      service.updateTask(id("c"), { target_repo: "be", persona: "fe" }),
+    ).rejects.toMatchObject({ code: "persona_repo_mismatch" });
+
+    // setTaskDependencies: reject missing dep and cycle, allow valid DAG change
+    await expect(
+      service.setTaskDependencies(id("c"), { depends_on: [randomUUID()] }),
+    ).rejects.toMatchObject({ code: "dependency_not_found" });
+    await expect(
+      service.setTaskDependencies(id("a"), { depends_on: [id("b")] }),
+    ).rejects.toMatchObject({ code: "dependency_cycle" });
+
+    const depsC = await service.setTaskDependencies(id("c"), { depends_on: [id("a")] });
+    expect(depsC.depends_on).toEqual([id("a")]);
+
+    // cancelTask: block when other tasks depend on it, block when IN_PROGRESS
+    await expect(service.cancelTask(id("a"))).rejects.toMatchObject({ code: "has_dependents" });
+
+    await manage("approve_plan", id("c"));
+    await service.setTaskDependencies(id("c"), { depends_on: [] });
+    await service.callTool("claim_task", { task_id: id("c") });
+    await expect(service.cancelTask(id("c"))).rejects.toMatchObject({ code: "task_locked" });
+
+    // Cancel task b (NEEDS_REVIEW, no dependents)
+    const cancelledB = await service.cancelTask(id("b"));
+    expect(cancelledB).toEqual({
+      task_id: id("b"),
+      title: "Task b updated",
+      previous_status: "NEEDS_REVIEW",
+      cancelled: true,
+    });
+
+    const boardAfter = await service.callTool("get_project_board", {});
+    expect(boardAfter.tasks.some((t) => t.id === id("b"))).toBe(false);
+
+    // Audit events recorded for update, set_dependencies, cancel
+    const bEvents = await service.readTaskEvents({ taskId: id("b"), limit: 10 });
+    expect(bEvents.map((e) => e.event)).toContain("update");
+    expect(bEvents.map((e) => e.event)).toContain("cancel");
+    const cEvents = await service.readTaskEvents({ taskId: id("c"), limit: 10 });
+    expect(cEvents.map((e) => e.event)).toContain("set_dependencies");
+
+    // Agent caller is denied CRUD mutations
+    const agent = new LocalService(root, config, "agent");
+    await expect(agent.updateEpic(epic.id, { title: "X" })).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    await expect(agent.updateTask(id("a"), { title: "X" })).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    await expect(agent.cancelTask(id("a"))).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    await expect(agent.setTaskDependencies(id("a"), { depends_on: [] })).rejects.toMatchObject({
+      code: "permission_denied",
+    });
   });
 });

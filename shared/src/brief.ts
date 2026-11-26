@@ -75,6 +75,8 @@ export const SessionBriefOutput = z.object({
   workspace_roots: z.array(WorkspaceRootSchema).max(20).default([]),
   /** Cold-start file: master prompt, then AGENTS.md for full rules. */
   read_first: z.literal("CATENEXT.md").default("CATENEXT.md"),
+  /** Session locale preference from session_prefs (when configured). */
+  locale: z.string().optional(),
 });
 
 export const ManageRootsInput = z.object({

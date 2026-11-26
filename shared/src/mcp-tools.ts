@@ -99,6 +99,8 @@ export const GetProjectContextOutput = z.object({
   documents: z.array(DocumentIndexEntrySchema).default([]),
   /** External/extra workspace roots registered for this project. */
   workspace_roots: z.array(WorkspaceRootSchema).max(20).default([]),
+  /** Session locale preference from session_prefs (when configured). */
+  locale: z.string().optional(),
 });
 
 // --- get_project_board (orchestrator) ---------------------------------------

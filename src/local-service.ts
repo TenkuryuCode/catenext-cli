@@ -8,7 +8,9 @@ import {
   type CatenextConfig,
   DOCUMENT_LIMITS,
   DocumentIndexEntrySchema,
+  findCycle,
   GENERAL_RULES,
+  IdSchema,
   LOCK_LEASE_MS,
   MCP_TOOLS,
   type McpToolName,
@@ -19,8 +21,11 @@ import {
   type PullRequestState,
   type ReviewResult,
   type SearchHit,
+  SetDependenciesInput,
   type TaskEvent,
   type TaskSummary,
+  UpdateEpicInput,
+  UpdateTaskInput,
 } from "@catenext/shared";
 import type { z } from "zod";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
@@ -296,6 +301,326 @@ export class LocalService {
         return [...project.permissions].sort(
           (a, b) => a.action.localeCompare(b.action) || a.principal.localeCompare(b.principal),
         );
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async updateEpic(
+    epicId: string,
+    input: z.input<typeof UpdateEpicInput>,
+  ): Promise<{
+    id: string;
+    title: string;
+    description: string | null;
+    task_counts: Record<string, number>;
+  }> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pembaruan epic hanya lewat CLI manusia.");
+    }
+    if (!IdSchema.safeParse(epicId).success) {
+      fail("invalid_input", "epic_id harus UUID yang valid.");
+    }
+    const parsed = UpdateEpicInput.safeParse(scrubDeep(input, DEFAULT_SCRUB_SKIP_KEYS).value);
+    if (!parsed.success) {
+      const paths = [
+        ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
+      ];
+      fail("invalid_input", `Input updateEpic tidak valid: ${paths.join(", ")}.`, {
+        fields: paths,
+      });
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        const epic = project.epics.find((e) => e.id === epicId);
+        if (!epic) fail("not_found", "Epic tidak ditemukan di proyek ini.");
+        let changed = false;
+        if (parsed.data.title !== undefined && parsed.data.title !== epic.title) {
+          epic.title = parsed.data.title;
+          changed = true;
+        }
+        if (parsed.data.description !== undefined) {
+          const nextDesc = parsed.data.description ?? null;
+          if (nextDesc !== epic.description) {
+            epic.description = nextDesc;
+            changed = true;
+          }
+        }
+        if (changed) dirty();
+        const counts = new Map<string, number>();
+        for (const t of project.tasks) {
+          if (t.epicId === epic.id) counts.set(t.status, (counts.get(t.status) ?? 0) + 1);
+        }
+        return { ...epic, task_counts: Object.fromEntries(counts) };
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async updateTask(taskId: string, input: z.input<typeof UpdateTaskInput>): Promise<LocalTask> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pembaruan task hanya lewat CLI manusia.");
+    }
+    if (!IdSchema.safeParse(taskId).success) {
+      fail("invalid_input", "task_id harus UUID yang valid.");
+    }
+    const skipKeys = new Set([...DEFAULT_SCRUB_SKIP_KEYS, "persona", "role", "target_repo"]);
+    const parsed = UpdateTaskInput.safeParse(scrubDeep(input, skipKeys).value);
+    if (!parsed.success) {
+      const paths = [
+        ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
+      ];
+      fail("invalid_input", `Input updateTask tidak valid: ${paths.join(", ")}.`, {
+        fields: paths,
+      });
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty, _db, afterSave) => {
+        const task = project.tasks.find((t) => t.id === taskId);
+        if (!task) fail("not_found", "Task tidak ditemukan di proyek ini.");
+        const data = parsed.data;
+        const changedFields: string[] = [];
+
+        if (data.target_repo !== undefined && data.target_repo !== task.target) {
+          if (task.lease && data.target_repo && task.lease.repo !== data.target_repo) {
+            fail(
+              "task_locked",
+              "Tidak bisa mengubah target_repo saat task sedang dipegang repo lain.",
+            );
+          }
+          task.target = data.target_repo;
+          changedFields.push("target_repo");
+        }
+
+        if (data.persona !== undefined) {
+          if (data.persona === null) {
+            if (task.persona !== null) {
+              task.persona = null;
+              changedFields.push("persona");
+            }
+          } else {
+            const p = project.personas.find((row) => row.alias === data.persona);
+            if (!p)
+              fail("persona_not_found", `Persona "${data.persona}" tidak ditemukan di proyek ini.`);
+            if (task.target && !allowsRepo(p, task.target)) {
+              fail(
+                "persona_repo_mismatch",
+                `Persona "${p.alias}" tidak memegang repo "${task.target}".`,
+              );
+            }
+            if (task.persona !== p.alias) {
+              task.persona = p.alias;
+              changedFields.push("persona");
+            }
+            if (data.role === undefined && task.role !== p.role) {
+              task.role = p.role;
+              changedFields.push("role");
+            }
+          }
+        } else if (task.persona && data.target_repo !== undefined && task.target) {
+          const currentPersona = project.personas.find((row) => row.alias === task.persona);
+          if (currentPersona && !allowsRepo(currentPersona, task.target)) {
+            fail(
+              "persona_repo_mismatch",
+              `Persona "${currentPersona.alias}" tidak memegang repo "${task.target}".`,
+            );
+          }
+        }
+
+        if (data.role !== undefined && data.role !== task.role) {
+          task.role = data.role;
+          changedFields.push("role");
+        }
+        if (data.title !== undefined && data.title !== task.title) {
+          task.title = data.title;
+          changedFields.push("title");
+        }
+        if (data.prompt_instruction !== undefined && data.prompt_instruction !== task.instruction) {
+          task.instruction = data.prompt_instruction;
+          changedFields.push("prompt_instruction");
+        }
+        if (
+          data.requires_approval !== undefined &&
+          data.requires_approval !== task.requiresApproval
+        ) {
+          task.requiresApproval = data.requires_approval;
+          changedFields.push("requires_approval");
+        }
+        if (data.is_stale === false && task.stale) {
+          task.stale = false;
+          changedFields.push("is_stale");
+        }
+
+        if (changedFields.length > 0) {
+          dirty();
+          const nowIso = new Date().toISOString();
+          afterSave((txDb) => {
+            insertTaskEvents(txDb, this.config.project_id, [
+              {
+                task_id: task.id,
+                event: "update",
+                actor: this.caller,
+                note: changedFields.join(", "),
+                detail: { fields: changedFields },
+                created_at: nowIso,
+              },
+            ]);
+          });
+        }
+        return structuredClone(task);
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async cancelTask(taskId: string): Promise<{
+    task_id: string;
+    title: string;
+    previous_status: LocalTask["status"];
+    cancelled: true;
+  }> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pembatalan task hanya lewat CLI manusia.");
+    }
+    if (!IdSchema.safeParse(taskId).success) {
+      fail("invalid_input", "task_id harus UUID yang valid.");
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty, _db, afterSave) => {
+        const idx = project.tasks.findIndex((t) => t.id === taskId);
+        const task = project.tasks[idx];
+        if (!task) fail("not_found", "Task tidak ditemukan di proyek ini.");
+        if (
+          task.status === "IN_PROGRESS" &&
+          task.lease &&
+          Date.parse(task.lease.expiresAt) > Date.now()
+        ) {
+          fail(
+            "task_locked",
+            "Task sedang dikerjakan (IN_PROGRESS); lepas lease terlebih dahulu sebelum membatalkan.",
+          );
+        }
+        const dependents = project.tasks.filter(
+          (other) => other.id !== taskId && other.dependencies.includes(taskId),
+        );
+        if (dependents.length > 0) {
+          fail(
+            "has_dependents",
+            `Task masih menjadi dependensi ${dependents.length} task lain; perbarui dependensi terlebih dahulu.`,
+            { dependent_task_ids: dependents.map((t) => t.id) },
+          );
+        }
+        const previousStatus = task.status;
+        const title = task.title;
+        project.tasks.splice(idx, 1);
+        dirty();
+        const nowIso = new Date().toISOString();
+        afterSave((txDb) => {
+          insertTaskEvents(txDb, this.config.project_id, [
+            {
+              task_id: taskId,
+              event: "cancel",
+              actor: this.caller,
+              note: title,
+              detail: { from: previousStatus },
+              created_at: nowIso,
+            },
+          ]);
+        });
+        return {
+          task_id: taskId,
+          title,
+          previous_status: previousStatus,
+          cancelled: true as const,
+        };
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async setTaskDependencies(
+    taskId: string,
+    input: z.input<typeof SetDependenciesInput>,
+  ): Promise<{ task_id: string; depends_on: string[] }> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pembaruan dependensi hanya lewat CLI manusia.");
+    }
+    if (!IdSchema.safeParse(taskId).success) {
+      fail("invalid_input", "task_id harus UUID yang valid.");
+    }
+    const skipKeys = new Set([...DEFAULT_SCRUB_SKIP_KEYS, "depends_on"]);
+    const parsed = SetDependenciesInput.safeParse(scrubDeep(input, skipKeys).value);
+    if (!parsed.success) {
+      const paths = [
+        ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
+      ];
+      fail("invalid_input", `Input setTaskDependencies tidak valid: ${paths.join(", ")}.`, {
+        fields: paths,
+      });
+    }
+    const nextDeps = [...new Set(parsed.data.depends_on)];
+    if (nextDeps.includes(taskId)) {
+      fail("dependency_cycle", "Task tidak boleh bergantung pada dirinya sendiri.");
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty, _db, afterSave) => {
+        const task = project.tasks.find((t) => t.id === taskId);
+        if (!task) fail("not_found", "Task tidak ditemukan di proyek ini.");
+        const taskIds = new Set(project.tasks.map((t) => t.id));
+        for (const depId of nextDeps) {
+          if (!taskIds.has(depId)) {
+            fail("dependency_not_found", `Task dependensi ${depId} tidak ditemukan di proyek ini.`);
+          }
+        }
+        const edges = project.tasks.flatMap((t) => {
+          const deps = t.id === task.id ? nextDeps : t.dependencies;
+          return deps.map((dependsOn) => ({ task: t.id, dependsOn }));
+        });
+        const cycle = findCycle(edges);
+        if (cycle) {
+          fail("dependency_cycle", `Dependensi melingkar terdeteksi: ${cycle.join(" -> ")}.`, {
+            cycle,
+          });
+        }
+        task.dependencies = nextDeps;
+        dirty();
+        const nowIso = new Date().toISOString();
+        afterSave((txDb) => {
+          insertTaskEvents(txDb, this.config.project_id, [
+            {
+              task_id: task.id,
+              event: "set_dependencies",
+              actor: this.caller,
+              detail: { depends_on: nextDeps },
+              created_at: nowIso,
+            },
+          ]);
+        });
+        return { task_id: task.id, depends_on: [...task.dependencies] };
       },
     );
     if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
@@ -787,6 +1112,7 @@ class LocalWorkflow {
       pending_approvals,
       workspace_roots: workspaceRoots,
       read_first: "CATENEXT.md",
+      ...(this.project.session_prefs?.locale ? { locale: this.project.session_prefs.locale } : {}),
     };
   }
 
@@ -933,6 +1259,7 @@ class LocalWorkflow {
         .map(recordIndex)
         .sort((a, b) => a.kind.localeCompare(b.kind) || a.slug.localeCompare(b.slug)),
       workspace_roots: this.workspaceRootSummaries(),
+      ...(this.project.session_prefs?.locale ? { locale: this.project.session_prefs.locale } : {}),
     };
   }
 
@@ -1155,7 +1482,7 @@ class LocalWorkflow {
         git_branch: handoff.git_branch,
         last_commit_hash: handoff.last_commit_hash,
         files_count: handoff.files_modified.length,
-        ...(handoff.pull_request ? { pr_url: handoff.pull_request.url } : {}),
+        ...(handoff.pull_request?.url ? { pr_url: handoff.pull_request.url } : {}),
       },
     });
     this.dirty();
@@ -1417,7 +1744,9 @@ class LocalWorkflow {
       title: task.title,
       status,
       review: {
-        ...review.ref,
+        ...(review.ref.url ? { url: review.ref.url } : {}),
+        base_branch: review.ref.base_branch,
+        head_sha: review.ref.head_sha,
         stage,
         checked_at: review.updatedAt,
         reviewer: review.lease?.reviewer ?? review.decision?.reviewer ?? null,

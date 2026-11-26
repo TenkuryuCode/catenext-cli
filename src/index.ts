@@ -41,13 +41,18 @@ import {
   docSave,
   epicCreate,
   epicList,
+  epicTemplates,
+  epicUpdate,
   PlanningInputError,
   personaList,
   personaSet,
   prepare,
   requireRoot,
   searchShow,
+  taskCancel,
   taskCreate,
+  taskDeps,
+  taskUpdate,
 } from "./planning.js";
 import { listSkills, loadSkill, SkillError } from "./skills.js";
 import { planSubagents } from "./subagents.js";
@@ -238,28 +243,113 @@ epic
     friendly(async () => epicList(await cliService(), Boolean(opts.json))),
   );
 epic
-  .command("create")
-  .description("Buat epic baru")
-  .argument("<title>", 'Judul epic, mis. "Fitur login"')
-  .option("-d, --description <text>", "Deskripsi / kriteria selesai")
+  .command("templates")
+  .description("Daftar template epic bawaan")
   .option("--json", "Keluaran JSON")
-  .action((title: string, opts: { description?: string; json?: boolean }) =>
-    friendly(async () =>
-      epicCreate(await cliService(), title, opts.description, Boolean(opts.json)),
-    ),
+  .action((opts: { json?: boolean }) => friendly(async () => epicTemplates(Boolean(opts.json))));
+epic
+  .command("create")
+  .description("Buat epic baru (opsional dari --template)")
+  .argument("[title]", 'Judul epic, mis. "Fitur login" (wajib tanpa --template)')
+  .option("-d, --description <text>", "Deskripsi / kriteria selesai")
+  .option(
+    "-t, --template <id>",
+    "Buat epic + draft task dari template (mis. fitur-login, crud-api)",
+  )
+  .option("--json", "Keluaran JSON")
+  .action(
+    (
+      title: string | undefined,
+      opts: { description?: string; template?: string; json?: boolean },
+    ) => friendly(async () => epicCreate(await cliService(), title, opts)),
+  );
+epic
+  .command("update")
+  .description("Perbarui judul atau deskripsi epic")
+  .argument("<epic_id>", "ID epic yang ingin diperbarui")
+  .option("--title <text>", "Judul baru")
+  .option("-d, --description <text>", "Deskripsi baru")
+  .option("--json", "Keluaran JSON")
+  .action((epicId: string, opts: { title?: string; description?: string; json?: boolean }) =>
+    friendly(async () => epicUpdate(await cliService(), epicId, opts)),
   );
 
-const task = program.command("task").description("Ajukan rencana task (masuk DRAFT)");
+const task = program.command("task").description("Ajukan dan kelola rencana task (masuk DRAFT)");
 task
   .command("create")
   .description(
-    "Ajukan task berdependensi dari file JSON (array task atau { tasks: [...] }); pakai '-' untuk stdin",
+    "Ajukan task berdependensi dari file JSON (--file / '-' stdin) atau inline (--title & --prompt)",
   )
   .requiredOption("--epic <id>", "epic_id tujuan (lihat `catenext epic list`)")
-  .requiredOption("-f, --file <path>", "File rencana JSON, atau '-' untuk stdin")
+  .option("-f, --file <path>", "File rencana JSON, atau '-' untuk stdin")
+  .option("--title <text>", "Judul task (mode inline)")
+  .option("--prompt <text>", "Instruksi task (mode inline)")
+  .option("--ref <ref>", "Referensi task lokal untuk mode inline (default: t1)")
+  .option("--persona <alias>", "Alias persona penanggung jawab (mode inline)")
+  .option("--role <role>", "Role task (mode inline)")
+  .option("--repo <name>", "Target repo (mode inline)")
+  .option("--depends-on <ids...>", "Daftar UUID dependensi (mode inline)")
+  .option("--requires-approval", "Wajibkan persetujuan (mode inline)")
   .option("--json", "Keluaran JSON")
-  .action((opts: { epic: string; file: string; json?: boolean }) =>
-    friendly(async () => taskCreate(await cliService(), opts.epic, opts.file, Boolean(opts.json))),
+  .action(
+    (opts: {
+      epic: string;
+      file?: string;
+      title?: string;
+      prompt?: string;
+      ref?: string;
+      persona?: string;
+      role?: string;
+      repo?: string;
+      dependsOn?: string[];
+      requiresApproval?: boolean;
+      json?: boolean;
+    }) => friendly(async () => taskCreate(await cliService(), opts)),
+  );
+
+task
+  .command("update")
+  .description("Perbarui detail task (judul, prompt, persona, role, repo, atau hapus stale)")
+  .argument("<task_id>")
+  .option("--title <text>", "Judul baru")
+  .option("--prompt <text>", "Instruksi baru")
+  .option("--persona <alias>", "Alias persona baru")
+  .option("--role <role>", "Role baru")
+  .option("--repo <name>", "Target repo baru")
+  .option("--clear-stale", "Bersihkan flag stale (is_stale=false)")
+  .option("--json", "Keluaran JSON")
+  .action(
+    (
+      taskId: string,
+      opts: {
+        title?: string;
+        prompt?: string;
+        persona?: string;
+        role?: string;
+        repo?: string;
+        clearStale?: boolean;
+        json?: boolean;
+      },
+    ) => friendly(async () => taskUpdate(await cliService(), taskId, opts)),
+  );
+
+task
+  .command("cancel")
+  .description("Batalkan (hapus) task yang belum/tidak dikunci dan tanpa task dependen")
+  .argument("<task_id>")
+  .option("--json", "Keluaran JSON")
+  .action((taskId: string, opts: { json?: boolean }) =>
+    friendly(async () => taskCancel(await cliService(), taskId, opts)),
+  );
+
+task
+  .command("deps")
+  .description("Atur ulang daftar UUID dependensi task (validasi eksistensi & siklus DAG)")
+  .argument("<task_id>")
+  .argument("[dep_ids...]", "Daftar UUID dependensi baru (kosongkan untuk menghapus semua)")
+  .option("--json", "Keluaran JSON")
+  .action((taskId: string, depIds: string[], opts: { json?: boolean }) =>
+    friendly(async () => taskDeps(await cliService(), taskId, depIds, opts)),
   );
 
 task
@@ -588,7 +678,7 @@ program
     [] as string[],
   )
   .option("--verify <cmd>", "Perintah verifikasi, mis. pnpm test")
-  .option("--pr <url>", "URL pull request GitHub (opsional, harus bersama --base)")
+  .option("--pr <url>", "URL pull/merge request (opsional, harus bersama --base)")
   .option("--base <branch>", "Branch tujuan PR (opsional, harus bersama --pr)")
   .option("--lease <id>", "Lease worktree dari claim")
   .option("--handoff <file>", "File JSON handoff_summary lengkap, atau '-' untuk stdin")
@@ -729,7 +819,7 @@ review
   );
 review
   .command("refresh")
-  .description("Baca informasi PR yang tercatat lokal; tidak meminta status dari GitHub")
+  .description("Baca informasi PR yang tercatat lokal; tidak meminta status dari host Git")
   .argument("<task_id>")
   .option("--json")
   .action((taskId: string, opts: { json?: boolean }) =>
@@ -819,7 +909,8 @@ program
   .option(...PLATFORM_OPT)
   .option("--dry-run", "Tampilkan perubahan tanpa menulis ke disk")
   .option("--fix", "Perbaiki entri MCP yang duplikat, basi (path hilang), atau file yang rusak")
-  .action((opts: { dryRun?: boolean; fix?: boolean } & PlatformOptions) =>
+  .option("--force", "Paksa perbarui entri MCP, CATENEXT.md, pointer platform, dan stub agen")
+  .action((opts: { dryRun?: boolean; fix?: boolean; force?: boolean } & PlatformOptions) =>
     friendly(async () => {
       const root = await requireRoot();
       const config = await readConfig(root);
@@ -827,6 +918,7 @@ program
         root,
         platforms: opts.platform,
         fix: Boolean(opts.fix),
+        force: Boolean(opts.force),
         defaultCommand: defaultMcpCommand,
       });
       for (const f of plan.findings) console.log(`${f.level === "ok" ? "•" : "!"} ${f.message}`);
@@ -847,13 +939,19 @@ program
         const platforms = opts.platform?.length ? opts.platform : configuredPlatforms(config);
         const service = await cliService(root);
         const { personas } = await service.callTool("list_personas", {});
-        const sub = await planSubagents(root, personas, platforms, {
-          stack: config.stack ?? [],
-          repoName: config.repo_name,
-          layout: config.layout,
-        });
+        const sub = await planSubagents(
+          root,
+          personas,
+          platforms,
+          {
+            stack: config.stack ?? [],
+            repoName: config.repo_name,
+            layout: config.layout,
+          },
+          { force: Boolean(opts.force) },
+        );
         const { planEntryPointers } = await import("./agents/entry-pointers.js");
-        const pointers = await planEntryPointers(root, platforms);
+        const pointers = await planEntryPointers(root, platforms, { force: Boolean(opts.force) });
         const agentEdits = [...sub.edits, ...pointers];
         await applyFileEdits(root, agentEdits);
         for (const l of summarize(agentEdits)) console.log(l);

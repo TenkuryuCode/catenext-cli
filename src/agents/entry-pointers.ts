@@ -203,11 +203,12 @@ export function renderClaudeEntry(): string {
 export async function planEntryPointers(
   root: string,
   platforms: readonly PlatformId[],
+  opts: { force?: boolean } = {},
 ): Promise<FileEdit[]> {
   const edits: FileEdit[] = [];
 
   const masterBefore = await readRepoFile(root, MASTER_PROMPT_FILE);
-  if (masterBefore === null || masterBefore.includes(MASTER_MARKER)) {
+  if (opts.force || masterBefore === null || masterBefore.includes(MASTER_MARKER)) {
     const masterAfter = renderMasterPrompt();
     if (masterAfter !== masterBefore) {
       edits.push({ path: MASTER_PROMPT_FILE, before: masterBefore, after: masterAfter });
@@ -218,7 +219,7 @@ export async function planEntryPointers(
     const path = PLATFORM_ENTRY_FILES[platform];
     if (!path) continue;
     const before = await readRepoFile(root, path);
-    if (before !== null && !before.includes(ENTRY_MARKER)) continue;
+    if (!opts.force && before !== null && !before.includes(ENTRY_MARKER)) continue;
     const after =
       platform === "claude-code" ? renderClaudeEntry() : renderEntryPointer(platform, path);
     if (after !== before) edits.push({ path, before, after });

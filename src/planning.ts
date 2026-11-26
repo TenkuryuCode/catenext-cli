@@ -2,11 +2,16 @@ import { readFile } from "node:fs/promises";
 import {
   CreateEpicToolInput,
   CreateTasksInput,
+  EPIC_TEMPLATES,
+  findEpicTemplate,
   GetDocumentInput,
   GetProjectBoardInput,
   SaveDocumentInput,
   SEARCH_SOURCES,
   SearchContextInput,
+  SetDependenciesInput,
+  UpdateEpicInput,
+  UpdateTaskInput,
   UpsertPersonaInput,
 } from "@catenext/shared";
 import type { z } from "zod";
@@ -70,17 +75,96 @@ export async function epicList(service: LocalService, asJson: boolean) {
   for (const e of res.epics) console.log(`${e.id}  ${e.title}  (${counts(e.task_counts)})`);
 }
 
+export function epicTemplates(asJson: boolean) {
+  if (asJson) return console.log(JSON.stringify({ templates: EPIC_TEMPLATES }, null, 2));
+  for (const t of EPIC_TEMPLATES) {
+    console.log(`${t.id.padEnd(14)} ${t.name} — ${t.summary} (${t.tasks.length} task)`);
+  }
+}
+
 export async function epicCreate(
   service: LocalService,
-  title: string,
-  description: string | undefined,
-  asJson: boolean,
+  title: string | undefined,
+  opts: { description?: string; template?: string; json?: boolean },
 ) {
-  const body = prepare(CreateEpicToolInput, { title, description }, []);
+  const asJson = Boolean(opts.json);
+  if (opts.template) {
+    const tpl = findEpicTemplate(opts.template);
+    if (!tpl) {
+      throw new PlanningInputError(
+        `Template epic tidak ditemukan: ${opts.template}. Jalankan \`catenext epic templates\` untuk daftar template.`,
+      );
+    }
+    const epicBody = prepare(
+      CreateEpicToolInput,
+      {
+        title: title ?? tpl.epic.title,
+        description: opts.description ?? tpl.epic.description,
+      },
+      [],
+    );
+    const epicRes = await service.callTool("create_epic", epicBody);
+    const tasksBody = prepare(
+      CreateTasksInput,
+      {
+        epic_id: epicRes.epic.id,
+        tasks: tpl.tasks.map((t) => ({
+          ref: t.ref,
+          title: t.title,
+          prompt_instruction: t.prompt_instruction,
+          depends_on: t.depends_on,
+          ...(t.role ? { role: t.role } : {}),
+        })),
+      },
+      ["epic_id", "ref", "depends_on", "target_repo", "role", "persona"],
+    );
+    const tasksRes = await service.callTool("create_tasks", tasksBody);
+    if (asJson) {
+      return console.log(
+        JSON.stringify({ epic: epicRes.epic, created: tasksRes.created }, null, 2),
+      );
+    }
+    console.log(
+      `✓ Epic "${epicRes.epic.title}" dibuat dari template "${tpl.id}": ${epicRes.epic.id}`,
+    );
+    for (const t of tasksRes.created) {
+      console.log(`+ ${t.ref.padEnd(16)} ${t.task_id}  ${t.status}`);
+    }
+    console.log(
+      `\n✓ ${tasksRes.created.length} task diajukan sebagai DRAFT. Tinjau lalu setujui dengan catenext task approve <id> sebelum agen bisa mengambilnya.`,
+    );
+    return;
+  }
+
+  if (!title) {
+    throw new PlanningInputError("Judul epic wajib diisi jika tidak memakai --template.");
+  }
+  const body = prepare(CreateEpicToolInput, { title, description: opts.description }, []);
   const res = await service.callTool("create_epic", body);
   if (asJson) return console.log(JSON.stringify(res, null, 2));
   console.log(`✓ Epic "${res.epic.title}" dibuat: ${res.epic.id}`);
   console.log(`  Lanjut: catenext task create --epic ${res.epic.id} --file rencana.json`);
+}
+
+export async function epicUpdate(
+  service: LocalService,
+  epicId: string,
+  opts: { title?: string; description?: string; json?: boolean },
+) {
+  if (opts.title === undefined && opts.description === undefined) {
+    throw new PlanningInputError("Berikan minimal --title atau --description.");
+  }
+  const body = prepare(
+    UpdateEpicInput,
+    {
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(opts.description !== undefined ? { description: opts.description } : {}),
+    },
+    [],
+  );
+  const updated = await service.updateEpic(epicId, body);
+  if (opts.json) return console.log(JSON.stringify({ epic: updated }, null, 2));
+  console.log(`✓ Epic "${updated.title}" diperbarui: ${updated.id}`);
 }
 
 export async function readJsonInput(file: string): Promise<unknown> {
@@ -108,16 +192,60 @@ export async function readJsonInput(file: string): Promise<unknown> {
   }
 }
 
-/** File rencana boleh berupa array task, atau objek { tasks: [...] }. */
-export async function taskCreate(
-  service: LocalService,
-  epicId: string,
-  file: string,
-  asJson: boolean,
-) {
-  const plan = await readJsonInput(file);
-  const tasks = Array.isArray(plan) ? plan : (plan as { tasks?: unknown })?.tasks;
-  const body = prepare(CreateTasksInput, { epic_id: epicId, tasks }, [
+export interface TaskCreateOpts {
+  epic: string;
+  file?: string;
+  title?: string;
+  prompt?: string;
+  ref?: string;
+  persona?: string;
+  role?: string;
+  repo?: string;
+  dependsOn?: string[];
+  requiresApproval?: boolean;
+  json?: boolean;
+}
+
+/** File rencana boleh berupa array task, atau objek { tasks: [...] }, atau inline lewat flag CLI. */
+export async function taskCreate(service: LocalService, opts: TaskCreateOpts) {
+  let tasks: unknown;
+  if (opts.file !== undefined) {
+    if (
+      opts.title !== undefined ||
+      opts.prompt !== undefined ||
+      opts.ref !== undefined ||
+      opts.persona !== undefined ||
+      opts.role !== undefined ||
+      opts.repo !== undefined ||
+      opts.dependsOn?.length ||
+      opts.requiresApproval
+    ) {
+      throw new PlanningInputError(
+        "Jangan gabungkan --file dengan flag inline (--title, --prompt, --ref, --persona, --role, --repo, --depends-on, --requires-approval).",
+      );
+    }
+    const plan = await readJsonInput(opts.file);
+    tasks = Array.isArray(plan) ? plan : (plan as { tasks?: unknown })?.tasks;
+  } else {
+    if (!opts.title || !opts.prompt) {
+      throw new PlanningInputError(
+        "Wajib isi --file <path> atau mode inline (--title dan --prompt).",
+      );
+    }
+    tasks = [
+      {
+        ref: opts.ref ?? "t1",
+        title: opts.title,
+        prompt_instruction: opts.prompt,
+        ...(opts.repo ? { target_repo: opts.repo } : {}),
+        ...(opts.role ? { role: opts.role } : {}),
+        ...(opts.persona ? { persona: opts.persona } : {}),
+        ...(opts.dependsOn?.length ? { depends_on: opts.dependsOn } : {}),
+        ...(opts.requiresApproval ? { requires_approval: true } : {}),
+      },
+    ];
+  }
+  const body = prepare(CreateTasksInput, { epic_id: opts.epic, tasks }, [
     "epic_id",
     "ref",
     "depends_on",
@@ -126,11 +254,73 @@ export async function taskCreate(
     "persona",
   ]);
   const res = await service.callTool("create_tasks", body);
-  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
   for (const t of res.created) console.log(`+ ${t.ref.padEnd(16)} ${t.task_id}  ${t.status}`);
   console.log(
     `\n✓ ${res.created.length} task diajukan sebagai DRAFT. Tinjau lalu setujui dengan catenext task approve <id> sebelum agen bisa mengambilnya.`,
   );
+}
+
+export async function taskUpdate(
+  service: LocalService,
+  taskId: string,
+  opts: {
+    title?: string;
+    prompt?: string;
+    persona?: string;
+    role?: string;
+    repo?: string;
+    clearStale?: boolean;
+    json?: boolean;
+  },
+) {
+  if (
+    opts.title === undefined &&
+    opts.prompt === undefined &&
+    opts.persona === undefined &&
+    opts.role === undefined &&
+    opts.repo === undefined &&
+    !opts.clearStale
+  ) {
+    throw new PlanningInputError(
+      "Berikan minimal satu field untuk diperbarui (--title, --prompt, --persona, --role, --repo, atau --clear-stale).",
+    );
+  }
+  const body = prepare(
+    UpdateTaskInput,
+    {
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(opts.prompt !== undefined ? { prompt_instruction: opts.prompt } : {}),
+      ...(opts.persona !== undefined ? { persona: opts.persona } : {}),
+      ...(opts.role !== undefined ? { role: opts.role } : {}),
+      ...(opts.repo !== undefined ? { target_repo: opts.repo } : {}),
+      ...(opts.clearStale ? { is_stale: false as const } : {}),
+    },
+    ["persona", "role", "target_repo"],
+  );
+  const updated = await service.updateTask(taskId, body);
+  if (opts.json) return console.log(JSON.stringify({ task: updated }, null, 2));
+  console.log(`✓ Task "${updated.title}" diperbarui (${updated.id}).`);
+}
+
+export async function taskCancel(service: LocalService, taskId: string, opts: { json?: boolean }) {
+  const res = await service.cancelTask(taskId);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(
+    `✓ Task "${res.title}" (${res.task_id}) dibatalkan (status sebelumnya: ${res.previous_status}).`,
+  );
+}
+
+export async function taskDeps(
+  service: LocalService,
+  taskId: string,
+  depIds: string[],
+  opts: { json?: boolean },
+) {
+  const body = prepare(SetDependenciesInput, { depends_on: depIds }, ["depends_on"]);
+  const res = await service.setTaskDependencies(taskId, body);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(`✓ Dependensi task ${res.task_id} diperbarui (${res.depends_on.length} dependensi).`);
 }
 
 export async function personaList(service: LocalService, asJson: boolean) {

@@ -102,6 +102,7 @@ export const UpdateTaskInput = z.object({
   prompt_instruction: z.string().min(1).max(8000).optional(),
   target_repo: RepoNameSchema.nullable().optional(),
   role: RoleSchema.nullable().optional(),
+  persona: AgentAliasSchema.nullable().optional(),
   persona_id: IdSchema.nullable().optional(),
   requires_approval: z.boolean().optional(),
   position: z.number().finite().optional(),

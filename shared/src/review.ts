@@ -2,15 +2,41 @@ import { z } from "zod";
 import { IdSchema } from "./common.js";
 
 export const CommitShaSchema = z.string().regex(/^[0-9a-f]{40}$/);
+const PULL_REQUEST_URL_RE =
+  /^https?:\/\/[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)*(?::\d{1,5})?(?:\/[a-z\d_][a-z\d._-]*){2,}(?:\/pull|\/(?:-\/)?merge_requests|\/pull-requests|\/pulls)\/[1-9]\d*$/i;
+const PULL_REQUEST_URL_MSG =
+  "Gunakan URL pull/merge request GitHub, GitLab, Bitbucket, atau Gitea yang valid.";
+type UrlParts = {
+  protocol: string;
+  username: string;
+  password: string;
+  search: string;
+  hash: string;
+};
+
+const UrlConstructor = (globalThis as { URL?: new (input: string) => UrlParts }).URL;
+
 export const PullRequestUrlSchema = z
   .string()
   .max(240)
-  .regex(
-    /^https:\/\/github\.com\/[a-z\d][a-z\d-]*\/[a-z\d_.-]+\/pull\/[1-9]\d*$/i,
-    "Gunakan URL pull request GitHub.",
-  );
+  .regex(PULL_REQUEST_URL_RE, PULL_REQUEST_URL_MSG)
+  .refine((value) => {
+    if (!UrlConstructor) return true;
+    try {
+      const parsed = new UrlConstructor(value);
+      return (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        !parsed.username &&
+        !parsed.password &&
+        !parsed.search &&
+        !parsed.hash
+      );
+    } catch {
+      return false;
+    }
+  }, PULL_REQUEST_URL_MSG);
 export const PullRequestRefSchema = z.object({
-  url: PullRequestUrlSchema,
+  url: PullRequestUrlSchema.optional(),
   base_branch: z.string().min(1).max(255),
   head_sha: CommitShaSchema,
 });

@@ -222,6 +222,7 @@ async function planDir(
   personas: PersonaItem[],
   ctx: AgentRenderContext,
   platform: PlatformId,
+  force = false,
 ): Promise<{ edits: FileEdit[]; skipped: string[] }> {
   const edits: FileEdit[] = [];
   const skipped: string[] = [];
@@ -231,6 +232,7 @@ async function planDir(
   wanted.add(orchPath);
   const orchBefore = await readOrNull(join(root, orchPath));
   if (
+    !force &&
     orchBefore !== null &&
     !orchBefore.includes(ORCHESTRATOR_MARKER) &&
     !orchBefore.includes(SUBAGENT_MARKER)
@@ -247,7 +249,7 @@ async function planDir(
     const path = join(dir, `${p.alias}.md`);
     wanted.add(path);
     const before = await readOrNull(join(root, path));
-    if (before !== null && !before.includes(SUBAGENT_MARKER)) {
+    if (!force && before !== null && !before.includes(SUBAGENT_MARKER)) {
       skipped.push(path);
       continue;
     }
@@ -268,6 +270,7 @@ export async function planSubagents(
   personas: PersonaItem[],
   platforms: readonly PlatformId[] = ["claude-code"],
   ctx: Partial<AgentRenderContext> = {},
+  opts: { force?: boolean } = {},
 ): Promise<{ edits: FileEdit[]; skipped: string[] }> {
   const fullCtx: AgentRenderContext = {
     stack: ctx.stack ?? [],
@@ -282,9 +285,8 @@ export async function planSubagents(
     const dir = SUBAGENT_DIRS[platform];
     if (dir) plannedDirs.set(dir, platform);
   }
-  if (plannedDirs.size === 0) plannedDirs.set(SUBAGENTS_DIR, "claude-code");
   for (const [dir, platform] of plannedDirs) {
-    const planned = await planDir(root, dir, personas, fullCtx, platform);
+    const planned = await planDir(root, dir, personas, fullCtx, platform, Boolean(opts.force));
     edits.push(...planned.edits);
     skipped.push(...planned.skipped);
   }
@@ -302,11 +304,16 @@ async function catenextAgentFilesIn(root: string, dir: string): Promise<string[]
   return out;
 }
 
-/** All Catenext-managed agent files across known dirs (for sync & remove). */
-export async function catenextSubagentFiles(root: string): Promise<string[]> {
+/** Catenext-managed agent files across known dirs (or only dirs for `platforms`). */
+export async function catenextSubagentFiles(
+  root: string,
+  platforms?: readonly PlatformId[],
+): Promise<string[]> {
+  const dirs = platforms
+    ? new Set(platforms.map((p) => SUBAGENT_DIRS[p]).filter((d): d is string => Boolean(d)))
+    : new Set(Object.values(SUBAGENT_DIRS).filter((d): d is string => Boolean(d)));
   const out: string[] = [];
-  for (const dir of new Set(Object.values(SUBAGENT_DIRS))) {
-    if (!dir) continue;
+  for (const dir of dirs) {
     out.push(...(await catenextAgentFilesIn(root, dir)));
   }
   return out;

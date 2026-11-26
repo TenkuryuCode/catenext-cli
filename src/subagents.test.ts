@@ -57,4 +57,35 @@ describe("subagent persona", () => {
     expect(removed.map((e) => e.path)).toContain(join(".claude", "agents", "adel.md"));
     expect(removed.map((e) => e.path)).not.toContain(join(".claude", "agents", "citra.md"));
   });
+
+  it("does not fall back to .claude/agents for codex or vscode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-sub-nofallback-"));
+    const res = await planSubagents(root, [adel], ["codex", "vscode"]);
+    expect(res).toEqual({ edits: [], skipped: [] });
+  });
+
+  it("overwrites non-Catenext stubs when force is true", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-sub-force-"));
+    await mkdir(join(root, ".claude", "agents"), { recursive: true });
+    await writeFile(join(root, ".claude", "agents", "orchestrator.md"), "custom orchestrator\n");
+    await writeFile(join(root, ".claude", "agents", "adel.md"), "custom adel\n");
+
+    const skipped = await planSubagents(root, [adel], ["claude-code"]);
+    expect(skipped.skipped).toEqual([
+      join(".claude", "agents", "orchestrator.md"),
+      join(".claude", "agents", "adel.md"),
+    ]);
+    expect(skipped.edits).toEqual([]);
+
+    const forced = await planSubagents(root, [adel], ["claude-code"], {}, { force: true });
+    expect(forced.skipped).toEqual([]);
+    expect(forced.edits.map((e) => e.path)).toEqual([
+      join(".claude", "agents", "orchestrator.md"),
+      join(".claude", "agents", "adel.md"),
+    ]);
+    await applyFileEdits(root, forced.edits);
+    expect(await readFile(join(root, ".claude", "agents", "adel.md"), "utf8")).toContain(
+      SUBAGENT_MARKER,
+    );
+  });
 });

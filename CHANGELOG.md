@@ -10,6 +10,19 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.8.0] - 2026-11-27
+
+### Ditambahkan
+- Task & Epic CRUD lokal: `catenext epic update`, `catenext task update` (`--title`, `--prompt`, `--persona`, `--role`, `--repo`, `--clear-stale`), `catenext task cancel`, dan `catenext task deps` dengan validasi dependensi dan deteksi siklus DAG serta audit event `task_events`.
+- Template epic siap pakai (`EPIC_TEMPLATES`: `fitur-login`, `crud-api`) lewat `catenext epic templates` dan `catenext epic create --template <id>`, serta pembuatan task inline via flag pada `catenext task create` (`--title`, `--prompt`, `--persona`, `--role`, `--repo`, `--depends-on`, `--requires-approval`).
+- Paparan opsional `session_prefs.locale` pada respons MCP `session_brief` dan `get_project_context`.
+- Flag `--force` pada `catenext sync` untuk memaksa pembaruan entri MCP, blok `AGENTS.md`, `CATENEXT.md`, pointer platform, dan stub agen.
+- Rangkaian unit test dedicated untuk `verify.ts`, `interview.ts`, `planning.ts`, dan `agents/entry-pointers.ts`, plus cakupan test baru untuk CRUD, `sync --force`, `planRemove`, `SUBAGENT_DIRS`, dan validasi URL PR multi-Git.
+
+### Diubah
+- `planRemove` kini membersihkan stub di semua platform terpilih beserta `CATENEXT.md` dan `PLATFORM_ENTRY_FILES`; `planSync` memakai perbandingan `Set` untuk perubahan platform; dan `SUBAGENT_DIRS` untuk `codex`/`vscode` tidak lagi jatuh ke `.claude/agents`.
+- `PullRequestUrlSchema` digeneralisasi untuk GitHub, GitLab (`/merge_requests/`, `/-/merge_requests/`), Bitbucket (`/pull-requests/`), dan Gitea (`/pulls/`), serta `PullRequestRefSchema.url` menjadi opsional untuk mendukung review lokal tanpa URL PR.
+
 ## [0.7.0] - 2026-11-27
 
 ### Ditambahkan

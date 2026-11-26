@@ -258,8 +258,13 @@ catenext board
 ## Rencana, claim, handoff
 
 ```bash
-catenext epic create "Tambah ekspor billing"
+catenext epic templates
+catenext epic create "Tambah ekspor billing"   # atau: --template fitur-login
 catenext task create --epic <epic_id> --file tasks.json
+# atau inline: catenext task create --epic <epic_id> --title "API" --prompt "..."
+catenext task update <task_id> --clear-stale
+catenext task deps <task_id> <dep_id...>
+catenext task cancel <task_id>
 catenext task approve <task_id>          # manusia: DRAFT → TODO
 catenext next --as bambang
 catenext claim <task_id> --as bambang --worktree
@@ -344,7 +349,7 @@ catenext index
 catenext search "login handler" --code
 ```
 
-MCP: `graph_neighbors`, `symbol_search`, `search_code` (hasil ringkas).
+MCP: `graph_neighbors`, `symbol_search`, `search_context` (dengan `sources: ["code"]`, hasil ringkas).
 
 ## Data lokal
 
@@ -374,10 +379,10 @@ Backup SQLite terpisah jika perlu. Data Cloud lama **tidak** dimigrasi otomatis.
 | `revise` / `assign` | `manage_task` | Revisi / ganti penanggung jawab |
 | `persona list\|set` | `list_personas` / `upsert_persona` | Persona proyek |
 | `doc …` | `get_document` / `save_document` | Dokumen lokal |
-| `epic` / `task create` | `list_epics` / `create_epic` / `create_tasks` | Rencana (masuk DRAFT) |
+| `epic` / `task create\|update\|cancel\|deps` | `list_epics` / `create_epic` / `create_tasks` | Rencana & CRUD lokal (DRAFT) |
 | `review …` | `review_pull_request` | Antrean review lokal |
 | `skill load` | `load_skill` / `save_repo_skill` | Skill repo |
-| `index` / `search` | `graph_neighbors` / `symbol_search` / `search_code` / `search_context` | Graf & pencarian lokal |
+| `index` / `search` | `graph_neighbors` / `symbol_search` / `search_context` | Graf & pencarian lokal |
 | `log` | - | Audit log event task (`task_events`) |
 | `permission list\|set\|grant\|revoke` | - | Matriks permission lokal |
 | `mcp` | - | Server MCP stdio |

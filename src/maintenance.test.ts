@@ -3,10 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as json } from "jsonc-parser";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  ENTRY_MARKER,
+  MASTER_MARKER,
+  MASTER_PROMPT_FILE,
+  PLATFORM_ENTRY_FILES,
+} from "./agents/entry-pointers.js";
 import { CONFIG_PATH, readConfig, stateFilePath } from "./config.js";
+import { AGENTS_MD, BLOCK_START } from "./init/agents-md.js";
 import { applyInit, planInit } from "./init/index.js";
 import { applyFileEdits, entryIsStale, planRemove, planSync } from "./maintenance.js";
-import { SUBAGENT_MARKER } from "./subagents.js";
+import { planSubagents, SUBAGENT_MARKER } from "./subagents.js";
 import { verifySetup } from "./verify.js";
 
 const CMD = { command: "catenext", args: [] as string[] };
@@ -88,6 +95,44 @@ describe("local sync", () => {
     await applyFileEdits(root, updated.edits);
     expect((await readConfig(root)).platforms).toContain("vscode");
   });
+
+  it("forces MCP command and AGENTS.md block rewrite when force is true", async () => {
+    await rm(join(root, AGENTS_MD), { force: true });
+    const plan = await planSync({
+      root,
+      platforms: ["claude-code"],
+      fix: false,
+      force: true,
+      defaultCommand: NEW,
+    });
+    expect(plan.edits.map((e) => e.path)).toEqual([".mcp.json", AGENTS_MD]);
+    await applyFileEdits(root, plan.edits);
+    expect(json(await read(".mcp.json"))).toMatchObject({
+      mcpServers: {
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
+        catenext: { command: "node", args: ["new.js", "mcp", "--root", "${CLAUDE_PROJECT_DIR}"] },
+      },
+    });
+    expect(await read(AGENTS_MD)).toContain(BLOCK_START);
+  });
+
+  it("checks platform set membership without rewriting config when same set is reordered", async () => {
+    const plan = await planSync({
+      root,
+      platforms: ["antigravity", "codex", "cursor", "claude-code"],
+      fix: false,
+      defaultCommand: NEW,
+    });
+    expect(plan.edits.map((e) => e.path)).not.toContain(CONFIG_PATH);
+
+    const added = await planSync({
+      root,
+      platforms: ["opencode"],
+      fix: false,
+      defaultCommand: NEW,
+    });
+    expect(added.edits.map((e) => e.path)).toContain(CONFIG_PATH);
+  });
 });
 
 describe("local remove", () => {
@@ -141,6 +186,53 @@ describe("local remove", () => {
     await write(".agents/mcp_config.json", foreign);
     await applyFileEdits(root, await planRemove({ root, platforms: ["antigravity"] }));
     expect(await read(".agents/mcp_config.json")).toBe(foreign);
+  });
+
+  it("cleans subagent stubs across all selected platforms, CATENEXT.md, and PLATFORM_ENTRY_FILES", async () => {
+    const allPlatforms = ["claude-code", "cursor", "codex", "antigravity", "opencode"] as const;
+    const syncExtra = await planSync({
+      root,
+      platforms: ["opencode"],
+      fix: false,
+      defaultCommand: NEW,
+    });
+    await applyFileEdits(root, syncExtra.edits);
+    const sub = await planSubagents(
+      root,
+      [{ alias: "be", role: "backend", rules: [], repos: [], scope: "project" }],
+      allPlatforms,
+    );
+    await applyFileEdits(root, sub.edits);
+    await write(
+      PLATFORM_ENTRY_FILES.opencode ?? ".opencode/CATENEXT.md",
+      `${ENTRY_MARKER}\n# opencode\n`,
+    );
+
+    expect(await read(MASTER_PROMPT_FILE)).toContain(MASTER_MARKER);
+    const partial = await planRemove({ root, platforms: ["cursor"] });
+    const partialPaths = partial.map((e) => e.path);
+    expect(partialPaths).toContain(PLATFORM_ENTRY_FILES.cursor);
+    expect(partialPaths).toContain(join(".cursor", "agents", "be.md"));
+    expect(partialPaths).not.toContain(MASTER_PROMPT_FILE);
+    expect(partialPaths).not.toContain(PLATFORM_ENTRY_FILES["claude-code"]);
+
+    const full = await planRemove({ root });
+    const fullPaths = full.map((e) => e.path);
+    expect(fullPaths).toContain(MASTER_PROMPT_FILE);
+    for (const p of allPlatforms) {
+      const entry = PLATFORM_ENTRY_FILES[p];
+      if (entry) expect(fullPaths).toContain(entry);
+    }
+    expect(fullPaths).toContain(join(".claude", "agents", "be.md"));
+    expect(fullPaths).toContain(join(".cursor", "agents", "be.md"));
+    expect(fullPaths).toContain(join(".agents", "catenext", "be.md"));
+    expect(fullPaths).toContain(join(".opencode", "agents", "be.md"));
+    await applyFileEdits(root, full);
+    await expect(read(MASTER_PROMPT_FILE)).rejects.toMatchObject({ code: "ENOENT" });
+    for (const p of allPlatforms) {
+      const entry = PLATFORM_ENTRY_FILES[p];
+      if (entry) await expect(read(entry)).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 });
 

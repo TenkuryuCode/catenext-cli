@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { estimateHandoffTokens, HANDOFF_LIMITS, HandoffSummarySchema } from "../index.js";
+import {
+  estimateHandoffTokens,
+  HANDOFF_LIMITS,
+  HandoffSummarySchema,
+  PullRequestRefSchema,
+  PullRequestUrlSchema,
+} from "../index.js";
 
 const valid = {
   files_modified: ["apps/api/src/routes/tasks.ts", "packages/shared/src/task.ts"],
@@ -59,5 +65,51 @@ describe("HandoffSummarySchema", () => {
       notes_for_next_agent: "n".repeat(500),
     };
     expect(HandoffSummarySchema.safeParse(big).success).toBe(false);
+  });
+});
+
+describe("PullRequestUrlSchema & PullRequestRefSchema", () => {
+  it.each([
+    "https://github.com/org/repo/pull/42",
+    "https://gitlab.com/org/repo/merge_requests/12",
+    "https://gitlab.com/org/group/repo/-/merge_requests/99",
+    "https://bitbucket.org/org/repo/pull-requests/7",
+    "https://gitea.example.com/org/repo/pulls/15",
+    "https://git.internal:8443/team/service/pulls/3",
+  ])("menerima URL PR/MR yang valid: %s", (url) => {
+    expect(PullRequestUrlSchema.safeParse(url).success).toBe(true);
+  });
+
+  it.each([
+    "ftp://github.com/org/repo/pull/1",
+    "javascript:alert(1)",
+    "github.com/org/repo/pull/1",
+    "https://user:pass@github.com/org/repo/pull/1",
+    "https://github.com/org/repo/pull/1?tab=files",
+    "https://github.com/org/repo/pull/1#discussion",
+    "https://github.com/org/repo/pull/0",
+    "https://github.com/org/repo/pull/",
+    "https://github.com/only-owner/pull/1",
+  ])("menolak URL non-http(s) atau tidak valid: %s", (url) => {
+    expect(PullRequestUrlSchema.safeParse(url).success).toBe(false);
+  });
+
+  it("mengizinkan PullRequestRefSchema tanpa url (review lokal) dan dengan url", () => {
+    const head_sha = "a".repeat(40);
+    expect(PullRequestRefSchema.parse({ base_branch: "main", head_sha })).toEqual({
+      base_branch: "main",
+      head_sha,
+    });
+    expect(
+      PullRequestRefSchema.parse({
+        url: "https://gitlab.com/org/repo/-/merge_requests/5",
+        base_branch: "main",
+        head_sha,
+      }),
+    ).toEqual({
+      url: "https://gitlab.com/org/repo/-/merge_requests/5",
+      base_branch: "main",
+      head_sha,
+    });
   });
 });

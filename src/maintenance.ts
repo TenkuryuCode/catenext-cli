@@ -1,6 +1,12 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { type PlatformId, SUPPORTED_PLATFORMS } from "@catenext/shared";
+import {
+  ENTRY_MARKER,
+  MASTER_MARKER,
+  MASTER_PROMPT_FILE,
+  PLATFORM_ENTRY_FILES,
+} from "./agents/entry-pointers.js";
 import { CONFIG_PATH, configuredPlatforms, parseConfig, stateFilePath } from "./config.js";
 import { AGENTS_MD, BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./init/agents-md.js";
 import { updateConfig } from "./init/config-file.js";
@@ -18,7 +24,7 @@ import {
 } from "./init/mcp-config.js";
 import { applyRepoEdits, type FileEdit, readRepoFile } from "./init/repo-files.js";
 import { listSkills, SKILLS_DIR } from "./skills.js";
-import { catenextSubagentFiles } from "./subagents.js";
+import { catenextSubagentFiles, SUBAGENT_DIRS } from "./subagents.js";
 
 export type { FileEdit } from "./init/repo-files.js";
 
@@ -47,6 +53,7 @@ export async function planSync(opts: {
   root: string;
   platforms?: readonly PlatformId[];
   fix: boolean;
+  force?: boolean;
   defaultCommand: () => McpServerEntry;
 }): Promise<SyncPlan> {
   const root = resolve(opts.root);
@@ -80,7 +87,7 @@ export async function planSync(opts: {
         current.count > 1 ||
         stale ||
         (current.entry && (!current.compatible || !entryMatchesRoot(current.entry, root, adapter)));
-      if (needsFix && !opts.fix) {
+      if (needsFix && !opts.fix && !opts.force) {
         for (const id of adapter.ids) failed.add(id);
         findings.push({
           level: "fixable",
@@ -88,18 +95,22 @@ export async function planSync(opts: {
         });
         continue;
       }
-      if (!current.entry || needsFix) {
-        const base = current.entry && !stale ? entryBase(current.entry) : null;
+      if (!current.entry || needsFix || opts.force) {
+        const base = current.entry && !stale && !opts.force ? entryBase(current.entry) : null;
         const after = changeMcp(
           before,
           adapter,
           scopedEntry(root, adapter, base ?? opts.defaultCommand()),
         );
         add(adapter.path, before, after);
-        findings.push({
-          level: "ok",
-          message: `${adapter.path}: entri catenext ${current.count ? "diperbaiki" : "ditambahkan"}.`,
-        });
+        if (before !== after || !current.entry || needsFix) {
+          findings.push({
+            level: "ok",
+            message: `${adapter.path}: entri catenext ${
+              current.count ? (needsFix ? "diperbaiki" : "diperbarui") : "ditambahkan"
+            }.`,
+          });
+        }
       }
       for (const id of adapter.ids) configured.add(id);
     } catch (error) {
@@ -111,13 +122,18 @@ export async function planSync(opts: {
   const tracked = [...configured].filter(
     (platform) => previous.includes(platform) || !failed.has(platform),
   );
-  if (tracked.length !== previous.length && configBefore !== null) {
+  const previousSet = new Set(previous);
+  const trackedSet = new Set(tracked);
+  const platformsChanged =
+    trackedSet.size !== previousSet.size || tracked.some((platform) => !previousSet.has(platform));
+  if (platformsChanged && configBefore !== null) {
     add(CONFIG_PATH, configBefore, updateConfig(configBefore, { platforms: tracked }));
   }
   const gitignore = await readRepoFile(root, ".gitignore");
   add(".gitignore", gitignore, ensureGitignore(gitignore));
   const agents = await readRepoFile(root, AGENTS_MD);
-  if (agents?.includes(BLOCK_START)) add(AGENTS_MD, agents, upsertAgentsBlock(agents));
+  if (agents?.includes(BLOCK_START) || opts.force)
+    add(AGENTS_MD, agents, upsertAgentsBlock(agents));
   return { edits, findings };
 }
 
@@ -151,7 +167,34 @@ export async function planRemove(opts: {
     const agents = await readRepoFile(root, AGENTS_MD);
     if (agents?.includes(BLOCK_START)) add(AGENTS_MD, agents, removeAgentsBlock(agents));
   }
-  if (!opts.platforms || selected.includes("claude-code")) {
+  const masterPrompt = await readRepoFile(root, MASTER_PROMPT_FILE);
+  if (
+    masterPrompt?.includes(MASTER_MARKER) &&
+    (!opts.platforms || (previous.length > 0 && remaining.length === 0))
+  ) {
+    add(MASTER_PROMPT_FILE, masterPrompt, null);
+  }
+  const entryPlatforms = opts.platforms ? selected : SUPPORTED_PLATFORMS;
+  for (const path of new Set(
+    entryPlatforms
+      .map((platform) => PLATFORM_ENTRY_FILES[platform])
+      .filter((path): path is string => Boolean(path)),
+  )) {
+    const before = await readRepoFile(root, path);
+    if (before?.includes(ENTRY_MARKER)) add(path, before, null);
+  }
+  if (opts.platforms) {
+    const remainingDirs = new Set(
+      remaining.map((platform) => SUBAGENT_DIRS[platform]).filter((d): d is string => Boolean(d)),
+    );
+    const removable = selected.filter((platform) => {
+      const dir = SUBAGENT_DIRS[platform];
+      return dir && !remainingDirs.has(dir);
+    });
+    for (const path of await catenextSubagentFiles(root, removable)) {
+      add(path, await readRepoFile(root, path), null);
+    }
+  } else {
     for (const path of await catenextSubagentFiles(root)) {
       add(path, await readRepoFile(root, path), null);
     }

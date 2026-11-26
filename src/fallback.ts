@@ -330,11 +330,14 @@ export async function taskReview(service: LocalService, input: unknown, json: bo
   if (json) console.log(JSON.stringify(result, null, 2));
   else if ("reviews" in result) {
     if (!result.reviews.length) console.log("Belum ada PR yang bisa Anda review di repo ini.");
-    for (const item of result.reviews)
-      console.log(`${item.task_id}  ${item.title}  ${item.review.url}`);
+    for (const item of result.reviews) {
+      const target = item.review.url ?? `(lokal base: ${item.review.base_branch})`;
+      console.log(`${item.task_id}  ${item.title}  ${target}`);
+    }
   } else {
     console.log(`${result.title}  ${result.status} · ${result.review.stage}`);
-    console.log(`${result.review.url} @ ${result.review.head_sha}`);
+    const target = result.review.url ?? `(lokal base: ${result.review.base_branch})`;
+    console.log(`${target} @ ${result.review.head_sha}`);
     if (result.lease_id)
       console.log(`Lease review: ${result.lease_id} (sampai ${result.lease_expires_at})`);
     if (result.notes_for_next_agent) console.log(result.notes_for_next_agent);
