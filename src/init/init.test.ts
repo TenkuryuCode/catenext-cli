@@ -73,6 +73,9 @@ it("plans default adapters without writing, then applies repo-scoped launches", 
     if (adapter.kind !== "toml") expect(() => JSON.parse(source)).not.toThrow();
   }
   expect(await readFile(global, "utf8")).toBe('{"mcpServers":{"other":{}}}');
+  const master = await readFile(join(root, "CATENEXT.md"), "utf8");
+  expect(master).toContain("## Bootstrap (install if missing)");
+  expect(master).toContain("npm install -g catenext");
   expect(await planInit({ root, mcpCommand: CMD })).toEqual([]);
 });
 

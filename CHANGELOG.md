@@ -19,7 +19,7 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 - Agent stubs English multi-platform (Claude/Cursor/Antigravity/OpenCode) + orchestrator stubs; stack in agent context.
 - Root `CATENEXT.md` master prompt for new sessions; platform entry files (`CLAUDE.md`, `.cursor/CATENEXT.md`, …) redirect there, then `AGENTS.md`.
 - `session_brief.pending_approvals` with approve/revise/next options for human chat gates.
-- README Master Prompt awal untuk cold-start chat.
+- README Master Prompt awal untuk cold-start chat (salin-tempel), termasuk **Bootstrap (install/init)**.
 - Parallel subagents wajib worktree terpisah; orchestrator memantau semua worktree, mengintegrasikan, lalu bertanya manusia: PR | merge | revise | next.
 - Kickoff brainstorm + `sync-board` / skill `cross-agent-sync`; persona `scribe` + skill `docs-hygiene` untuk merapikan dokumen.
 
@@ -31,6 +31,8 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 - Token lease task/review di-hash (`sha256.…`) di state; pemanggil tetap memakai token plaintext.
 - README mirror publik (`catenext-cli`): panduan lokal SQLite, master prompt `CATENEXT.md`,
   worktree paralel, approval manusia; hilangkan alur Cloud/login/dashboard.
+- Master prompt (`renderMasterPrompt` / README): bagian Bootstrap agar agen bisa `npm install -g catenext`
+  + `init`/`verify` dari chat sebelum orkestrasi.
 
 ### Removed
 - Web dashboard, Cloud API, browser login, premium quotas, and deployment configuration.
