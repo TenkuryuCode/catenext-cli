@@ -10,6 +10,15 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.6.1] - 2026-11-27
+
+### Diubah
+- Seed persona default **`matched`**: hanya subagent yang cocok dengan stack/repo
+  (mis. React → `fe`+`reviewer`; API Go → `be`+`reviewer`). Role lain (`tester`,
+  `security`, `scribe`, …) ditambah nanti lewat `catenext persona set` + `sync`.
+- Interview `init` / `interview_setup`: opsi `matched` (rekomendasi), `minimal`, `all`, `none`.
+- Deteksi stack Android (`build.gradle`, `AndroidManifest.xml`, …).
+
 ## [0.6.0] - 2026-11-27
 
 ### Ditambahkan

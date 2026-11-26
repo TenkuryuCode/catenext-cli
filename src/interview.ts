@@ -7,6 +7,8 @@ import {
   PlatformIdSchema,
   SUPPORTED_PLATFORMS,
 } from "@catenext/shared";
+import { detectStack } from "./init/detect.js";
+import { type PersonaSeedMode, recommendPersonaAliases } from "./seed.js";
 
 export type SetupOptionCard = {
   id: string;
@@ -53,6 +55,7 @@ function detectPlatformHints(root: string): PlatformId[] {
 export function buildInterviewSetup(
   root: string,
   step: "platform" | "personas" | "locale" = "platform",
+  stack: string[] = [],
 ): InterviewSetupResult {
   if (step === "locale") {
     return {
@@ -84,21 +87,29 @@ export function buildInterviewSetup(
   }
 
   if (step === "personas") {
+    const matched = recommendPersonaAliases(stack);
+    const stackHint = stack.length ? stack.join(", ") : "unknown";
     return {
       step,
       locale_hint: "follow_user",
       options: [
         {
-          id: "default",
-          label: "Seed be, fe, tester, android, security, reviewer, scribe",
+          id: "matched",
+          label: `Seed for this repo: ${matched.join(", ")}`,
           recommended: true,
-          why: "Delivery roles plus scribe for docs hygiene; add more later with persona set.",
+          why: `Matched to stack [${stackHint}]. Add more later with persona set / sync.`,
         },
         {
           id: "minimal",
           label: "Seed be, fe, reviewer only",
           recommended: false,
-          why: "Smaller starter set for tiny repos.",
+          why: "Fixed small starter set; ignore stack match.",
+        },
+        {
+          id: "all",
+          label: "Seed be, fe, tester, android, security, reviewer, scribe",
+          recommended: false,
+          why: "Full catalog; use when you want every role stubbed up front.",
         },
         {
           id: "none",
@@ -107,7 +118,7 @@ export function buildInterviewSetup(
           why: "You will create personas manually.",
         },
       ],
-      recommended_ids: ["default"],
+      recommended_ids: ["matched"],
       ask: "Which persona seed should this project use?",
     };
   }
@@ -169,21 +180,29 @@ async function ask(question: string, fallback: string): Promise<string> {
 
 export type InterviewAnswers = {
   platforms: PlatformId[];
-  personaSeed: "default" | "minimal" | "none";
+  personaSeed: PersonaSeedMode;
   locale: string;
+  stack: string[];
 };
+
+function parsePersonaSeed(raw: string): PersonaSeedMode {
+  if (raw === "all" || raw === "default") return "all";
+  if (raw === "minimal" || raw === "none" || raw === "matched") return raw;
+  return "matched";
+}
 
 /** Interactive (TTY) or default (--yes / non-TTY) setup interview. */
 export async function runInitInterview(
   root: string,
   opts: { yes?: boolean; platforms?: PlatformId[] },
 ): Promise<InterviewAnswers> {
-  const platformCards = buildInterviewSetup(root, "platform");
+  const stack = await detectStack(root);
+  const platformCards = buildInterviewSetup(root, "platform", stack);
   const defaultPlatforms = opts.platforms?.length
     ? opts.platforms
     : (platformCards.recommended_ids as PlatformId[]);
   let platforms = defaultPlatforms;
-  let personaSeed: InterviewAnswers["personaSeed"] = "default";
+  let personaSeed: PersonaSeedMode = "matched";
   let locale = "follow_user";
 
   if (!opts.yes && process.stdin.isTTY) {
@@ -197,15 +216,15 @@ export async function runInitInterview(
     );
     platforms = parsePlatformChoices(platformAnswer);
 
-    const personaCards = buildInterviewSetup(root, "personas");
+    const personaCards = buildInterviewSetup(root, "personas", stack);
     console.log(personaCards.ask);
     for (const card of personaCards.options) {
       console.log(`  ${card.recommended ? "*" : " "} ${card.id} — ${card.why}`);
     }
-    const personaAnswer = await ask("Persona seed", "default");
-    if (personaAnswer === "minimal" || personaAnswer === "none") personaSeed = personaAnswer;
+    const personaAnswer = await ask("Persona seed", "matched");
+    personaSeed = parsePersonaSeed(personaAnswer);
 
-    const localeCards = buildInterviewSetup(root, "locale");
+    const localeCards = buildInterviewSetup(root, "locale", stack);
     console.log(localeCards.ask);
     for (const card of localeCards.options) {
       console.log(`  ${card.recommended ? "*" : " "} ${card.id} — ${card.why}`);
@@ -213,5 +232,5 @@ export async function runInitInterview(
     locale = await ask("Locale", "follow_user");
   }
 
-  return { platforms, personaSeed, locale };
+  return { platforms, personaSeed, locale, stack };
 }

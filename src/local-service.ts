@@ -149,7 +149,8 @@ export class LocalService {
     options: {
       platforms?: string[];
       locale?: string;
-      personaSeed?: "default" | "minimal" | "none";
+      personaSeed?: "matched" | "all" | "minimal" | "none" | "default";
+      stack?: string[];
     } = {},
   ): Promise<void> {
     await this.store.transaction(
@@ -158,7 +159,10 @@ export class LocalService {
       (project, dirty) => {
         const beforePersonas = project.personas.length;
         const beforeDocs = project.documents.length;
-        applyProjectSeed(project, options);
+        applyProjectSeed(project, {
+          ...options,
+          stack: options.stack ?? this.config.stack ?? [],
+        });
         if (
           project.personas.length !== beforePersonas ||
           project.documents.length !== beforeDocs ||
@@ -254,7 +258,7 @@ class LocalWorkflow {
       return { ...skill, ...(revision ? { revision } : {}) };
     },
     save_repo_skill: (input) => saveSkill(this.root, input, new Date(this.now)),
-    interview_setup: (input) => buildInterviewSetup(this.root, input.step),
+    interview_setup: (input) => buildInterviewSetup(this.root, input.step, this.config.stack ?? []),
     session_brief: (input) => this.sessionBrief(Boolean(input.verbose)),
     manage_roots: (input) => this.manageRoots(input),
     graph_neighbors: (input) => ({

@@ -48,5 +48,19 @@ export async function detectStack(root: string): Promise<string[]> {
   else if ((await exists(join(root, "requirements.txt"))) !== null) stack.add("python");
   if ((await exists(join(root, "Cargo.toml"))) !== null) stack.add("rust");
 
+  const androidHints = [
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    join("app", "src", "main", "AndroidManifest.xml"),
+  ];
+  for (const rel of androidHints) {
+    if ((await exists(join(root, rel))) !== null) {
+      stack.add("android");
+      break;
+    }
+  }
+
   return [...stack].slice(0, 20);
 }

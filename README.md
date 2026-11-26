@@ -36,8 +36,9 @@ Mulai ulang IDE/CLI, lalu percayai server MCP `catenext` jika diminta.
 | OpenCode | `opencode` | sesuai setup OpenCode + `.opencode/CATENEXT.md` |
 
 `init` menulis `.catenext/config.yaml`, entri MCP, `.gitignore`, **`CATENEXT.md`** (master
-prompt), pointer platform, blok di `AGENTS.md`, dan seed persona default
-(`be`, `fe`, `tester`, `android`, `security`, `reviewer`, `scribe`).
+prompt), pointer platform, blok di `AGENTS.md`, dan seed persona **yang cocok dengan
+stack/repo** (mis. hanya `fe`+`reviewer` untuk Next.js). Role lain ditambah nanti:
+`catenext persona set <alias> --role <role>` lalu `catenext sync`.
 `catenext remove` membersihkan setup (bukan file state SQLite, kecuali Anda hapus sendiri).
 
 ```bash
@@ -131,6 +132,7 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 | Install CLI | `npm install -g catenext` |
 | First-time setup | `catenext init --platform <id>` (`--dry-run` / `--yes`) |
 | Verify MCP | `catenext verify --platform <id>` |
+| Add persona | `catenext persona set <alias> --role <role>` then `catenext sync` |
 | Session snapshot | `catenext brief` |
 | Board | `catenext board` |
 | Claim (parallel-safe) | `catenext claim <id> --as <alias> --worktree` |
@@ -141,7 +143,7 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 
 ## Do / Don't
 
-- **Do** install/init when setup is missing; keep tool outputs compact; cite paths; one worktree per concurrent subagent.
+- **Do** install/init when setup is missing; seed only personas that match this repo; add more with `persona set` when needed.
 - **Don't** invent cloud accounts, API keys, or dashboards — this CLI is local SQLite only.
 - **Don't** implement persona tasks yourself unless the human explicitly asks.
 - **Don't** merge to main without explicit human choice; prefer PR when unsure.
@@ -157,12 +159,15 @@ rencana / delegasi. Bahasa tanya-jawab mengikuti manusia; stub agen tetap Inggri
 
 - **Orchestrator** memecah tujuan, menyusun DRAFT, mendelegasikan, meninjau worktree, dan
   bertanya ke manusia sebelum merge/PR.
-- **Persona** adalah subagent (alias + role + repo). Default setelah `init`: `be`, `fe`,
-  `tester`, `android`, `security`, `reviewer`, `scribe`.
+- **Persona** adalah subagent (alias + role + repo). Setelah `init`, hanya yang **matched**
+  ke repo (plus `reviewer`). Catalog penuh tetap tersedia: `be`, `fe`, `tester`, `android`,
+  `security`, `reviewer`, `scribe`.
 
 ```bash
 catenext persona list
+catenext persona set tester --role testing    # tambah role yang kurang
 catenext persona set bambang --role backend --repo api
+catenext sync --platform cursor               # tulis stub agen untuk persona baru
 catenext brief
 catenext board
 ```

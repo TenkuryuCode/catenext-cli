@@ -1,6 +1,8 @@
 import type { LocalProject } from "./local-state.js";
 
-/** Default personas seeded on init (English rules for agents). */
+export type PersonaSeedMode = "matched" | "all" | "minimal" | "none";
+
+/** Catalog of personas available to seed (English rules for agents). */
 export const DEFAULT_PERSONAS: LocalProject["personas"] = [
   {
     alias: "be",
@@ -73,6 +75,66 @@ export const DEFAULT_PERSONAS: LocalProject["personas"] = [
   },
 ];
 
+const FRONTEND_STACK = new Set(["react", "vue", "svelte", "nextjs"]);
+const BACKEND_STACK = new Set([
+  "hono",
+  "express",
+  "nestjs",
+  "go",
+  "php",
+  "laravel",
+  "python",
+  "rust",
+  "drizzle",
+  "prisma",
+]);
+
+/** Pick persona aliases that fit this checkout's stack (never forces unused roles). */
+export function recommendPersonaAliases(stack: string[]): string[] {
+  const tags = new Set(stack.map((s) => s.toLowerCase()));
+  const aliases = new Set<string>(["reviewer"]);
+
+  const wantsFe = [...FRONTEND_STACK].some((t) => tags.has(t));
+  const wantsBe = [...BACKEND_STACK].some((t) => tags.has(t));
+  const wantsAndroid = tags.has("android") || tags.has("kotlin");
+
+  if (wantsFe) aliases.add("fe");
+  if (wantsBe) aliases.add("be");
+  if (wantsAndroid) aliases.add("android");
+
+  // Node/TS without clear FE/BE markers → assume API-capable backend.
+  if (!wantsFe && !wantsBe && !wantsAndroid && (tags.has("node") || tags.has("typescript"))) {
+    aliases.add("be");
+  }
+
+  // Empty / unknown repo → small delivery pair + reviewer; user can add more later.
+  if (aliases.size === 1) {
+    aliases.add("be");
+    aliases.add("fe");
+  }
+
+  const order = DEFAULT_PERSONAS.map((p) => p.alias);
+  return order.filter((alias) => aliases.has(alias));
+}
+
+export function personasForSeed(
+  mode: PersonaSeedMode,
+  stack: string[] = [],
+): LocalProject["personas"] {
+  if (mode === "none") return [];
+  const aliases =
+    mode === "all"
+      ? DEFAULT_PERSONAS.map((p) => p.alias)
+      : mode === "minimal"
+        ? ["be", "fe", "reviewer"]
+        : recommendPersonaAliases(stack);
+  return DEFAULT_PERSONAS.filter((persona) => aliases.includes(persona.alias)).map((persona) => ({
+    ...persona,
+    rules: [...persona.rules],
+    repos: [...persona.repos],
+  }));
+}
+
 export const DEFAULT_PERMISSIONS: LocalProject["permissions"] = [
   { action: "approve_plan", principal: "human" },
   { action: "edit_setup", principal: "human" },
@@ -85,8 +147,15 @@ export const DEFAULT_PERMISSIONS: LocalProject["permissions"] = [
 
 const iso = () => new Date().toISOString();
 
-export function starterDocuments(updatedBy = "catenext-init"): LocalProject["documents"] {
+export function starterDocuments(
+  updatedBy = "catenext-init",
+  seededAliases: string[] = [],
+): LocalProject["documents"] {
   const at = iso();
+  const seeded =
+    seededAliases.length > 0
+      ? seededAliases.join(", ")
+      : "matched to this repo (add more with `catenext persona set`)";
   const docs: Array<{
     slug: string;
     title: string;
@@ -103,7 +172,8 @@ export function starterDocuments(updatedBy = "catenext-init"): LocalProject["doc
         "Local Catenext project. Orchestrator asks the user first (user language), then delegates to English-persona subagents.",
         "",
         "- Storage: `.catenext/catenext.sqlite`",
-        "- Default personas: be, fe, tester, android, security, reviewer, scribe",
+        `- Seeded personas: ${seeded}`,
+        "- Add roles later: `catenext persona set <alias> --role <role>` then `catenext sync`",
         "- Kickoff: cross-agent brainstorm → document `sync-board`",
         "- External folders: register with `catenext root add` and assign an owning persona",
       ].join("\n"),
@@ -120,7 +190,7 @@ export function starterDocuments(updatedBy = "catenext-init"): LocalProject["doc
         "3. Before parallel work: short brainstorm with involved personas; save to `sync-board` (skill `cross-agent-sync`).",
         "4. Delegate only; concurrent personas each use a separate git worktree.",
         "5. Watch all worktrees; after handoffs integrate if needed, then ask: PR | merge | revise | next.",
-        "6. Docs tidy: delegate persona `scribe` with skill `docs-hygiene`.",
+        "6. Docs tidy: add persona `scribe` if needed, then skill `docs-hygiene`.",
         "7. Keep tool outputs brief; no code dumps or secrets.",
       ].join("\n"),
     },
@@ -184,25 +254,26 @@ export function applyProjectSeed(
   options: {
     platforms?: string[];
     locale?: string;
-    personaSeed?: "default" | "minimal" | "none";
+    personaSeed?: PersonaSeedMode | "default";
+    stack?: string[];
   } = {},
 ): void {
-  if (project.personas.length === 0 && options.personaSeed !== "none") {
-    const source =
-      options.personaSeed === "minimal"
-        ? DEFAULT_PERSONAS.filter((persona) => ["be", "fe", "reviewer"].includes(persona.alias))
-        : DEFAULT_PERSONAS;
-    project.personas = source.map((persona) => ({
-      ...persona,
-      rules: [...persona.rules],
-      repos: [...persona.repos],
-    }));
+  const mode: PersonaSeedMode =
+    options.personaSeed === "default" || options.personaSeed === undefined
+      ? "matched"
+      : options.personaSeed;
+
+  if (project.personas.length === 0 && mode !== "none") {
+    project.personas = personasForSeed(mode, options.stack ?? []);
   }
   if (project.permissions.length === 0) {
     project.permissions = DEFAULT_PERMISSIONS.map((row) => ({ ...row }));
   }
   if (project.documents.length === 0) {
-    project.documents = starterDocuments();
+    project.documents = starterDocuments(
+      "catenext-init",
+      project.personas.map((p) => p.alias),
+    );
   }
   if (options.platforms?.length) {
     project.platform_setup = [

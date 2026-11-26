@@ -188,6 +188,7 @@ program
           platforms,
           locale: answers.locale,
           personaSeed: answers.personaSeed,
+          stack: answers.stack.length ? answers.stack : (config.stack ?? []),
         });
         const { planSubagents } = await import("./subagents.js");
         const personas = (await service.callTool("list_personas", {})).personas;
