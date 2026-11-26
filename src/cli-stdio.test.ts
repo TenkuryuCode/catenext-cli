@@ -249,6 +249,18 @@ describe("CLI dan MCP stdio lokal", () => {
       expect(cli(["search", "localWorkflowMarker", "--source", "code", "--json"])).toContain(
         "feature.ts",
       );
+      const logOut = JSON.parse(cli(["log", first.task_id, "--limit", "10", "--json"])) as {
+        events: Array<{ event: string }>;
+      };
+      expect(logOut.events.map((e) => e.event)).toEqual([
+        "approve",
+        "handoff",
+        "claim",
+        "unblock",
+        "blocker",
+        "claim",
+        "approve_plan",
+      ]);
       expect(stderr).toContain("[catenext]");
     } finally {
       await client.close();
@@ -285,5 +297,20 @@ describe("CLI dan MCP stdio lokal", () => {
       state,
     );
     cli(["verify", "--platform", "claude-code"]);
+    const perms = JSON.parse(cli(["permission", "--json"])) as {
+      permissions: Array<{ action: string; principal: string }>;
+    };
+    expect(perms.permissions).toContainEqual({
+      action: "upsert_persona",
+      principal: "orchestrator",
+    });
+    cli(["permission", "revoke", "upsert_persona", "orchestrator"]);
+    const permsAfter = JSON.parse(cli(["permission", "list", "--json"])) as {
+      permissions: Array<{ action: string; principal: string }>;
+    };
+    expect(permsAfter.permissions).not.toContainEqual({
+      action: "upsert_persona",
+      principal: "orchestrator",
+    });
   }, 20_000);
 });

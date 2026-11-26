@@ -28,10 +28,17 @@ export async function verifySetup(
   const state = stateFilePath(root, config);
   try {
     const stat = await lstat(state);
+    const regular = stat.isFile() && stat.nlink === 1;
+    const modeOk = process.platform === "win32" || (stat.mode & 0o777) === 0o600;
+    const hint = !regular
+      ? "State harus file biasa, bukan symlink atau hardlink."
+      : !modeOk
+        ? `Izin file state harus 0600 (chmod 600 ${state}).`
+        : undefined;
     lines.push({
-      ok: stat.isFile() && stat.nlink === 1,
+      ok: hint === undefined,
       label: `File state lokal: ${state}`,
-      hint: "State harus file biasa, bukan symlink atau hardlink.",
+      hint,
     });
   } catch (error) {
     if (!isMissingFile(error)) throw error;

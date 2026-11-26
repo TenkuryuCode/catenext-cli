@@ -1,18 +1,25 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
+  briefText,
   ClaimTaskInput,
   CompleteHandoffInput,
   GetReadyTasksInput,
   HANDOFF_LIMITS,
   type HandoffSummary,
+  IdSchema,
   ManageTaskInput,
   type McpToolOutput,
   ReportBlockerInput,
   ReviewInput,
 } from "@catenext/shared";
+import { z } from "zod";
+import { isMissingFile } from "./config.js";
 import type { LocalService } from "./local-service.js";
+import { type LocalPermission, PERMISSION_ACTIONS } from "./local-state.js";
 import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
 
 /**
@@ -31,11 +38,61 @@ async function git(args: string[], cwd: string): Promise<string | null> {
   }
 }
 
+async function gitRaw(args: string[], cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec("git", args, { cwd });
+    return stdout.replace(/[\r\n]+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function parsePorcelainPaths(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .filter((line) => line.length >= 4)
+    .map((line) => {
+      const entry = line.slice(3).trim();
+      const renamed = entry.includes(" -> ") ? (entry.split(" -> ").pop() ?? entry) : entry;
+      return renamed.replace(/^"(.*)"$/, "$1");
+    })
+    .filter(Boolean);
+}
+
+export async function readOrCreateCliSessionId(root: string = process.cwd()): Promise<string> {
+  const file = join(root, ".catenext", "cache", "cli-session-id");
+  try {
+    const existing = (await readFile(file, "utf8")).trim();
+    if (IdSchema.safeParse(existing).success) return existing;
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
+  const id = randomUUID();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, `${id}\n`, "utf8");
+  return id;
+}
+
+async function detectBaseBranch(cwd: string, currentBranch: string): Promise<string | undefined> {
+  const originHead = await git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
+  if (originHead) {
+    const base = originHead.replace(/^origin\//, "");
+    if (base && base !== currentBranch) return base;
+  }
+  for (const candidate of ["main", "master"]) {
+    const exists = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], cwd);
+    if (exists !== null && candidate !== currentBranch) return candidate;
+  }
+  return undefined;
+}
+
 export interface GitState {
   branch: string | null;
   commit: string | null;
   /** File yang berubah di commit terakhir + perubahan yang belum di-commit. */
   changedFiles: string[];
+  /** Perubahan belum di-commit dari `git status --porcelain` atau diff vs `HEAD`. */
+  dirtyFiles?: string[];
 }
 
 export async function readGitState(cwd: string = process.cwd()): Promise<GitState> {
@@ -43,10 +100,14 @@ export async function readGitState(cwd: string = process.cwd()): Promise<GitStat
   const commit = await git(["rev-parse", "HEAD"], cwd);
   const lastCommit = (await git(["show", "--name-only", "--format=", "HEAD"], cwd)) ?? "";
   const dirty = (await git(["diff", "--name-only", "HEAD"], cwd)) ?? "";
+  const porcelain = (await gitRaw(["status", "--porcelain"], cwd)) ?? "";
+  const dirtyFiles = [
+    ...new Set([...dirty.split("\n").filter(Boolean), ...parsePorcelainPaths(porcelain)]),
+  ];
   const changedFiles = [
     ...new Set([...dirty.split("\n"), ...lastCommit.split("\n")].filter(Boolean)),
   ];
-  return { branch, commit, changedFiles };
+  return { branch, commit, changedFiles, ...(dirtyFiles.length ? { dirtyFiles } : {}) };
 }
 
 export async function taskNext(
@@ -128,21 +189,38 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
 export async function taskClaim(
   service: LocalService,
   taskId: string,
-  opts: { as?: string; json?: boolean; worktree?: boolean },
+  opts: { as?: string; json?: boolean; worktree?: boolean; base?: string; cwd?: string },
 ) {
-  const branch = opts.worktree
-    ? await git(["symbolic-ref", "--short", "HEAD"], process.cwd())
-    : null;
+  if (opts.base && !opts.worktree) {
+    throw new PlanningInputError("--base hanya berlaku bersama --worktree.");
+  }
+  const cwd = opts.cwd ?? process.cwd();
+  const branch = opts.worktree ? await git(["symbolic-ref", "--short", "HEAD"], cwd) : null;
   if (opts.worktree && !branch)
     throw new PlanningInputError("Checkout branch kerja sebelum memakai --worktree.");
+  const worktreeRoot = opts.worktree
+    ? ((await git(["rev-parse", "--show-toplevel"], cwd)) ?? cwd)
+    : undefined;
+  const sessionId = worktreeRoot ? await readOrCreateCliSessionId(worktreeRoot) : undefined;
+  const baseBranch =
+    opts.worktree && branch ? (opts.base ?? (await detectBaseBranch(cwd, branch))) : undefined;
   const payload = prepare(
     ClaimTaskInput,
     {
       task_id: taskId,
       ...(opts.as ? { agent_alias: opts.as } : {}),
-      ...(branch ? { worktree: { branch, session_id: randomUUID() } } : {}),
+      ...(branch && sessionId
+        ? {
+            worktree: {
+              branch,
+              session_id: sessionId,
+              ...(worktreeRoot ? { worktree_path: worktreeRoot } : {}),
+              ...(baseBranch ? { base_branch: baseBranch } : {}),
+            },
+          }
+        : {}),
     },
-    ["task_id", "session_id", "agent_alias"],
+    ["task_id", "session_id", "agent_alias", "branch", "worktree_path", "base_branch"],
   );
   const res = await service.callTool("claim_task", payload);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
@@ -160,6 +238,7 @@ export interface DoneOptions {
   /** File JSON berisi handoff_summary lengkap, atau '-' untuk stdin. */
   handoff?: string;
   json?: boolean;
+  cwd?: string;
 }
 
 /** Susun handoff dari flag + git lokal. Flag eksplisit selalu menang atas deteksi git. */
@@ -197,9 +276,17 @@ export async function taskDone(service: LocalService, taskId: string, opts: Done
       "Sertakan metadata PR di JSON handoff, bukan lewat --pr atau --base bersamaan dengan --handoff.",
     );
   }
-  const summary = opts.handoff
-    ? await readJsonInput(opts.handoff)
-    : buildHandoff(opts, await readGitState());
+  const gitState = await readGitState(opts.cwd);
+  if (gitState.dirtyFiles?.length) {
+    const preview = gitState.dirtyFiles.slice(0, 5).join(", ");
+    const more =
+      gitState.dirtyFiles.length > 5 ? ` (+${gitState.dirtyFiles.length - 5} lainnya)` : "";
+    console.error(
+      `! Peringatan: ada ${gitState.dirtyFiles.length} perubahan belum di-commit (${preview}${more}). ` +
+        `Commit pekerjaan Anda agar last_commit_hash (${gitState.commit ?? "HEAD"}) mencakup seluruh perubahan.`,
+    );
+  }
+  const summary = opts.handoff ? await readJsonInput(opts.handoff) : buildHandoff(opts, gitState);
   const body = prepare(
     CompleteHandoffInput,
     { task_id: taskId, handoff_summary: summary, lease_id: opts.lease },
@@ -280,4 +367,102 @@ export async function taskManage(service: LocalService, input: unknown, json: bo
     if (body.action === "approve")
       console.log("  Persetujuan dicatat lokal; status merge PR tidak diverifikasi.");
   }
+}
+
+const TaskLogInput = z.strictObject({
+  task_id: IdSchema.optional(),
+  limit: z.number().int().min(1).max(200).default(20),
+});
+
+export async function taskLog(
+  service: LocalService,
+  taskId?: string,
+  opts: { limit?: number; json?: boolean } = {},
+) {
+  const body = prepare(
+    TaskLogInput,
+    {
+      ...(taskId !== undefined ? { task_id: taskId } : {}),
+      ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+    },
+    ["task_id", "limit"],
+  );
+  const events = await service.readTaskEvents({
+    taskId: body.task_id,
+    limit: body.limit,
+  });
+  if (opts.json) return console.log(JSON.stringify({ events }, null, 2));
+  if (events.length === 0) {
+    return console.log(
+      body.task_id
+        ? `Belum ada event audit untuk task ${body.task_id}.`
+        : "Belum ada event audit task.",
+    );
+  }
+  for (const ev of events) {
+    const taskPart = body.task_id
+      ? ""
+      : `  ${ev.task_id.slice(0, 8)}${ev.task_title ? ` (${briefText(ev.task_title, 40)})` : ""}`;
+    const notePart = ev.note ? `  — ${briefText(ev.note, 80)}` : "";
+    console.log(`${ev.created_at}  ${ev.event.padEnd(12)}  ${ev.actor}${taskPart}${notePart}`);
+  }
+}
+
+function renderPermissions(permissions: LocalPermission[]): void {
+  if (permissions.length === 0) {
+    console.log("Belum ada aturan permission.");
+    return;
+  }
+  const byAction = new Map<string, string[]>();
+  for (const row of permissions) {
+    const list = byAction.get(row.action) ?? [];
+    list.push(row.principal);
+    byAction.set(row.action, list);
+  }
+  for (const action of PERMISSION_ACTIONS) {
+    const principals = byAction.get(action) ?? [];
+    console.log(`${action.padEnd(16)} ${principals.length ? principals.join(", ") : "(none)"}`);
+  }
+}
+
+export async function permissionList(service: LocalService, asJson: boolean): Promise<void> {
+  const permissions = await service.listPermissions();
+  if (asJson) return console.log(JSON.stringify({ permissions }, null, 2));
+  renderPermissions(permissions);
+}
+
+export async function permissionSet(
+  service: LocalService,
+  action: string,
+  principals: string[],
+  asJson: boolean,
+): Promise<void> {
+  const permissions = await service.setPermissions(action, principals);
+  if (asJson) return console.log(JSON.stringify({ permissions }, null, 2));
+  const current = permissions.filter((row) => row.action === action).map((row) => row.principal);
+  console.log(`✓ Permission ${action}: ${current.join(", ") || "(none)"}`);
+}
+
+export async function permissionGrant(
+  service: LocalService,
+  action: string,
+  principal: string,
+  asJson: boolean,
+): Promise<void> {
+  const permissions = await service.grantPermission(action, principal);
+  if (asJson) return console.log(JSON.stringify({ permissions }, null, 2));
+  const current = permissions.filter((row) => row.action === action).map((row) => row.principal);
+  console.log(`✓ Permission ${action}: ${current.join(", ") || "(none)"}`);
+}
+
+export async function permissionRevoke(
+  service: LocalService,
+  action: string,
+  principal: string,
+  asJson: boolean,
+): Promise<void> {
+  const permissions = await service.revokePermission(action, principal);
+  if (asJson) return console.log(JSON.stringify({ permissions }, null, 2));
+  const current = permissions.filter((row) => row.action === action).map((row) => row.principal);
+  console.log(`✓ Permission ${action}: ${current.join(", ") || "(none)"}`);
 }

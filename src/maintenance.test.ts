@@ -1,12 +1,13 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as json } from "jsonc-parser";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CONFIG_PATH, readConfig } from "./config.js";
+import { CONFIG_PATH, readConfig, stateFilePath } from "./config.js";
 import { applyInit, planInit } from "./init/index.js";
 import { applyFileEdits, entryIsStale, planRemove, planSync } from "./maintenance.js";
 import { SUBAGENT_MARKER } from "./subagents.js";
+import { verifySetup } from "./verify.js";
 
 const CMD = { command: "catenext", args: [] as string[] };
 const NEW = () => ({ command: "node", args: ["new.js"] });
@@ -155,4 +156,24 @@ it("flags only missing absolute launch paths and leaves PATH commands alone", as
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+describe("verifySetup", () => {
+  it("memeriksa izin file state SQLite 0600 pada POSIX", async () => {
+    const config = await readConfig(root);
+    const state = stateFilePath(root, config);
+    await writeFile(state, "");
+    await chmod(state, 0o644);
+    const failed = await verifySetup(root, config, ["claude-code"]);
+    const stateCheckBad = failed.find((line) => line.label.includes(state));
+    if (process.platform !== "win32") {
+      expect(stateCheckBad?.ok).toBe(false);
+      expect(stateCheckBad?.hint).toContain("chmod 600");
+    }
+
+    await chmod(state, 0o600);
+    const passed = await verifySetup(root, config, ["claude-code"]);
+    const stateCheckOk = passed.find((line) => line.label.includes(state));
+    expect(stateCheckOk?.ok).toBe(true);
+  });
 });

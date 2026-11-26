@@ -344,7 +344,7 @@ catenext index
 catenext search "login handler" --code
 ```
 
-MCP: `graph_neighbors`, `symbol_search` (hasil ringkas).
+MCP: `graph_neighbors`, `symbol_search`, `search_code` (hasil ringkas).
 
 ## Data lokal
 
@@ -377,7 +377,9 @@ Backup SQLite terpisah jika perlu. Data Cloud lama **tidak** dimigrasi otomatis.
 | `epic` / `task create` | `list_epics` / `create_epic` / `create_tasks` | Rencana (masuk DRAFT) |
 | `review …` | `review_pull_request` | Antrean review lokal |
 | `skill load` | `load_skill` / `save_repo_skill` | Skill repo |
-| `index` / `search` | `graph_neighbors` / `symbol_search` / `search_context` | Graf & pencarian lokal |
+| `index` / `search` | `graph_neighbors` / `symbol_search` / `search_code` / `search_context` | Graf & pencarian lokal |
+| `log` | - | Audit log event task (`task_events`) |
+| `permission list\|set\|grant\|revoke` | - | Matriks permission lokal |
 | `mcp` | - | Server MCP stdio |
 | - | `interview_setup` | Kartu opsi setup untuk interview |
 

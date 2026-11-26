@@ -1,6 +1,6 @@
-/** SQLite DDL for local Catenext orchestration (schema version 1). */
+/** SQLite DDL for local Catenext orchestration (schema version 3). */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   handoff_json TEXT,
   review_json TEXT,
   blocker_json TEXT,
+  integrated_commit_json TEXT,
   PRIMARY KEY (project_id, id)
 );
 
@@ -86,6 +87,17 @@ CREATE TABLE IF NOT EXISTS task_deps (
   depends_on TEXT NOT NULL,
   PRIMARY KEY (project_id, task_id, depends_on),
   FOREIGN KEY (project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  note TEXT,
+  detail_json TEXT,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS permissions (
@@ -147,6 +159,8 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_events_project_task_created
+  ON task_events(project_id, task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project_id, kind);
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(project_id, path);

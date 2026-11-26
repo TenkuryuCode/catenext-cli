@@ -1,6 +1,7 @@
 import {
   AgentAliasSchema,
   BlockerCategorySchema,
+  CommitShaSchema,
   HandoffSummarySchema,
   IdSchema,
   IsoDateTimeSchema,
@@ -26,7 +27,13 @@ const taskLease = z.strictObject({
   repo: RepoNameSchema,
   alias: AgentAliasSchema.optional(),
   expiresAt: IsoDateTimeSchema,
-  worktree: z.strictObject({ session: IdSchema }).optional(),
+  worktree: z
+    .strictObject({
+      session: IdSchema,
+      worktree_path: z.string().min(1).max(1000).optional(),
+      base_branch: z.string().min(1).max(255).optional(),
+    })
+    .optional(),
 });
 
 const review = z.strictObject({
@@ -63,8 +70,18 @@ const task = z.strictObject({
   persona: AgentAliasSchema.nullable(),
   requiresApproval: z.boolean(),
   lease: taskLease.optional(),
-  branch: z.strictObject({ repo: RepoNameSchema, name: z.string().min(1).max(255) }).optional(),
+  branch: z
+    .strictObject({
+      repo: RepoNameSchema,
+      name: z.string().min(1).max(255),
+      worktree_path: z.string().min(1).max(1000).optional(),
+      base_branch: z.string().min(1).max(255).optional(),
+    })
+    .optional(),
   handoff: HandoffSummarySchema.optional(),
+  integrated_commit: z
+    .strictObject({ branch: z.string().min(1).max(255), sha: CommitShaSchema })
+    .optional(),
   review: review.optional(),
   feedback: z.string().min(1).max(2000).optional(),
   revision: z.number().int().min(0),

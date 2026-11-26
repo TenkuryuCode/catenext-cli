@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   AgentAliasSchema,
   BlockerCategorySchema,
+  CommitShaSchema,
   EpicSchema,
   HandoffSummarySchema,
   IdSchema,
@@ -20,7 +21,7 @@ import {
 import { z } from "zod";
 import { LocalServiceError } from "../errors.js";
 import { emptyExtendedProject, saveProject } from "./project-codec.js";
-import { SCHEMA_VERSION } from "./schema.js";
+import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
 
 const LeaseTokenSchema = z.string().min(1).max(128);
 
@@ -29,7 +30,13 @@ const taskLease = z.strictObject({
   repo: RepoNameSchema,
   alias: AgentAliasSchema.optional(),
   expiresAt: IsoDateTimeSchema,
-  worktree: z.strictObject({ session: IdSchema }).optional(),
+  worktree: z
+    .strictObject({
+      session: IdSchema,
+      worktree_path: z.string().min(1).max(1000).optional(),
+      base_branch: z.string().min(1).max(255).optional(),
+    })
+    .optional(),
 });
 
 const review = z.strictObject({
@@ -66,8 +73,18 @@ const legacyTask = z.strictObject({
   persona: AgentAliasSchema.nullable(),
   requiresApproval: z.boolean(),
   lease: taskLease.optional(),
-  branch: z.strictObject({ repo: RepoNameSchema, name: z.string().min(1).max(255) }).optional(),
+  branch: z
+    .strictObject({
+      repo: RepoNameSchema,
+      name: z.string().min(1).max(255),
+      worktree_path: z.string().min(1).max(1000).optional(),
+      base_branch: z.string().min(1).max(255).optional(),
+    })
+    .optional(),
   handoff: HandoffSummarySchema.optional(),
+  integrated_commit: z
+    .strictObject({ branch: z.string().min(1).max(255), sha: CommitShaSchema })
+    .optional(),
   review: review.optional(),
   feedback: z.string().min(1).max(2000).optional(),
   revision: z.number().int().min(0),
@@ -92,8 +109,176 @@ const legacyState = z.strictObject({
   projects: z.record(IdSchema, legacyProject),
 });
 
+export interface SchemaMigration {
+  version: number;
+  description: string;
+  up: (db: DatabaseSync) => void;
+}
+
+export interface SchemaMigrationResult {
+  fromVersion: number;
+  toVersion: number;
+  applied: number[];
+}
+
+export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
+  {
+    version: 2,
+    description: "Ensure tasks.integrated_commit_json column and v2 schema indexes",
+    up(db) {
+      db.exec(SCHEMA_SQL);
+      const taskColumns = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
+      if (
+        taskColumns.length > 0 &&
+        !taskColumns.some((col) => col.name === "integrated_commit_json")
+      ) {
+        db.exec("ALTER TABLE tasks ADD COLUMN integrated_commit_json TEXT");
+      }
+    },
+  },
+  {
+    version: 3,
+    description: "Add task_events audit log table and index",
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL,
+          event TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          note TEXT,
+          detail_json TEXT,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_events_project_task_created
+          ON task_events(project_id, task_id, created_at);
+      `);
+    },
+  },
+];
+
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+function tableExists(db: DatabaseSync, tableName: string): boolean {
+  const row = db
+    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName) as { ok: number } | undefined;
+  return Boolean(row);
+}
+
+function readMetaSchemaVersion(db: DatabaseSync): number {
+  if (!tableExists(db, "meta")) return 0;
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
+    | { value: string }
+    | undefined;
+  if (!row) return 0;
+  const parsed = Number.parseInt(row.value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function readUserVersion(db: DatabaseSync): number {
+  const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
+  const value = Number(row?.user_version ?? 0);
+  return Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+/** Detect current SQLite schema version from `meta.schema_version` and `PRAGMA user_version`. */
+export function getSchemaVersion(db: DatabaseSync): number {
+  const metaVersion = readMetaSchemaVersion(db);
+  const userVersion = readUserVersion(db);
+  const combined = Math.max(metaVersion, userVersion);
+  if (combined > 0) return combined;
+  if (tableExists(db, "projects") || tableExists(db, "tasks")) return 1;
+  return 0;
+}
+
+/** Record schema version in both `meta` and `PRAGMA user_version`. */
+export function setSchemaVersion(db: DatabaseSync, version: number): void {
+  if (!Number.isInteger(version) || version < 0) {
+    throw new LocalServiceError("corrupt_state", `Invalid schema version: ${String(version)}`);
+  }
+  db.prepare(
+    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(String(version));
+  db.exec(`PRAGMA user_version = ${version}`);
+}
+
+function runInTransaction(db: DatabaseSync, name: string, fn: () => void): void {
+  const useSavepoint = db.isTransaction;
+  db.exec(useSavepoint ? `SAVEPOINT ${name}` : "BEGIN IMMEDIATE");
+  try {
+    fn();
+    db.exec(useSavepoint ? `RELEASE SAVEPOINT ${name}` : "COMMIT");
+  } catch (error) {
+    db.exec(useSavepoint ? `ROLLBACK TO SAVEPOINT ${name}; RELEASE SAVEPOINT ${name}` : "ROLLBACK");
+    throw error;
+  }
+}
+
+/**
+ * Run idempotent, ordered schema migrations up to `targetVersion` (default `SCHEMA_VERSION`).
+ */
+export function runSchemaMigrations(
+  db: DatabaseSync,
+  options: {
+    targetVersion?: number;
+    migrations?: readonly SchemaMigration[];
+  } = {},
+): SchemaMigrationResult {
+  const targetVersion = options.targetVersion ?? SCHEMA_VERSION;
+  const migrations = options.migrations ?? SCHEMA_MIGRATIONS;
+  const fromVersion = getSchemaVersion(db);
+
+  if (fromVersion > targetVersion) {
+    throw new LocalServiceError(
+      "unsupported_schema",
+      `Catenext SQLite schema version ${fromVersion} is newer than supported version ${targetVersion}. Upgrade Catenext CLI.`,
+    );
+  }
+
+  if (fromVersion === 0) {
+    runInTransaction(db, "schema_init", () => {
+      db.exec(SCHEMA_SQL);
+      setSchemaVersion(db, targetVersion);
+    });
+    return { fromVersion: 0, toVersion: targetVersion, applied: [] };
+  }
+
+  if (fromVersion === targetVersion) {
+    // Sync meta/user_version only when one of them lagged behind.
+    if (readMetaSchemaVersion(db) !== targetVersion || readUserVersion(db) !== targetVersion) {
+      runInTransaction(db, "schema_sync_ver", () => {
+        setSchemaVersion(db, targetVersion);
+      });
+    }
+    return { fromVersion, toVersion: targetVersion, applied: [] };
+  }
+
+  const pending = [...migrations]
+    .filter((m) => m.version > fromVersion && m.version <= targetVersion)
+    .sort((a, b) => a.version - b.version);
+
+  const applied: number[] = [];
+  for (const migration of pending) {
+    runInTransaction(db, `schema_v${migration.version}`, () => {
+      migration.up(db);
+      setSchemaVersion(db, migration.version);
+    });
+    applied.push(migration.version);
+  }
+
+  const afterVersion = getSchemaVersion(db);
+  if (afterVersion < targetVersion) {
+    runInTransaction(db, "schema_finalize_ver", () => {
+      setSchemaVersion(db, targetVersion);
+    });
+  }
+
+  return { fromVersion, toVersion: targetVersion, applied };
 }
 
 /** Classic JSON state path beside a SQLite DB. */
@@ -152,9 +337,7 @@ export async function migrateJsonStateIfNeeded(db: DatabaseSync, dbPath: string)
       project.documents = data.documents.map((doc) => ({ ...doc }));
       saveProject(db, projectId, project);
     }
-    db.prepare(
-      "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ).run(String(SCHEMA_VERSION));
+    setSchemaVersion(db, SCHEMA_VERSION);
     db.prepare(
       "INSERT INTO meta (key, value) VALUES ('migrated_from_json', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(new Date().toISOString());

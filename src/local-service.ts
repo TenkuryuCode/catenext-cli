@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, statSync } from "node:fs";
+import { chmod } from "node:fs/promises";
 import { basename, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import {
   briefText,
   type CatenextConfig,
@@ -15,55 +18,42 @@ import {
   type ProjectDocument,
   type PullRequestState,
   type ReviewResult,
+  type SearchHit,
   type TaskEvent,
   type TaskSummary,
 } from "@catenext/shared";
 import type { z } from "zod";
+import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { graphNeighbors, symbolSearch } from "./db/graph-index.js";
 import { LocalStore, newRootId } from "./db/store.js";
+import {
+  insertTaskEvents,
+  type NewTaskEvent,
+  type ReadTaskEventsOptions,
+  type TaskEventRecord,
+} from "./db/task-events.js";
 import { LocalServiceError } from "./errors.js";
 import { buildInterviewSetup } from "./interview.js";
 import { type LocalSearchItem, searchLocalContext } from "./local-search.js";
-import type { LocalProject, LocalReview, LocalTask } from "./local-state.js";
-import { scrubDeep } from "./scrubber.js";
+import {
+  type LocalPermission,
+  type LocalProject,
+  type LocalReview,
+  type LocalTask,
+  PERMISSION_ACTIONS,
+  type PermissionAction,
+} from "./local-state.js";
+import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep } from "./scrubber.js";
 import { applyProjectSeed } from "./seed.js";
 import { listSkills, loadSkill, saveSkill } from "./skills.js";
 
+export type { ReadTaskEventsOptions, TaskEventRecord } from "./db/task-events.js";
 export { LocalServiceError } from "./errors.js";
 
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
   [N in McpToolName]: (input: Parsed<N>) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
-const scrubFields = new Set([
-  "task_id",
-  "epic_id",
-  "lease_id",
-  "last_commit_hash",
-  "head_sha",
-  "session_id",
-  "branch",
-  "git_branch",
-  "base_branch",
-  "url",
-  "ref",
-  "depends_on",
-  "action",
-  "decision",
-  "agent_alias",
-  "alias",
-  "role",
-  "persona",
-  "repos",
-  "target_repo",
-  "category",
-  "status",
-  "slug",
-  "kind",
-  "name",
-  "revision",
-  "sources",
-]);
 const offlineReview = "Review lokal saja. Status, head SHA, dan merge PR di host tidak diperiksa.";
 const directives = [
   ...GENERAL_RULES,
@@ -159,6 +149,7 @@ export class LocalService {
       (project, dirty) => {
         const beforePersonas = project.personas.length;
         const beforeDocs = project.documents.length;
+        const beforePerms = project.permissions.length;
         applyProjectSeed(project, {
           ...options,
           stack: options.stack ?? this.config.stack ?? [],
@@ -166,6 +157,7 @@ export class LocalService {
         if (
           project.personas.length !== beforePersonas ||
           project.documents.length !== beforeDocs ||
+          project.permissions.length !== beforePerms ||
           options.platforms?.length ||
           options.locale
         ) {
@@ -173,29 +165,165 @@ export class LocalService {
         }
       },
     );
+    if (process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
     const { ensureDefaultSkills } = await import("./seed-skills.js");
     await ensureDefaultSkills(this.repoRoot);
   }
 
+  /** Read task audit log entries via read-only SQLite query. */
+  async readTaskEvents(options: ReadTaskEventsOptions = {}): Promise<TaskEventRecord[]> {
+    return this.store.readTaskEvents(this.config.project_id, options);
+  }
+
+  async listPermissions(): Promise<LocalPermission[]> {
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project) =>
+        [...(project.permissions ?? [])].sort(
+          (a, b) => a.action.localeCompare(b.action) || a.principal.localeCompare(b.principal),
+        ),
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async setPermissions(action: string, principals: string[]): Promise<LocalPermission[]> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pengaturan permission hanya lewat CLI manusia.");
+    }
+    if (!PERMISSION_ACTIONS.includes(action as PermissionAction)) {
+      fail(
+        "invalid_input",
+        `Aksi permission tidak valid: ${action}. Pilih: ${PERMISSION_ACTIONS.join(", ")}.`,
+      );
+    }
+    const validAction = action as PermissionAction;
+    const normalized = [...new Set(principals.map((p) => p.trim()).filter(Boolean))];
+    if (normalized.length === 0) {
+      fail("invalid_input", "Minimal satu principal wajib diberikan (mis. human, orchestrator).");
+    }
+    if (validAction === "approve_plan" && normalized.some((p) => p !== "human")) {
+      fail("invalid_input", "Aksi approve_plan hanya boleh untuk principal human.");
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        const rest = (project.permissions ?? []).filter((row) => row.action !== validAction);
+        const updated = normalized.map((principal) => ({ action: validAction, principal }));
+        project.permissions = [...rest, ...updated];
+        dirty();
+        return [...project.permissions].sort(
+          (a, b) => a.action.localeCompare(b.action) || a.principal.localeCompare(b.principal),
+        );
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async grantPermission(action: string, principal: string): Promise<LocalPermission[]> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pengaturan permission hanya lewat CLI manusia.");
+    }
+    if (!PERMISSION_ACTIONS.includes(action as PermissionAction)) {
+      fail(
+        "invalid_input",
+        `Aksi permission tidak valid: ${action}. Pilih: ${PERMISSION_ACTIONS.join(", ")}.`,
+      );
+    }
+    const validAction = action as PermissionAction;
+    const clean = principal.trim();
+    if (!clean) fail("invalid_input", "Principal wajib diisi.");
+    if (validAction === "approve_plan" && clean !== "human") {
+      fail("invalid_input", "Aksi approve_plan hanya boleh untuk principal human.");
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        project.permissions ??= [];
+        if (
+          !project.permissions.some((row) => row.action === validAction && row.principal === clean)
+        ) {
+          project.permissions.push({ action: validAction, principal: clean });
+          dirty();
+        }
+        return [...project.permissions].sort(
+          (a, b) => a.action.localeCompare(b.action) || a.principal.localeCompare(b.principal),
+        );
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  async revokePermission(action: string, principal: string): Promise<LocalPermission[]> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Pengaturan permission hanya lewat CLI manusia.");
+    }
+    if (!PERMISSION_ACTIONS.includes(action as PermissionAction)) {
+      fail(
+        "invalid_input",
+        `Aksi permission tidak valid: ${action}. Pilih: ${PERMISSION_ACTIONS.join(", ")}.`,
+      );
+    }
+    const validAction = action as PermissionAction;
+    const clean = principal.trim();
+    if (!clean) fail("invalid_input", "Principal wajib diisi.");
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        const before = project.permissions?.length ?? 0;
+        project.permissions = (project.permissions ?? []).filter(
+          (row) => !(row.action === validAction && row.principal === clean),
+        );
+        if (project.permissions.length !== before) dirty();
+        return [...project.permissions].sort(
+          (a, b) => a.action.localeCompare(b.action) || a.principal.localeCompare(b.principal),
+        );
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
   async callTool<K extends McpToolName>(name: K, input: unknown): Promise<McpToolOutput<K>> {
     const contract = MCP_TOOLS[name];
-    const parsed = contract.input.safeParse(scrubDeep(input, scrubFields).value);
+    const parsed = contract.input.safeParse(scrubDeep(input, DEFAULT_SCRUB_SKIP_KEYS).value);
     if (!parsed.success) {
       const paths = [
         ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
       ];
       fail("invalid_input", `Input ${name} tidak valid: ${paths.join(", ")}.`, { fields: paths });
     }
-    return this.store.transaction(
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
       this.config.project_id,
       this.config.repo_name,
-      async (project, dirty) => {
+      async (project, dirty, db, afterSave) => {
         const now = Date.now();
         const tools = new LocalWorkflow(
           project,
           this.config,
           this.repoRoot,
-          this.stateFile,
+          db,
           now,
           dirty,
           this.caller,
@@ -206,9 +334,19 @@ export class LocalService {
         // on a generic indexed access; output validation happens before the transaction commits.
         const run = tools.handlers[name] as (data: typeof parsed.data) => unknown;
         const result = contract.output.parse(await run(parsed.data));
+        const events = tools.drainEvents();
+        if (events.length > 0) {
+          afterSave((txDb) => {
+            insertTaskEvents(txDb, this.config.project_id, events);
+          });
+        }
         return result as McpToolOutput<K>;
       },
     );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
   }
 }
 
@@ -216,12 +354,13 @@ class LocalWorkflow {
   private readonly tasks: Map<string, LocalTask>;
   private readonly repo: string;
   private readonly iso: string;
+  private readonly events: NewTaskEvent[] = [];
 
   constructor(
     private readonly project: LocalProject,
     private readonly config: CatenextConfig,
     private readonly root: string,
-    private readonly stateFile: string,
+    private readonly db: DatabaseSync,
     private readonly now: number,
     private readonly dirty: () => void,
     private readonly caller: "human" | "agent" = "human",
@@ -229,6 +368,14 @@ class LocalWorkflow {
     this.tasks = new Map(project.tasks.map((task) => [task.id, task]));
     this.repo = config.repo_name;
     this.iso = new Date(now).toISOString();
+  }
+
+  private recordEvent(event: Omit<NewTaskEvent, "created_at">): void {
+    this.events.push({ ...event, created_at: this.iso });
+  }
+
+  drainEvents(): NewTaskEvent[] {
+    return this.events.splice(0);
   }
 
   readonly handlers: Handlers = {
@@ -263,10 +410,10 @@ class LocalWorkflow {
     manage_roots: (input) => this.manageRoots(input),
     graph_neighbors: (input) => ({
       path: input.path,
-      edges: graphNeighbors(this.stateFile, this.config.project_id, input.path, input.limit),
+      edges: graphNeighbors(this.db, this.config.project_id, input.path, input.limit, input.depth),
     }),
     symbol_search: (input) => ({
-      hits: symbolSearch(this.stateFile, this.config.project_id, input.query, input.limit),
+      hits: symbolSearch(this.db, this.config.project_id, input.query, input.limit),
     }),
   };
 
@@ -296,6 +443,11 @@ class LocalWorkflow {
 
   private task(id: string): LocalTask {
     return this.tasks.get(id) ?? fail("not_found", "Task tidak ditemukan di proyek ini.");
+  }
+
+  private activeLease(task: LocalTask): LocalTask["lease"] | undefined {
+    if (!task.lease) return undefined;
+    return Date.parse(task.lease.expiresAt) > this.now ? task.lease : undefined;
   }
 
   private persona(alias: string): Persona {
@@ -432,6 +584,12 @@ class LocalWorkflow {
   }
 
   private upsertPersona(input: Parsed<"upsert_persona">): McpToolOutput<"upsert_persona"> {
+    if (this.caller === "agent") {
+      const allowed = (this.project.permissions ?? []).some(
+        (row) => row.action === "upsert_persona" && row.principal === "orchestrator",
+      );
+      if (!allowed) fail("permission_denied", "upsert_persona requires edit permission.");
+    }
     const existing = this.project.personas.find((p) => p.alias === input.alias);
     const persona: Persona = {
       alias: input.alias,
@@ -485,7 +643,7 @@ class LocalWorkflow {
         is_ready: this.readyByDeps(task),
         is_stale: task.stale,
         revision_count: task.revision,
-        locked_by_repo: task.lease?.repo ?? null,
+        locked_by_repo: this.activeLease(task)?.repo ?? null,
         blocker_reason: task.blocker
           ? briefText(task.blocker.reason, input.verbose ? 1000 : 160)
           : null,
@@ -544,14 +702,24 @@ class LocalWorkflow {
       kind: "info",
       text: "Read CATENEXT.md first (master prompt), then AGENTS.md.",
     });
-    const activeWorktrees = this.project.tasks.filter(
-      (task) => task.status === "IN_PROGRESS" && (task.branch || task.lease?.worktree),
-    );
+    const activeWorktrees = this.project.tasks.filter((task) => {
+      const lease = this.activeLease(task);
+      return (
+        task.status === "IN_PROGRESS" && Boolean(lease) && Boolean(task.branch || lease?.worktree)
+      );
+    });
     for (const task of activeWorktrees.slice(0, 5)) {
+      const lease = this.activeLease(task);
+      const worktreePath = lease?.worktree?.worktree_path ?? task.branch?.worktree_path;
+      const baseBranch = lease?.worktree?.base_branch ?? task.branch?.base_branch;
+      const branchLabel = baseBranch
+        ? `${task.branch?.name ?? "branch?"} (base=${baseBranch})`
+        : (task.branch?.name ?? "branch?");
+      const pathPart = worktreePath ? ` · path=${worktreePath}` : "";
       lines.push({
         kind: "worktree",
         text: briefText(
-          `${task.persona ?? "?"} · ${task.branch?.name ?? "branch?"} · session=${task.lease?.worktree?.session ?? "-"}`,
+          `${task.persona ?? "?"} · ${branchLabel}${pathPart} · session=${lease?.worktree?.session ?? "-"}`,
         ),
         task_id: task.id,
       });
@@ -568,6 +736,17 @@ class LocalWorkflow {
         kind: "blocked",
         text: briefText(`${task.title}: ${task.blocker?.reason ?? "blocked"}`, verbose ? 160 : 120),
         task_id: task.id,
+      });
+    }
+    const workspaceRoots = this.workspaceRootSummaries();
+    if (workspaceRoots.length) {
+      lines.push({
+        kind: "info",
+        text: briefText(
+          `roots: ${workspaceRoots
+            .map((r) => `${r.label ?? basename(r.path)}(${r.owner_persona ?? "*"})`)
+            .join(", ")}`,
+        ),
       });
     }
     if (pending_approvals.length) {
@@ -606,8 +785,18 @@ class LocalWorkflow {
       blocked_count: blocked.length,
       draft_count: draft.length,
       pending_approvals,
+      workspace_roots: workspaceRoots,
       read_first: "CATENEXT.md",
     };
+  }
+
+  private workspaceRootSummaries() {
+    return (this.project.workspace_roots ?? []).slice(0, 20).map((root) => ({
+      id: root.id,
+      path: root.path,
+      owner_persona: root.ownerPersona,
+      ...(root.label ? { label: root.label } : {}),
+    }));
   }
 
   private manageRoots(input: Parsed<"manage_roots">): McpToolOutput<"manage_roots"> {
@@ -624,9 +813,7 @@ class LocalWorkflow {
     }
     if (this.caller === "agent") {
       const allowed = (this.project.permissions ?? []).some(
-        (row) =>
-          row.action === "manage_roots" &&
-          (row.principal === "orchestrator" || row.principal === "human"),
+        (row) => row.action === "manage_roots" && row.principal === "orchestrator",
       );
       if (!allowed) fail("permission_denied", "manage_roots requires edit permission.");
     }
@@ -634,6 +821,26 @@ class LocalWorkflow {
       const path = input.path
         ? resolve(input.path)
         : fail("invalid_input", "path required for add");
+      let lstat: ReturnType<typeof lstatSync>;
+      try {
+        lstat = lstatSync(path);
+      } catch (error) {
+        const code = error instanceof Error && "code" in error ? error.code : undefined;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          fail("invalid_input", `Root path does not exist: ${path}`);
+        }
+        if (code === "EACCES" || code === "EPERM") {
+          fail("permission_denied", `Root path cannot be accessed: ${path}`);
+        }
+        throw error;
+      }
+      if (lstat.isSymbolicLink()) {
+        fail("permission_denied", `Root path must not be a symlink: ${path}`);
+      }
+      const stat = statSync(path);
+      if (!stat.isDirectory()) {
+        fail("invalid_input", `Root path must be a directory: ${path}`);
+      }
       if (this.project.workspace_roots.some((root) => root.path === path)) {
         fail("already_exists", "Root path already registered.");
       }
@@ -669,7 +876,18 @@ class LocalWorkflow {
   private dependencyHandoffs(task: LocalTask) {
     return task.dependencies.flatMap((id) => {
       const dep = this.tasks.get(id);
-      return dep?.handoff ? [{ task_id: id, title: dep.title, handoff_summary: dep.handoff }] : [];
+      if (!dep?.handoff) return [];
+      const integrated =
+        dep.integrated_commit ??
+        (dep.handoff as { integrated_commit?: { branch: string; sha: string } }).integrated_commit;
+      return [
+        {
+          task_id: id,
+          title: dep.title,
+          handoff_summary: dep.handoff,
+          ...(integrated ? { integrated_commit: integrated } : {}),
+        },
+      ];
     });
   }
 
@@ -714,6 +932,7 @@ class LocalWorkflow {
       documents: this.project.documents
         .map(recordIndex)
         .sort((a, b) => a.kind.localeCompare(b.kind) || a.slug.localeCompare(b.slug)),
+      workspace_roots: this.workspaceRootSummaries(),
     };
   }
 
@@ -724,7 +943,22 @@ class LocalWorkflow {
     const persona = alias ? this.persona(alias) : undefined;
     const owner = task.persona ? this.persona(task.persona) : undefined;
     // Lease expired boleh diambil alih; holder lama kehilangan hak lewat lease_id baru.
-    if (task.lease && Date.parse(task.lease.expiresAt) <= this.now) returnClaim(task);
+    if (task.lease && Date.parse(task.lease.expiresAt) <= this.now) {
+      const expired = task.lease;
+      const returnedStatus = returnClaim(task);
+      this.recordEvent({
+        task_id: task.id,
+        event: "lease_expired",
+        actor: "system",
+        note: expired.alias ? `expired lease (${expired.alias})` : "expired lease",
+        detail: {
+          from: "IN_PROGRESS",
+          to: returnedStatus,
+          repo: expired.repo,
+          expired_at: expired.expiresAt,
+        },
+      });
+    }
     if (task.lease) {
       fail(
         task.lease.repo === this.repo ? "already_claimed" : "task_locked",
@@ -782,6 +1016,7 @@ class LocalWorkflow {
       task.status === "REVISION_REQUESTED"
         ? { review_feedback: task.feedback ?? "", previous_handoff: task.handoff ?? null }
         : undefined;
+    const fromStatus = task.status;
     advance(task, "claim");
     const leaseId = randomUUID();
     const expiry = leaseEnd(this.now);
@@ -790,9 +1025,36 @@ class LocalWorkflow {
       repo: this.repo,
       expiresAt: expiry,
       ...(alias ? { alias } : {}),
-      ...(worktree ? { worktree: { session: worktree.session_id } } : {}),
+      ...(worktree
+        ? {
+            worktree: {
+              session: worktree.session_id,
+              ...(worktree.worktree_path ? { worktree_path: worktree.worktree_path } : {}),
+              ...(worktree.base_branch ? { base_branch: worktree.base_branch } : {}),
+            },
+          }
+        : {}),
     };
-    if (worktree) task.branch = { repo: this.repo, name: worktree.branch };
+    if (worktree) {
+      task.branch = {
+        repo: this.repo,
+        name: worktree.branch,
+        ...(worktree.worktree_path ? { worktree_path: worktree.worktree_path } : {}),
+        ...(worktree.base_branch ? { base_branch: worktree.base_branch } : {}),
+      };
+    }
+    this.recordEvent({
+      task_id: task.id,
+      event: "claim",
+      actor: persona?.alias ?? alias ?? this.caller,
+      note: worktree ? `branch=${worktree.branch}` : null,
+      detail: {
+        from: fromStatus,
+        to: task.status,
+        repo: this.repo,
+        ...(worktree ? { branch: worktree.branch, session: worktree.session_id } : {}),
+      },
+    });
     this.dirty();
     return {
       task: {
@@ -827,16 +1089,38 @@ class LocalWorkflow {
 
   private release(input: Parsed<"release_task">): McpToolOutput<"release_task"> {
     const task = this.held(input.task_id, input.lease_id);
+    const fromStatus = task.status;
+    const actor = task.lease?.alias ?? task.persona ?? this.caller;
     const status = returnClaim(task);
+    this.recordEvent({
+      task_id: task.id,
+      event: "release",
+      actor,
+      detail: { from: fromStatus, to: status, repo: this.repo },
+    });
     this.dirty();
     return { status, task_id: task.id };
   }
 
   private block(input: Parsed<"report_blocker">): McpToolOutput<"report_blocker"> {
     const task = this.held(input.task_id, input.lease_id);
+    const fromStatus = task.status;
+    const actor = task.lease?.alias ?? task.persona ?? this.caller;
     advance(task, "report_blocker");
     task.blocker = { category: input.category, reason: input.reason };
     endLease(task);
+    this.recordEvent({
+      task_id: task.id,
+      event: "blocker",
+      actor,
+      note: `[${input.category}] ${input.reason}`,
+      detail: {
+        from: fromStatus,
+        to: task.status,
+        category: input.category,
+        reason: input.reason,
+      },
+    });
     this.dirty();
     return { status: "BLOCKED", task_id: task.id };
   }
@@ -846,6 +1130,8 @@ class LocalWorkflow {
     const handoff = input.handoff_summary;
     if (task.branch && task.branch.name !== handoff.git_branch)
       fail("branch_mismatch", `Kirim handoff dari branch "${task.branch.name}".`);
+    const fromStatus = task.status;
+    const actor = task.lease?.alias ?? task.persona ?? this.caller;
     advance(task, "complete");
     task.handoff = handoff;
     if (handoff.pull_request) {
@@ -858,6 +1144,20 @@ class LocalWorkflow {
       };
     } else delete task.review;
     endLease(task);
+    this.recordEvent({
+      task_id: task.id,
+      event: "handoff",
+      actor,
+      note: handoff.notes_for_next_agent,
+      detail: {
+        from: fromStatus,
+        to: task.status,
+        git_branch: handoff.git_branch,
+        last_commit_hash: handoff.last_commit_hash,
+        files_count: handoff.files_modified.length,
+        ...(handoff.pull_request ? { pr_url: handoff.pull_request.url } : {}),
+      },
+    });
     this.dirty();
     return {
       task_id: task.id,
@@ -872,6 +1172,7 @@ class LocalWorkflow {
     advance(task, "request_revision");
     task.feedback = feedback;
     task.revision += 1;
+    delete task.integrated_commit;
     if (task.review) {
       delete task.review.lease;
       delete task.review.decision;
@@ -915,6 +1216,7 @@ class LocalWorkflow {
       );
     }
     const task = this.task(input.task_id);
+    const fromStatus = task.status;
     let stale: string[] = [];
     let unlocked: string[] | undefined;
     if (input.action === "assign" || input.action === "request_revision") {
@@ -939,6 +1241,28 @@ class LocalWorkflow {
           input.role,
         );
       }
+      if (input.action === "request_revision") {
+        this.recordEvent({
+          task_id: task.id,
+          event: "revision",
+          actor: this.caller,
+          note: input.feedback,
+          detail: {
+            from: fromStatus,
+            to: task.status,
+            revision_count: task.revision,
+            stale_count: stale.length,
+          },
+        });
+      } else {
+        this.recordEvent({
+          task_id: task.id,
+          event: "assign",
+          actor: this.caller,
+          note: task.persona ? `@${task.persona}` : task.role ? `role:${task.role}` : "unassigned",
+          detail: { persona: task.persona, role: task.role },
+        });
+      }
     } else {
       advance(task, input.action);
       if (input.action === "approve") {
@@ -955,6 +1279,17 @@ class LocalWorkflow {
         delete task.blocker;
         if (task.handoff) task.status = "REVISION_REQUESTED";
       }
+      this.recordEvent({
+        task_id: task.id,
+        event: input.action,
+        actor: this.caller,
+        note: unlocked?.length ? `unlocked ${unlocked.length} task(s)` : null,
+        detail: {
+          from: fromStatus,
+          to: task.status,
+          ...(unlocked?.length ? { unlocked_task_ids: unlocked } : {}),
+        },
+      });
     }
     this.dirty();
     return {
@@ -1027,10 +1362,39 @@ class LocalWorkflow {
           text: skill.when_to_use,
         });
     }
+    const contextHits = items.length ? searchLocalContext(input.query, items, input.limit) : [];
+    let codeHits: SearchHit[] = [];
+    let degraded = false;
+    if (sources.has("code")) {
+      const rootOpts = {
+        roots: (this.project.workspace_roots ?? []).map((r) => ({
+          id: r.id,
+          path: r.path,
+          label: r.label,
+        })),
+      };
+      try {
+        const res = await searchLocalCode(this.root, input.query, input.limit, rootOpts);
+        codeHits = res.hits;
+        degraded = res.degraded;
+        if (codeHits.length === 0) {
+          codeHits = await keywordFallback(this.root, input.query, input.limit, rootOpts);
+        }
+      } catch {
+        degraded = true;
+        codeHits = await keywordFallback(this.root, input.query, input.limit, rootOpts);
+      }
+    }
+    const hits = [...contextHits, ...codeHits]
+      .sort(
+        (a, b) =>
+          b.score - a.score || a.source.localeCompare(b.source) || a.ref.localeCompare(b.ref),
+      )
+      .slice(0, input.limit);
     return {
-      hits: searchLocalContext(input.query, items, input.limit),
+      hits,
       reranked: false,
-      degraded: false,
+      degraded,
     };
   }
 
@@ -1129,7 +1493,22 @@ class LocalWorkflow {
     }
     const reviewer = review.lease.reviewer;
     delete review.lease;
-    if (input.decision === "request_changes") this.revise(task, input.feedback);
+    if (input.decision === "request_changes") {
+      const fromStatus = task.status;
+      this.revise(task, input.feedback);
+      this.recordEvent({
+        task_id: task.id,
+        event: "revision",
+        actor: reviewer,
+        note: input.feedback,
+        detail: {
+          from: fromStatus,
+          to: task.status,
+          revision_count: task.revision,
+          via: "review_pull_request",
+        },
+      });
+    }
     review.decision = { value: input.decision, reviewer, feedback: input.feedback };
     review.updatedAt = this.iso;
     this.dirty();

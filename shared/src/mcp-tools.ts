@@ -11,6 +11,7 @@ import {
   SessionBriefOutput,
   SymbolSearchInput,
   SymbolSearchOutput,
+  WorkspaceRootSchema,
 } from "./brief.js";
 import {
   AgentAliasSchema,
@@ -96,6 +97,8 @@ export const GetProjectContextOutput = z.object({
   project_repos: z.array(RepoNameSchema).default([]),
   /** Indeks dokumen proyek lokal (blueprint, ERD, ...); isi lewat get_document. */
   documents: z.array(DocumentIndexEntrySchema).default([]),
+  /** External/extra workspace roots registered for this project. */
+  workspace_roots: z.array(WorkspaceRootSchema).max(20).default([]),
 });
 
 // --- get_project_board (orchestrator) ---------------------------------------
@@ -154,16 +157,20 @@ export const GetReadyTasksOutput = z.object({
 
 // --- claim_task -------------------------------------------------------------
 
+const BranchNameSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(/^[a-zA-Z0-9_./-]+$/)
+  .refine((s) => s !== "HEAD" && !s.startsWith("-") && !s.includes(".."));
+
 export const ClaimTaskInput = z.object({
   worktree: z
     .object({
       session_id: IdSchema,
-      branch: z
-        .string()
-        .min(1)
-        .max(255)
-        .regex(/^[a-zA-Z0-9_./-]+$/)
-        .refine((s) => s !== "HEAD" && !s.startsWith("-") && !s.includes("..")),
+      branch: BranchNameSchema,
+      worktree_path: z.string().min(1).max(1000).optional(),
+      base_branch: BranchNameSchema.optional(),
     })
     .optional(),
   task_id: IdSchema,
@@ -466,7 +473,7 @@ export const MCP_TOOLS = {
     GetProjectBoardOutput,
   ),
   search_context: tool(
-    "Cari kata kunci di dokumen proyek, indeks skill repo ini, dan task lokal. Pakai sebelum load_skill/get_document buta.",
+    "Cari kata kunci di dokumen proyek, indeks skill, task lokal, dan kode (sources: code). Pakai sebelum load_skill/get_document/baca file buta.",
     SearchContextInput,
     SearchContextOutput,
   ),

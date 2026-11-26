@@ -7,11 +7,9 @@ import {
   SaveDocumentInput,
   SEARCH_SOURCES,
   SearchContextInput,
-  type SearchContextOutputType,
   UpsertPersonaInput,
 } from "@catenext/shared";
 import type { z } from "zod";
-import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { ConfigError, findProjectRoot, readConfig } from "./config.js";
 import { LocalService } from "./local-service.js";
 import { describeRedactions, scrubDeep } from "./scrubber.js";
@@ -263,49 +261,25 @@ export async function searchShow(
   query: string,
   opts: { source?: string[]; limit?: number; json?: boolean },
 ) {
-  const wanted = [...new Set(opts.source?.length ? opts.source : [...SEARCH_SOURCES, "code"])];
+  const wanted = [...new Set(opts.source?.length ? opts.source : SEARCH_SOURCES)];
   for (const source of wanted) {
-    if (source !== "code" && !CONTEXT_SOURCES.has(source)) {
+    if (!CONTEXT_SOURCES.has(source)) {
       throw new PlanningInputError(`Sumber pencarian tidak valid: ${source}.`);
     }
   }
-  const contextSources = wanted.filter((s): s is (typeof SEARCH_SOURCES)[number] =>
-    CONTEXT_SOURCES.has(s),
-  );
-  const body = prepare(
-    SearchContextInput,
-    { query, sources: contextSources.length ? contextSources : undefined, limit: opts.limit },
-    ["sources", "limit"],
-  );
+  const body = prepare(SearchContextInput, { query, sources: wanted, limit: opts.limit }, [
+    "sources",
+    "limit",
+  ]);
   const root = await requireRoot();
-  const context: SearchContextOutputType | undefined = contextSources.length
-    ? await (await cliService(root)).callTool("search_context", body)
-    : undefined;
-
-  let codeHits: Awaited<ReturnType<typeof searchLocalCode>>["hits"] = [];
-  let codeNote: string | undefined;
-  if (wanted.includes("code")) {
-    try {
-      codeHits = (await searchLocalCode(root, body.query, body.limit)).hits;
-      if (!codeHits.length) codeHits = await keywordFallback(root, body.query, body.limit);
-    } catch {
-      codeNote = "Indeks kode gagal; memakai pencarian kata kunci.";
-      codeHits = await keywordFallback(root, body.query, body.limit);
-    }
-  }
-
-  const hits = [...(context?.hits ?? []), ...codeHits]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, body.limit)
-    .map((hit) => ({ ...hit, origin: "local" as const }));
+  const context = await (await cliService(root)).callTool("search_context", body);
+  const hits = context.hits.map((hit) => ({ ...hit, origin: "local" as const }));
   const payload = {
     hits,
-    reranked: context?.reranked ?? false,
-    degraded: context?.degraded ?? true,
-    ...(codeNote ? { note: codeNote } : {}),
+    reranked: context.reranked,
+    degraded: context.degraded,
   };
   if (opts.json) return console.log(JSON.stringify(payload, null, 2));
-  if (codeNote) console.error(`! ${codeNote}`);
   if (hits.length === 0) return console.log("Tidak ada hasil.");
   for (const h of hits) {
     console.log(

@@ -1,3 +1,5 @@
+import type { McpToolName } from "@catenext/shared";
+
 /** Best-effort redaction of recognizable secrets before text is stored or returned by Catenext. */
 
 interface Rule {
@@ -37,18 +39,71 @@ const RULES: Rule[] = [
     replace: (_m, pre) => `${pre}${redact("bearer_token")}`,
   },
   {
-    // KEY=value / password: value. Nilai dianggap secret bila >= 12 karakter, atau
-    // >= 6 karakter dan mengandung angka/simbol (agar prosa biasa tidak ikut tersensor).
+    // KEY=value / password: value / "api_key": "secret-val". Nilai dianggap secret bila >= 12 karakter,
+    // atau >= 6 karakter dan mengandung angka/simbol (agar prosa biasa tidak ikut tersensor).
     kind: "assignment",
     pattern:
-      /\b([A-Za-z0-9_.-]*(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|auth)[A-Za-z0-9_.-]*)(\s*[:=]\s*["']?)([^\s"'`,;]*[^\s"'`,;.)])/gi,
+      /\b([A-Za-z0-9_.-]*(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|auth)[A-Za-z0-9_.-]*)(["']?\s*[:=]\s*["']?)([^\s"'`,;]*[^\s"'`,;.)])/gi,
     replace: (m, name, sep, value) => {
-      if (value.startsWith("[REDACTED:")) return m;
+      if (value.includes("[REDACTED:")) return m;
       const looksSecret = value.length >= 12 || (value.length >= 6 && /[0-9\W_]/.test(value));
       return looksSecret ? `${name}${sep}${redact("assignment")}` : m;
     },
   },
 ];
+
+/** Structured identity/metadata keys exempted per MCP tool so free text is scrubbed cleanly. */
+export const SCRUB_TOOL_FIELDS: Partial<Record<McpToolName, readonly string[]>> = {
+  complete_handoff: ["task_id", "last_commit_hash", "head_sha", "lease_id"],
+  report_blocker: ["task_id", "category", "lease_id"],
+  review_pull_request: ["action", "task_id", "head_sha", "lease_id", "agent_alias", "decision"],
+  manage_task: ["action", "task_id", "agent_alias", "role"],
+  save_document: ["slug", "kind", "expected_version"],
+  search_context: ["sources", "limit"],
+  create_epic: [],
+  create_tasks: ["epic_id", "ref", "depends_on", "target_repo", "role", "persona"],
+  upsert_persona: ["alias", "role", "repos"],
+  save_repo_skill: ["name"],
+  manage_roots: ["action", "persona", "root_id", "path"],
+  graph_neighbors: ["path"],
+  symbol_search: ["query"],
+};
+
+export const DEFAULT_SCRUB_SKIP_KEYS: ReadonlySet<string> = new Set([
+  "task_id",
+  "epic_id",
+  "lease_id",
+  "last_commit_hash",
+  "head_sha",
+  "session_id",
+  "worktree_path",
+  "branch",
+  "git_branch",
+  "base_branch",
+  "url",
+  "ref",
+  "depends_on",
+  "action",
+  "decision",
+  "agent_alias",
+  "alias",
+  "role",
+  "persona",
+  "repos",
+  "target_repo",
+  "category",
+  "status",
+  "slug",
+  "kind",
+  "name",
+  "revision",
+  "sources",
+  "path",
+  "query",
+  "root_id",
+  "expected_version",
+  "limit",
+]);
 
 export interface ScrubResult<T> {
   value: T;

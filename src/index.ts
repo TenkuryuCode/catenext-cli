@@ -13,10 +13,23 @@ import {
 } from "@catenext/shared";
 import { Command, InvalidArgumentError } from "commander";
 import { ConfigError, configuredPlatforms, findProjectRoot, readConfig } from "./config.js";
-import { taskBlock, taskClaim, taskDone, taskManage, taskNext, taskReview } from "./fallback.js";
+import {
+  permissionGrant,
+  permissionList,
+  permissionRevoke,
+  permissionSet,
+  taskBlock,
+  taskClaim,
+  taskDone,
+  taskLog,
+  taskManage,
+  taskNext,
+  taskReview,
+} from "./fallback.js";
 import { applyInit, planInit, renderDiff } from "./init/index.js";
 import { McpConfigError } from "./init/mcp-config.js";
 import { LocalServiceError } from "./local-service.js";
+import { PERMISSION_ACTIONS } from "./local-state.js";
 import { applyFileEdits, planRemove, planSync, summarize } from "./maintenance.js";
 import { runMcpServer } from "./mcp/run.js";
 import { hasVersionedSegment, stableNodeCommand } from "./node-command.js";
@@ -323,6 +336,16 @@ program
   );
 
 program
+  .command("log")
+  .description("Tampilkan riwayat audit event task lokal")
+  .argument("[task_id]", "Filter berdasarkan ID task (opsional)")
+  .option("-n, --limit <n>", "Jumlah maksimal event", (v) => Number.parseInt(v, 10), 20)
+  .option("--json", "Keluaran JSON")
+  .action((taskId: string | undefined, opts: { limit: number; json?: boolean }) =>
+    friendly(async () => taskLog(await cliService(), taskId, opts)),
+  );
+
+program
   .command("brief")
   .description("Orchestrator: ringkasan sesi hemat token (ready/blocked/next ask)")
   .option("--verbose", "Teks blocker lebih panjang")
@@ -388,6 +411,46 @@ rootCmd
       if (opts.json) return console.log(JSON.stringify(res, null, 2));
       console.log(`✓ ${res.roots.length} root tersisa`);
     }),
+  );
+
+const permCmd = program.command("permission").description("Lihat dan atur matriks izin proyek ini");
+permCmd
+  .command("list", { isDefault: true })
+  .description("Daftar izin saat ini per aksi")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { json?: boolean }) =>
+    friendly(async () => permissionList(await cliService(), Boolean(opts.json))),
+  );
+permCmd
+  .command("set")
+  .description(`Atur principal untuk aksi (${PERMISSION_ACTIONS.join(", ")})`)
+  .argument("<action>", `Salah satu: ${PERMISSION_ACTIONS.join(", ")}`)
+  .argument("<principals...>", "Principal yang diizinkan (mis. human orchestrator)")
+  .option("--json", "Keluaran JSON")
+  .action((action: string, principals: string[], opts: { json?: boolean }) =>
+    friendly(async () => permissionSet(await cliService(), action, principals, Boolean(opts.json))),
+  );
+permCmd
+  .command("grant")
+  .description("Tambahkan principal ke aksi permission")
+  .argument("<action>", `Salah satu: ${PERMISSION_ACTIONS.join(", ")}`)
+  .argument("<principal>", "Principal yang ditambahkan (mis. human, orchestrator)")
+  .option("--json", "Keluaran JSON")
+  .action((action: string, principal: string, opts: { json?: boolean }) =>
+    friendly(async () =>
+      permissionGrant(await cliService(), action, principal, Boolean(opts.json)),
+    ),
+  );
+permCmd
+  .command("revoke")
+  .description("Cabut principal dari aksi permission")
+  .argument("<action>", `Salah satu: ${PERMISSION_ACTIONS.join(", ")}`)
+  .argument("<principal>", "Principal yang dicabut (mis. orchestrator)")
+  .option("--json", "Keluaran JSON")
+  .action((action: string, principal: string, opts: { json?: boolean }) =>
+    friendly(async () =>
+      permissionRevoke(await cliService(), action, principal, Boolean(opts.json)),
+    ),
   );
 
 program
@@ -500,9 +563,11 @@ program
   .argument("<task_id>")
   .option("--as <alias>", "Bekerja sebagai persona ini; task milik persona lain ditolak")
   .option("--worktree", "Reservasi branch checkout + lease sesi (wajib di proyek layout monorepo)")
+  .option("--base <branch>", "Base branch untuk metadata worktree (opsional bersama --worktree)")
   .option("--json", "Keluaran JSON")
-  .action((taskId: string, opts: { as?: string; json?: boolean; worktree?: boolean }) =>
-    friendly(async () => taskClaim(await cliService(), taskId, opts)),
+  .action(
+    (taskId: string, opts: { as?: string; json?: boolean; worktree?: boolean; base?: string }) =>
+      friendly(async () => taskClaim(await cliService(), taskId, opts)),
   );
 
 program

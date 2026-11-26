@@ -1,7 +1,53 @@
-import { describe, expect, it } from "vitest";
-import { buildHandoff, renderClaim } from "./fallback.js";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CatenextConfigSchema } from "@catenext/shared";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  buildHandoff,
+  permissionGrant,
+  permissionList,
+  permissionRevoke,
+  permissionSet,
+  readGitState,
+  readOrCreateCliSessionId,
+  renderClaim,
+  taskClaim,
+  taskDone,
+  taskLog,
+} from "./fallback.js";
+import { LocalService } from "./local-service.js";
 
 const GIT = { branch: "feat/login", commit: "abcdef1234567", changedFiles: ["a.ts", "b.ts"] };
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  while (tempDirs.length) {
+    const dir = tempDirs.pop();
+    if (dir) await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function makeTempGitRepo() {
+  const rawDir = await mkdtemp(join(tmpdir(), "catenext-fallback-"));
+  const dir = await realpath(rawDir);
+  tempDirs.push(dir);
+  const git = (...args: string[]) =>
+    execFileSync("git", args, {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  git("init", "-b", "main");
+  await writeFile(join(dir, ".gitignore"), ".catenext/\n");
+  await writeFile(join(dir, "README.md"), "# test\n");
+  git("add", ".gitignore", "README.md");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init");
+  git("checkout", "-b", "feat/work");
+  return { dir, git };
+}
 
 describe("fallback CLI", () => {
   const prOpts = {
@@ -81,5 +127,192 @@ describe("fallback CLI", () => {
     expect(md).toContain("catenext done 11111111-2222-4333-8444-555555555555");
     expect(md).toContain("--pr <url> --base <branch>");
     expect(md).toContain("Jangan merge ke default branch");
+  });
+
+  it("readOrCreateCliSessionId menyimpan dan memakai ulang UUID di .catenext/cache/cli-session-id", async () => {
+    const rawDir = await mkdtemp(join(tmpdir(), "catenext-session-"));
+    tempDirs.push(rawDir);
+    const first = await readOrCreateCliSessionId(rawDir);
+    const second = await readOrCreateCliSessionId(rawDir);
+    expect(second).toBe(first);
+    const stored = (await readFile(join(rawDir, ".catenext/cache/cli-session-id"), "utf8")).trim();
+    expect(stored).toBe(first);
+
+    await writeFile(join(rawDir, ".catenext/cache/cli-session-id"), "not-a-uuid\n");
+    const regenerated = await readOrCreateCliSessionId(rawDir);
+    expect(regenerated).not.toBe(first);
+    expect(await readOrCreateCliSessionId(rawDir)).toBe(regenerated);
+  });
+
+  it("taskClaim --worktree mengirim session_id persisten, worktree_path, dan base_branch", async () => {
+    const { dir } = await makeTempGitRepo();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: "11111111-2222-4333-8444-555555555555",
+      repo_name: "be",
+      layout: "monorepo",
+    });
+    const service = new LocalService(dir, config);
+    const { epic } = await service.callTool("create_epic", { title: "Worktree" });
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [
+        { ref: "t1", title: "Task 1", prompt_instruction: "Kerjakan" },
+        { ref: "t2", title: "Task 2", prompt_instruction: "Kerjakan lagi" },
+      ],
+    });
+    for (const t of created) {
+      await service.callTool("manage_task", { action: "approve_plan", task_id: t.task_id });
+    }
+    const t1 = created[0]?.task_id;
+    const t2 = created[1]?.task_id;
+    if (!t1 || !t2) throw new Error("Expected two tasks");
+
+    await expect(taskClaim(service, t1, { base: "main", cwd: dir })).rejects.toThrow(/--worktree/);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await taskClaim(service, t1, { worktree: true, json: true, cwd: dir });
+    const sessionId = await readOrCreateCliSessionId(dir);
+    const brief = await service.callTool("session_brief", {});
+    const wtLine = brief.lines.find((line) => line.kind === "worktree");
+    expect(wtLine?.text).toContain("feat/work (base=main)");
+    expect(wtLine?.text).toContain(`path=${dir}`);
+    expect(wtLine?.text).toContain(`session=${sessionId.slice(0, 8)}`);
+
+    // Klaim kedua dari worktree CLI yang sama memakai session_id yang sama -> session_busy
+    await expect(
+      taskClaim(service, t2, { worktree: true, base: "develop", cwd: dir }),
+    ).rejects.toMatchObject({ code: "session_busy" });
+  });
+
+  it("taskDone memperingatkan perubahan yang belum di-commit dari git status --porcelain", async () => {
+    const { dir, git } = await makeTempGitRepo();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: "11111111-2222-4333-8444-555555555555",
+      repo_name: "be",
+    });
+    const service = new LocalService(dir, config);
+    const { epic } = await service.callTool("create_epic", { title: "Done check" });
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [{ ref: "t1", title: "Task 1", prompt_instruction: "Kerjakan" }],
+    });
+    const t1 = created[0]?.task_id;
+    if (!t1) throw new Error("Expected task");
+    await service.callTool("manage_task", { action: "approve_plan", task_id: t1 });
+    const claim = await service.callTool("claim_task", { task_id: t1 });
+
+    // Buat perubahan belum di-commit (untracked + modified)
+    await writeFile(join(dir, "README.md"), "# dirty\n");
+    await writeFile(join(dir, "extra.ts"), "export const x = 1;\n");
+    const dirtyState = await readGitState(dir);
+    expect(dirtyState.dirtyFiles).toEqual(expect.arrayContaining(["README.md", "extra.ts"]));
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await taskDone(service, t1, {
+      notes: "Selesai",
+      decision: [],
+      file: [],
+      lease: claim.lease_id,
+      json: true,
+      cwd: dir,
+    });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("belum di-commit"));
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("README.md"));
+    expect(JSON.parse(String(logSpy.mock.calls[0]?.[0]))).toMatchObject({ status: "NEEDS_REVIEW" });
+
+    // Commit semua perubahan -> tidak ada peringatan dirty
+    errSpy.mockClear();
+    git("add", "README.md", "extra.ts");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "clean");
+    const cleanState = await readGitState(dir);
+    expect(cleanState.dirtyFiles).toBeUndefined();
+  });
+
+  it("taskLog mencetak ringkasan event audit dan mendukung --limit serta --json", async () => {
+    const { dir } = await makeTempGitRepo();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: "11111111-2222-4333-8444-555555555555",
+      repo_name: "be",
+    });
+    const service = new LocalService(dir, config);
+    const { epic } = await service.callTool("create_epic", { title: "Audit" });
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [{ ref: "t1", title: "Audit target", prompt_instruction: "Kerjakan" }],
+    });
+    const t1 = created[0]?.task_id;
+    if (!t1) throw new Error("Expected task");
+    await service.callTool("manage_task", { action: "approve_plan", task_id: t1 });
+    const claim = await service.callTool("claim_task", { task_id: t1 });
+    await service.callTool("release_task", { task_id: t1, lease_id: claim.lease_id });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await taskLog(service, t1, { limit: 2, json: true });
+    const parsed = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+      events: Array<{ event: string; task_id: string }>;
+    };
+    expect(parsed.events.map((e) => e.event)).toEqual(["release", "claim"]);
+    expect(parsed.events.every((e) => e.task_id === t1)).toBe(true);
+
+    logSpy.mockClear();
+    await taskLog(service, undefined, { limit: 5 });
+    const lines = logSpy.mock.calls.map((c) => String(c[0]));
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain("release");
+    expect(lines[0]).toContain("Audit target");
+
+    logSpy.mockClear();
+    await taskLog(service, "99999999-2222-4333-8444-555555555555", {});
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Belum ada event audit"));
+  });
+
+  it("mengelola permission lewat permissionList, permissionSet, permissionGrant, dan permissionRevoke", async () => {
+    const rawDir = await mkdtemp(join(tmpdir(), "catenext-perm-cli-"));
+    tempDirs.push(rawDir);
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: "11111111-2222-4333-8444-555555555555",
+      repo_name: "be",
+    });
+    const service = new LocalService(rawDir, config);
+    await service.ensureSeed({ personaSeed: "minimal" });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await permissionList(service, true);
+    const initial = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+      permissions: Array<{ action: string; principal: string }>;
+    };
+    expect(initial.permissions).toContainEqual({
+      action: "upsert_persona",
+      principal: "orchestrator",
+    });
+
+    logSpy.mockClear();
+    await permissionRevoke(service, "upsert_persona", "orchestrator", false);
+    expect(logSpy).toHaveBeenCalledWith("✓ Permission upsert_persona: human");
+
+    logSpy.mockClear();
+    await permissionGrant(service, "upsert_persona", "orchestrator", false);
+    expect(logSpy).toHaveBeenCalledWith("✓ Permission upsert_persona: human, orchestrator");
+
+    logSpy.mockClear();
+    await permissionSet(service, "manage_roots", ["human"], true);
+    const afterSet = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+      permissions: Array<{ action: string; principal: string }>;
+    };
+    expect(afterSet.permissions.filter((p) => p.action === "manage_roots")).toEqual([
+      { action: "manage_roots", principal: "human" },
+    ]);
+
+    await expect(permissionSet(service, "approve_plan", ["orchestrator"], false)).rejects.toThrow(
+      /human/,
+    );
+    await expect(permissionSet(service, "unknown_action", ["human"], false)).rejects.toThrow(
+      /tidak valid/,
+    );
   });
 });

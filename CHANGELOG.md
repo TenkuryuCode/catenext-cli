@@ -10,6 +10,20 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.7.0] - 2026-11-27
+
+### Ditambahkan
+- MCP tool `search_code` dengan cuplikan kode kontekstual (`context_lines`), plus dukungan `workspace_roots` pada `catenext index` dan fallback Node.js saat `rg` tidak tersedia.
+- Metadata worktree pada lease (`worktree.session`, `worktree.branch`, `worktree.base_branch`, `integrated_commit`), pembersihan otomatis lease kedaluwarsa, serta peringatan dirty tree saat handoff.
+- SQLite `WAL` mode, `busy_timeout = 5000`, `foreign_keys = ON`, permission file `0o600` (`.sqlite`, `-wal`, `-shm`), recovery lock stale berbasis PID + timestamp + symlink/hardlink check, path baca read-only tanpa `.lock`, partial diff write (`saveProjectDiff`), serta migrasi skema idempoten (`v1 -> v2 -> v3`).
+- Tabel audit `task_events` di SQLite untuk mencatat `claim`, `release`, `block`, `handoff`, `manage_task`, `review_pull_request`, dan `lease_expired`, beserta perintah CLI `catenext log [task_id] [-n/--limit] [--json]`.
+- Subcommand CLI `catenext permission` (`list`, `set`, `grant`, `revoke`) untuk mengelola matriks permission lokal, serta pemeriksaan mode `0o600` file SQLite pada `catenext verify` di POSIX.
+
+### Diubah
+- Perbaikan code graph: resolusi ekstensi `.js`/`.ts`/`.tsx`/`.jsx` dan `index.*`, `graph_neighbors` depth=2 yang akurat, incremental re-index berdasarkan mtime/hash, dan ekstraksi simbol multi-bahasa (TS/JS, Python, Go, Rust).
+- `scrubber.ts`: sensor nilai secret pada key JSON/objek terpetik (`"api_key": "..."`, `'token': '...'`) tanpa merusak JSON valid atau melakukan redaksi ganda; penyatuan `SCRUB_TOOL_FIELDS` dan `DEFAULT_SCRUB_SKIP_KEYS` (termasuk `path` dan `query`) di MCP server dan `LocalService`.
+- Penegakan matriks permission pada `upsert_persona` dan pengaturan via agent, serta validasi `manage_roots add` agar hanya menerima direktori nyata non-symlink.
+
 ## [0.6.2] - 2026-11-27
 
 ### Ditambahkan

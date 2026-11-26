@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  ClaimTaskInput,
   CompleteHandoffInput,
   CreateTasksInput,
   findCycle,
   GetReadyTasksInput,
   ManageTaskInput,
   MCP_TOOL_NAMES,
+  SearchContextInput,
   UpsertPersonaInput,
 } from "../index.js";
 
@@ -102,6 +104,61 @@ describe("registry tool MCP", () => {
     expect(
       ManageTaskInput.safeParse({ action: "assign", task_id, agent_alias: null }).success,
     ).toBe(true);
+  });
+
+  it("search_context defaults to document/skill/task and allows code source", () => {
+    expect(SearchContextInput.parse({ query: "auth" }).sources).toEqual([
+      "document",
+      "skill",
+      "task",
+    ]);
+    expect(
+      SearchContextInput.parse({
+        query: "auth",
+        sources: ["document", "skill", "task", "code"],
+      }).sources,
+    ).toEqual(["document", "skill", "task", "code"]);
+  });
+
+  it("claim_task menerima worktree tanpa atau dengan worktree_path dan base_branch", () => {
+    const session_id = "3c9f1e2d-8a7b-4c6d-9e5f-1a2b3c4d5e6f";
+    expect(
+      ClaimTaskInput.safeParse({
+        task_id: EXISTING,
+        worktree: { session_id, branch: "feat/e1" },
+      }).success,
+    ).toBe(true);
+    expect(
+      ClaimTaskInput.parse({
+        task_id: EXISTING,
+        worktree: {
+          session_id,
+          branch: "feat/e1",
+          worktree_path: "/tmp/worktrees/e1",
+          base_branch: "main",
+        },
+      }),
+    ).toEqual({
+      task_id: EXISTING,
+      worktree: {
+        session_id,
+        branch: "feat/e1",
+        worktree_path: "/tmp/worktrees/e1",
+        base_branch: "main",
+      },
+    });
+    expect(
+      ClaimTaskInput.safeParse({
+        task_id: EXISTING,
+        worktree: { session_id, branch: "feat/e1", worktree_path: "" },
+      }).success,
+    ).toBe(false);
+    expect(
+      ClaimTaskInput.safeParse({
+        task_id: EXISTING,
+        worktree: { session_id, branch: "feat/e1", base_branch: "HEAD" },
+      }).success,
+    ).toBe(false);
   });
 });
 

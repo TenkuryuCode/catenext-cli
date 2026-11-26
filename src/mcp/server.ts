@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
 import type { LocalService } from "../local-service.js";
-import { describeRedactions, scrubDeep } from "../scrubber.js";
+import { describeRedactions, SCRUB_TOOL_FIELDS, scrubDeep } from "../scrubber.js";
 import { loadSkill, saveSkill } from "../skills.js";
 
 export const LOCAL_TOOLS = MCP_TOOL_NAMES;
@@ -48,23 +48,6 @@ function zodIssues(error: z.ZodError): string {
   return error.issues.map((i) => `- ${i.path.join(".") || "(root)"}: ${i.message}`).join("\n");
 }
 
-/** Rawatan nilai identitas terstruktur agar scrubber hanya mengubah teks bebas. */
-const SCRUB_FIELDS: Partial<Record<McpToolName, readonly string[]>> = {
-  complete_handoff: ["task_id", "last_commit_hash", "head_sha", "lease_id"],
-  report_blocker: ["task_id", "category", "lease_id"],
-  review_pull_request: ["action", "task_id", "head_sha", "lease_id", "agent_alias", "decision"],
-  manage_task: ["action", "task_id", "agent_alias", "role"],
-  save_document: ["slug", "kind", "expected_version"],
-  search_context: ["sources", "limit"],
-  create_epic: [],
-  create_tasks: ["epic_id", "ref", "depends_on", "target_repo", "role", "persona"],
-  upsert_persona: ["alias", "role", "repos"],
-  save_repo_skill: ["name"],
-  manage_roots: ["action", "persona", "root_id"],
-  graph_neighbors: ["path"],
-  symbol_search: ["query"],
-};
-
 const LOCAL_DESCRIPTIONS: Partial<Record<McpToolName, string>> = {
   review_pull_request: "Local PR review queue/claim/submit. Does not verify remote merge status.",
   complete_handoff:
@@ -88,7 +71,7 @@ export function createCatenextMcpServer(opts: ServerOptions): McpServer {
     try {
       const ctx = await opts.context();
       if (!ctx.ok) return text(`Catenext belum siap: ${ctx.error}`);
-      const keep = SCRUB_FIELDS[name];
+      const keep = SCRUB_TOOL_FIELDS[name];
       if (!keep) return json(await run(ctx, input));
       const scrubbed = scrubDeep(input, new Set(keep));
       // Sensor dapat mengubah ukuran payload; validasi ulang sebelum disimpan.

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -19,7 +19,7 @@ function readTaskJsonField(
   stateFile: string,
   projectId: string,
   taskId: string,
-  column: "lease_json" | "review_json",
+  column: "lease_json" | "branch_json" | "review_json" | "integrated_commit_json",
 ): Record<string, unknown> | undefined {
   const db = new DatabaseSync(stateFile, { readOnly: true });
   try {
@@ -384,6 +384,63 @@ describe("LocalService approval gate", () => {
       }),
     ).rejects.toMatchObject({ code: "human_approval_required" });
   });
+
+  it("menegakkan matriks izin untuk upsert_persona dan manage_roots pada pemanggil agent", async () => {
+    const agent = new LocalService(root, config, "agent");
+    // Belum di-seed: permissions kosong -> agent ditolak.
+    await expect(
+      agent.callTool("upsert_persona", { alias: "sec", role: "security" }),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    await expect(
+      agent.callTool("manage_roots", { action: "add", path: root }),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+
+    await service.ensureSeed({ personaSeed: "minimal" });
+    await expect(
+      agent.callTool("upsert_persona", { alias: "sec", role: "security" }),
+    ).resolves.toMatchObject({ created: true });
+
+    // Cabut izin orchestrator (sisakan human saja) -> agent harus ditolak meski human masih ada.
+    await service.revokePermission("upsert_persona", "orchestrator");
+    await expect(
+      agent.callTool("upsert_persona", { alias: "sec2", role: "security" }),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+
+    await service.setPermissions("manage_roots", ["human"]);
+    const extDir = await mkdtemp(join(tmpdir(), "catenext-perm-root-"));
+    try {
+      await expect(
+        agent.callTool("manage_roots", { action: "add", path: extDir }),
+      ).rejects.toMatchObject({ code: "permission_denied" });
+      // Human CLI tetap boleh menambah root valid.
+      await expect(
+        service.callTool("manage_roots", { action: "add", path: extDir }),
+      ).resolves.toMatchObject({ roots: [{ path: extDir }] });
+    } finally {
+      await rm(extDir, { recursive: true, force: true });
+    }
+  });
+
+  it("manage_roots menolak path hilang, file biasa, dan symlink", async () => {
+    const missing = join(root, "does-not-exist");
+    await expect(
+      service.callTool("manage_roots", { action: "add", path: missing }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+
+    const regularFile = join(root, "plain.txt");
+    await writeFile(regularFile, "not a directory\n");
+    await expect(
+      service.callTool("manage_roots", { action: "add", path: regularFile }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+
+    const realDir = join(root, "real-dir");
+    const linkDir = join(root, "link-dir");
+    await mkdir(realDir);
+    await symlink(realDir, linkDir);
+    await expect(
+      service.callTool("manage_roots", { action: "add", path: linkDir }),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+  });
 });
 
 describe("LocalService lease hashing", () => {
@@ -539,6 +596,98 @@ describe("LocalService lease expiry", () => {
         handoff_summary: handoff(),
       }),
     ).rejects.toMatchObject({ code: "not_lock_holder" });
+  });
+
+  it("menyaring lease kedaluwarsa di session_brief dan get_project_board serta menyimpan worktree_path/base_branch", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const mono = new LocalService(root, { ...config, layout: "monorepo" });
+    const { id } = await draft([plan("wt")], mono);
+    await manage("approve_plan", id("wt"), {}, mono);
+
+    // Path mengandung pola mirip token agar teruji tidak tersensor oleh scrubber.
+    const worktreePath = `/tmp/worktrees/wt-${testSecret}`;
+    const sessionId = randomUUID();
+    await mono.callTool("claim_task", {
+      task_id: id("wt"),
+      worktree: {
+        session_id: sessionId,
+        branch: "feat/wt",
+        worktree_path: worktreePath,
+        base_branch: "main",
+      },
+    });
+
+    const storedLease = readTaskJsonField(
+      mono.stateFile,
+      config.project_id,
+      id("wt"),
+      "lease_json",
+    );
+    expect(storedLease?.worktree).toEqual({
+      session: sessionId,
+      worktree_path: worktreePath,
+      base_branch: "main",
+    });
+
+    const activeBrief = await mono.callTool("session_brief", {});
+    expect(activeBrief.lines.filter((line) => line.kind === "worktree")).toMatchObject([
+      {
+        task_id: id("wt"),
+        text: expect.stringContaining(`feat/wt (base=main) · path=${worktreePath}`),
+      },
+    ]);
+    expect(await mono.callTool("get_project_board", {})).toMatchObject({
+      tasks: [{ id: id("wt"), locked_by_repo: "be" }],
+    });
+
+    // Setelah lease kedaluwarsa, tidak muncul di activeWorktrees atau locked_by_repo.
+    clock.mockReturnValue(start + LOCK_LEASE_MS + 1);
+    const expiredBrief = await mono.callTool("session_brief", {});
+    expect(expiredBrief.lines.filter((line) => line.kind === "worktree")).toEqual([]);
+    expect(await mono.callTool("get_project_board", {})).toMatchObject({
+      tasks: [{ id: id("wt"), status: "IN_PROGRESS", locked_by_repo: null }],
+    });
+  });
+
+  it("mengisi integrated_commit pada dependency handoff bila tersedia di state dan memigrasikan DB lama", async () => {
+    const { id } = await draft([plan("up"), plan("down", { depends_on: ["up"] })]);
+    await manage("approve_plan", id("up"));
+    await manage("approve_plan", id("down"));
+    const claim = await service.callTool("claim_task", { task_id: id("up") });
+    await service.callTool("complete_handoff", {
+      lease_id: claim.lease_id,
+      task_id: id("up"),
+      handoff_summary: handoff(),
+    });
+    await manage("approve", id("up"));
+
+    const integrated = { branch: "main", sha: heads.next };
+    const db = new DatabaseSync(service.stateFile);
+    try {
+      db.prepare("UPDATE tasks SET integrated_commit_json = ? WHERE project_id = ? AND id = ?").run(
+        JSON.stringify(integrated),
+        config.project_id,
+        id("up"),
+      );
+    } finally {
+      db.close();
+    }
+
+    const context = await service.callTool("get_project_context", {});
+    expect(context.recent_handoffs).toMatchObject([
+      { task_id: id("up"), integrated_commit: integrated },
+    ]);
+    const downClaim = await service.callTool("claim_task", { task_id: id("down") });
+    expect(downClaim.dependencies).toMatchObject([
+      { task_id: id("up"), integrated_commit: integrated },
+    ]);
+    await service.callTool("release_task", { task_id: id("down"), lease_id: downClaim.lease_id });
+
+    // Revisi menghapus integrated_commit lama agar tidak usang.
+    await manage("request_revision", id("up"), { feedback: "Perlu perbaikan kontrak." });
+    expect(
+      readTaskJsonField(service.stateFile, config.project_id, id("up"), "integrated_commit_json"),
+    ).toBeUndefined();
   });
 });
 
@@ -713,6 +862,55 @@ describe("LocalService reviews and context", () => {
       code: "not_found",
     });
   });
+
+  it("exposes code source in search_context and workspace_roots summary in session_brief and get_project_context", async () => {
+    const extDir = await mkdtemp(join(tmpdir(), "catenext-ext-root-"));
+    try {
+      await service.callTool("upsert_persona", { alias: "fe", role: "frontend" });
+      await service.callTool("manage_roots", {
+        action: "add",
+        path: extDir,
+        persona: "fe",
+        label: "web-app",
+      });
+      await mkdir(join(root, "src"), { recursive: true });
+      await writeFile(
+        join(root, "src/billing.ts"),
+        "export function calculateQuotaTier() { return 'pro'; }\n",
+      );
+      await mkdir(join(extDir, "pages"), { recursive: true });
+      await writeFile(
+        join(extDir, "pages/billing.tsx"),
+        "export function QuotaTierBadge() { return null; }\n",
+      );
+
+      const codeSearch = await service.callTool("search_context", {
+        query: "QuotaTier",
+        sources: ["code"],
+        limit: 5,
+      });
+      expect(codeSearch.degraded).toBe(false);
+      expect(codeSearch.hits.map((h) => h.ref).sort()).toEqual([
+        "@web-app/pages/billing.tsx",
+        "src/billing.ts",
+      ]);
+
+      const brief = await service.callTool("session_brief", {});
+      expect(brief.workspace_roots).toMatchObject([
+        { path: extDir, owner_persona: "fe", label: "web-app" },
+      ]);
+      expect(brief.lines.some((l) => l.kind === "info" && l.text.includes("web-app(fe)"))).toBe(
+        true,
+      );
+
+      const ctx = await service.callTool("get_project_context", {});
+      expect(ctx.workspace_roots).toMatchObject([
+        { path: extDir, owner_persona: "fe", label: "web-app" },
+      ]);
+    } finally {
+      await rm(extDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("LocalService state persistence", () => {
@@ -768,5 +966,119 @@ describe("LocalService state persistence", () => {
       service.callTool("create_epic", { title: "Must not overwrite" }),
     ).rejects.toMatchObject({ code: "corrupt_state" });
     expect(await readFile(service.stateFile, "utf8")).toBe(contents);
+  });
+
+  it("records task_events across task lifecycle transitions and rolls back on failure", async () => {
+    let now = start;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1000;
+      return now;
+    });
+
+    await service.callTool("upsert_persona", { alias: "be", role: "backend" });
+    const { id } = await draft([plan("alpha"), plan("beta")]);
+
+    await manage("assign", id("alpha"), { agent_alias: "be" });
+    await manage("approve_plan", id("alpha"));
+    await manage("approve_plan", id("beta"));
+
+    const firstClaim = await service.callTool("claim_task", {
+      task_id: id("alpha"),
+      agent_alias: "be",
+      worktree: { session_id: randomUUID(), branch: "feat/alpha" },
+    });
+    await service.callTool("release_task", {
+      task_id: id("alpha"),
+      lease_id: firstClaim.lease_id,
+    });
+
+    const secondClaim = await service.callTool("claim_task", {
+      task_id: id("alpha"),
+      agent_alias: "be",
+      worktree: { session_id: randomUUID(), branch: "feat/alpha" },
+    });
+    await service.callTool("report_blocker", {
+      task_id: id("alpha"),
+      lease_id: secondClaim.lease_id,
+      category: "dependency_issue",
+      reason: "Waiting for schema",
+    });
+    await manage("unblock", id("alpha"));
+
+    const thirdClaim = await service.callTool("claim_task", {
+      task_id: id("alpha"),
+      agent_alias: "be",
+      worktree: { session_id: randomUUID(), branch: "feat/alpha" },
+    });
+    // Failed handoff (branch_mismatch) must not emit a handoff event
+    await expect(
+      service.callTool("complete_handoff", {
+        task_id: id("alpha"),
+        lease_id: thirdClaim.lease_id,
+        handoff_summary: handoff({ git_branch: "wrong/branch" }),
+      }),
+    ).rejects.toMatchObject({ code: "branch_mismatch" });
+
+    await service.callTool("complete_handoff", {
+      task_id: id("alpha"),
+      lease_id: thirdClaim.lease_id,
+      handoff_summary: handoff({ git_branch: "feat/alpha" }),
+    });
+    await manage("request_revision", id("alpha"), { feedback: "Add index test" });
+
+    const fourthClaim = await service.callTool("claim_task", {
+      task_id: id("alpha"),
+      agent_alias: "be",
+      worktree: { session_id: randomUUID(), branch: "feat/alpha" },
+    });
+    await service.callTool("complete_handoff", {
+      task_id: id("alpha"),
+      lease_id: fourthClaim.lease_id,
+      handoff_summary: handoff({ git_branch: "feat/alpha" }),
+    });
+    await manage("approve", id("alpha"));
+
+    // Claim beta and let lease expire so lease_expired is recorded when reclaimed
+    await service.callTool("claim_task", { task_id: id("beta"), agent_alias: "be" });
+    now += LOCK_LEASE_MS + 5_000;
+    await service.callTool("claim_task", { task_id: id("beta"), agent_alias: "be" });
+
+    const alphaEvents = await service.readTaskEvents({ taskId: id("alpha"), limit: 50 });
+    expect(alphaEvents.map((e) => e.event)).toEqual([
+      "approve",
+      "handoff",
+      "claim",
+      "revision",
+      "handoff",
+      "claim",
+      "unblock",
+      "blocker",
+      "claim",
+      "release",
+      "claim",
+      "approve_plan",
+      "assign",
+    ]);
+    expect(alphaEvents[0]).toMatchObject({
+      task_id: id("alpha"),
+      task_title: "Task alpha",
+      actor: "human",
+      detail: { from: "NEEDS_REVIEW", to: "DONE" },
+    });
+    expect(alphaEvents.find((e) => e.event === "blocker")).toMatchObject({
+      actor: "be",
+      note: "[dependency_issue] Waiting for schema",
+    });
+
+    const betaEvents = await service.readTaskEvents({ taskId: id("beta"), limit: 10 });
+    expect(betaEvents.map((e) => e.event)).toEqual([
+      "claim",
+      "lease_expired",
+      "claim",
+      "approve_plan",
+    ]);
+
+    const limited = await new LocalService(root, config).readTaskEvents({ limit: 3 });
+    expect(limited).toHaveLength(3);
   });
 });

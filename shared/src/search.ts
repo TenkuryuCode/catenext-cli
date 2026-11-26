@@ -1,13 +1,13 @@
 import { z } from "zod";
 
-/** Sumber konteks lokal. Pencarian kode terpisah di CLI. */
-export const SEARCH_SOURCES = ["document", "skill", "task"] as const;
+/** Sumber konteks lokal. */
+export const SEARCH_SOURCES = ["document", "skill", "task", "code"] as const;
 export const SearchSourceSchema = z.enum(SEARCH_SOURCES);
 export type SearchSource = z.infer<typeof SearchSourceSchema>;
 
 export const SearchContextInput = z.object({
   query: z.string().trim().min(1).max(500),
-  sources: z.array(SearchSourceSchema).min(1).max(3).default(["document", "skill", "task"]),
+  sources: z.array(SearchSourceSchema).min(1).max(4).default(["document", "skill", "task"]),
   limit: z.number().int().min(1).max(20).default(8),
 });
 export type SearchContextInputType = z.input<typeof SearchContextInput>;

@@ -34,6 +34,17 @@ describe("scrubText", () => {
     );
   });
 
+  it("menyensor pasangan kunci JSON ber-kutip", () => {
+    const out = scrubText(
+      '{"api_key": "supersecretkey123", "password": "pw_with_digits_1", "note": "ok"}',
+    );
+    expect(out).not.toContain("supersecretkey123");
+    expect(out).not.toContain("pw_with_digits_1");
+    expect(out).toContain('"api_key": "[REDACTED:assignment]"');
+    expect(out).toContain('"password": "[REDACTED:assignment]"');
+    expect(out).toContain('"note": "ok"');
+  });
+
   it("menyensor private key", () => {
     const out = scrubText("-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----");
     expect(out).toBe("[REDACTED:private_key]");

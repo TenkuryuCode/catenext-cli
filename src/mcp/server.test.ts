@@ -298,4 +298,29 @@ describe("server MCP catenext", () => {
     expect(JSON.stringify(calls[0])).not.toContain("sk_live_abcdefghijklmnop");
     expect(textOf(result)).toMatch(/secret scrubber menyensor/i);
   });
+
+  it("mempertahankan field path dan query dari SCRUB_TOOL_FIELDS tanpa menyensornya", async () => {
+    const { client, calls } = await setup();
+    const secretLikePath = "/tmp/token_sk_live_abcdefghijklmnop/repo";
+    const secretLikeQuery = "auth_token=supersecretvalue123";
+    await client.callTool({
+      name: "manage_roots",
+      arguments: { action: "add", path: secretLikePath, label: "token=supersecretvalue123" },
+    });
+    await client.callTool({
+      name: "graph_neighbors",
+      arguments: { path: secretLikePath },
+    });
+    await client.callTool({
+      name: "symbol_search",
+      arguments: { query: secretLikeQuery },
+    });
+    expect(calls[0]?.body).toMatchObject({
+      action: "add",
+      path: secretLikePath,
+      label: "token=[REDACTED:assignment]",
+    });
+    expect(calls[1]?.body).toMatchObject({ path: secretLikePath });
+    expect(calls[2]?.body).toMatchObject({ query: secretLikeQuery });
+  });
 });

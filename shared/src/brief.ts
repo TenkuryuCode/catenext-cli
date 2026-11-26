@@ -57,6 +57,13 @@ export const PendingApprovalSchema = z.object({
   options: z.array(ApprovalOptionSchema).max(5),
 });
 
+export const WorkspaceRootSchema = z.object({
+  id: IdSchema,
+  path: z.string(),
+  owner_persona: AgentAliasSchema.nullable(),
+  label: z.string().optional(),
+});
+
 export const SessionBriefOutput = z.object({
   lines: z.array(SessionBriefLineSchema).max(BRIEF_LIMITS.sessionLines),
   ready_count: z.number().int().min(0),
@@ -64,6 +71,8 @@ export const SessionBriefOutput = z.object({
   draft_count: z.number().int().min(0),
   /** Human decisions the orchestrator must present (chat or numbered options). */
   pending_approvals: z.array(PendingApprovalSchema).max(10).default([]),
+  /** Registered external/extra workspace roots for this project. */
+  workspace_roots: z.array(WorkspaceRootSchema).max(20).default([]),
   /** Cold-start file: master prompt, then AGENTS.md for full rules. */
   read_first: z.literal("CATENEXT.md").default("CATENEXT.md"),
 });
@@ -74,12 +83,6 @@ export const ManageRootsInput = z.object({
   persona: AgentAliasSchema.optional(),
   label: z.string().min(1).max(80).optional(),
   root_id: IdSchema.optional(),
-});
-export const WorkspaceRootSchema = z.object({
-  id: IdSchema,
-  path: z.string(),
-  owner_persona: AgentAliasSchema.nullable(),
-  label: z.string().optional(),
 });
 export const ManageRootsOutput = z.object({
   roots: z.array(WorkspaceRootSchema),
