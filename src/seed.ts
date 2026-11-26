@@ -191,7 +191,9 @@ export function starterDocuments(
         "4. Delegate only; concurrent personas each use a separate git worktree.",
         "5. Watch all worktrees; after handoffs integrate if needed, then ask: PR | merge | revise | next.",
         "6. Docs tidy: add persona `scribe` if needed, then skill `docs-hygiene`.",
-        "7. Keep tool outputs brief; no code dumps or secrets.",
+        "7. Missing research/fetch/browser (or other access): ask the human with ACCESS NEEDED — never invent results.",
+        "8. Never publish credentials or critical secrets (handoffs/docs/git/PR) — cite paths only.",
+        "9. Keep tool outputs brief; no code dumps.",
       ].join("\n"),
     },
     {

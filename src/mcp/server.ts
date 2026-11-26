@@ -15,7 +15,7 @@ export const SERVER_INSTRUCTIONS = [
   "Workers: get_ready_tasks then claim_task (worktree required for monorepo). complete_handoff → NEEDS_REVIEW.",
   "Human approve_plan/approve stays on the CLI. Revisions reuse the same task.",
   "External folders: manage_roots. Code graph: catenext index then graph_neighbors / symbol_search.",
-  "No secrets or code dumps in handoffs/docs. Do not hand-edit .catenext/config.yaml or IDE MCP configs.",
+  "Never publish credentials or critical secrets (handoffs/docs/git — paths only). No code dumps. Do not hand-edit .catenext/config.yaml or IDE MCP configs.",
 ].join(" ");
 
 export type ServerContext =

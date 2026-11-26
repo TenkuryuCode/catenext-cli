@@ -60,6 +60,47 @@ catenext sync --platform cursor --dry-run
 catenext sync --platform cursor --force
 ```
 
+## Memperbarui Catenext
+
+CLI di npm dan file setup di repo adalah dua langkah terpisah.
+
+**1. Paket CLI (global atau npx)**
+
+```bash
+# cek versi terpasang
+catenext --version
+
+# perbarui global
+npm install -g catenext@latest
+
+# atau sekali jalan tanpa global
+npx -y catenext@latest --version
+```
+
+Lihat perubahan: [CHANGELOG.md](CHANGELOG.md) ·
+[rilis npm](https://www.npmjs.com/package/catenext).
+
+**2. Setup di setiap repo proyek** (setelah CLI baru)
+
+```bash
+cd ~/code/proyek-anda
+catenext sync --platform cursor --dry-run   # lihat dulu
+catenext sync --platform cursor --force     # perbarui MCP, CATENEXT.md, stub agen, skill
+catenext verify --platform cursor
+```
+
+Lalu **mulai ulang IDE/CLI** agar proses MCP memuat biner baru.
+
+| Yang ikut `sync` | Yang tidak disentuh |
+| --- | --- |
+| Entri MCP, pointer platform, blok `AGENTS.md`, `CATENEXT.md` (bila masih bertanda Catenext), stub persona, skill bawaan yang belum ada | `.catenext/catenext.sqlite` (task/docs), skill yang sudah Anda edit, config YAML kecuali field yang `sync` kelola |
+
+Tips:
+
+- Pakai `npx -y catenext@latest …` di MCP jika Anda tidak ingin mengelola global install — tetap jalankan `sync` setelah rilis besar.
+- Setelah naik versi mayor/minor, baca changelog; contoh 0.6.x: state SQLite, seed persona **matched**, master prompt baru.
+- Jangan commit `.catenext/catenext.sqlite` atau cache; backup SQLite sendiri sebelum eksperimen besar.
+
 ## Master prompt (salin ke chat)
 
 Tempel blok di bawah sebagai **pesan pertama** di chat agen (repo kosong atau sudah ada
@@ -169,6 +210,7 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 | Need | Command |
 | --- | --- |
 | Install CLI | `npm install -g catenext` |
+| Upgrade CLI | `npm install -g catenext@latest` then `catenext sync --force` + restart IDE |
 | First-time setup | `catenext init --platform <id>` (`--dry-run` / `--yes`) |
 | Verify MCP | `catenext verify --platform <id>` |
 | Add persona | `catenext persona set <alias> --role <role>` then `catenext sync` |
@@ -351,6 +393,7 @@ Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.
 | `document_version_conflict` | Baca ulang, gabungkan, simpan dengan versi terbaru |
 | Approve ditolak dari MCP | Setujui lewat CLI: `task approve` / `review approve` |
 | Tool MCP tidak terbaca | Mulai ulang IDE, lalu `catenext sync --platform … --force` |
+| Perilaku lama setelah rilis baru | `npm install -g catenext@latest`, lalu `sync --force`, restart IDE |
 | State lama JSON | Jalankan perintah apa pun yang membuka store — migrasi sekali ke SQLite |
 
 ## Build dari source

@@ -10,6 +10,19 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.6.2] - 2026-11-27
+
+### Ditambahkan
+- README: bagian **Memperbarui Catenext** (upgrade CLI + `sync --force` + restart IDE).
+
+### Diubah
+- README mirror publik: logo/wordmark Catenext + badge npm di header.
+- Master prompt / aturan orchestrator: jika research, fetch, browser, atau akses lain
+  tidak tersedia, minta izin/bantuan user (`ACCESS NEEDED`) — jangan mengarang hasil.
+- Aturan eksplisit: **jangan pernah mempublikasikan** kredensial atau secret krusial
+  (handoff, docs, git, PR, issues) — cukup path; scrubber tetap best-effort.
+- Cheat sheet master prompt: baris upgrade CLI.
+
 ## [0.6.1] - 2026-11-27
 
 ### Diubah
