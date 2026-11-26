@@ -1,4 +1,18 @@
-# Catenext CLI
+<p align="center">
+  <img src="docs/assets/catenext-wordmark.svg" alt="Catenext" width="320" />
+</p>
+
+<h1 align="center">Catenext CLI</h1>
+
+<p align="center">
+  Satu antrean lokal untuk agen AI coding — claim, handoff, dan task berikutnya tanpa Cloud.
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/catenext"><img alt="npm" src="https://img.shields.io/npm/v/catenext?color=0D9488" /></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/npm/l/catenext?color=0F766E" /></a>
+  <a href="https://nodejs.org/"><img alt="node" src="https://img.shields.io/node/v/catenext?color=0D9488" /></a>
+</p>
 
 Satu antrean lokal untuk agen AI coding Anda. Catenext mengunci task agar dua agen tidak
 mengerjakan hal yang sama, meneruskan handoff ke agen berikutnya, dan membuka task baru hanya

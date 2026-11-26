@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="96" viewBox="0 0 480 96" role="img" aria-label="Catenext">
+  <title>Catenext</title>
+  <g transform="translate(16,22) scale(2)">
+    <rect x="1" y="1" width="10" height="10" rx="3" fill="none" stroke="#0F766E" stroke-width="2"/>
+    <rect x="15" y="15" width="10" height="10" rx="3" fill="#0D9488" stroke="#0D9488" stroke-width="2"/>
+    <path d="M11 6h4a4 4 0 0 1 4 4v5" fill="none" stroke="#0F766E" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <text x="88" y="62" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="42" font-weight="700" fill="#0F766E" letter-spacing="-0.5">Catenext</text>
+</svg>
