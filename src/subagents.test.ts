@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyFileEdits, planRemove } from "./maintenance.js";
-import { planSubagents, renderSubagent, SUBAGENT_MARKER } from "./subagents.js";
+import {
+  planSubagents,
+  renderCodexSubagent,
+  renderSubagent,
+  SUBAGENT_MARKER,
+} from "./subagents.js";
 
 const adel = {
   alias: "adel",
@@ -22,6 +27,23 @@ describe("subagent persona", () => {
     expect(md).toContain("- Hanya apps/api");
     expect(md).toContain("Owned repos: `be`");
     expect(md).toContain("Stack:");
+  });
+
+  it("enriches cursor / antigravity / codex with native conventions", () => {
+    const cursor = renderSubagent(adel, { stack: ["node"], personas: [adel] }, "cursor");
+    expect(cursor).toContain("model: inherit");
+    expect(cursor).toContain(SUBAGENT_MARKER);
+
+    const anti = renderSubagent(adel, { stack: ["node"], personas: [adel] }, "antigravity");
+    expect(anti).toContain("model: inherit");
+    expect(anti).toContain("subagent: true");
+    expect(anti).toContain("mainAgent: false");
+
+    const codex = renderCodexSubagent(adel, { stack: ["node"], personas: [adel] });
+    expect(codex).toContain(`# ${SUBAGENT_MARKER}`);
+    expect(codex).toContain('name = "adel"');
+    expect(codex).toContain("developer_instructions = ");
+    expect(codex).toContain("Hanya apps/api");
   });
 
   it("membuat, memperbarui, menghapus file Catenext saja, dan tidak menimpa file manusia", async () => {
@@ -58,10 +80,29 @@ describe("subagent persona", () => {
     expect(removed.map((e) => e.path)).not.toContain(join(".claude", "agents", "citra.md"));
   });
 
-  it("does not fall back to .claude/agents for codex or vscode", async () => {
+  it("does not fall back to .claude/agents for vscode; writes Codex TOML under .codex/agents", async () => {
     const root = await mkdtemp(join(tmpdir(), "catenext-sub-nofallback-"));
-    const res = await planSubagents(root, [adel], ["codex", "vscode"]);
-    expect(res).toEqual({ edits: [], skipped: [] });
+    const vscode = await planSubagents(root, [adel], ["vscode"]);
+    expect(vscode).toEqual({ edits: [], skipped: [] });
+
+    const codex = await planSubagents(root, [adel], ["codex"]);
+    expect(codex.edits.map((e) => e.path).sort()).toEqual([
+      join(".codex", "agents", "adel.toml"),
+      join(".codex", "agents", "orchestrator.toml"),
+    ]);
+    await applyFileEdits(root, codex.edits);
+    expect(await readFile(join(root, ".codex", "agents", "adel.toml"), "utf8")).toContain(
+      'name = "adel"',
+    );
+  });
+
+  it("writes antigravity stubs under native .agents/agents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-sub-anti-"));
+    const planned = await planSubagents(root, [adel], ["antigravity"]);
+    expect(planned.edits.map((e) => e.path)).toContain(join(".agents", "agents", "adel.md"));
+    await applyFileEdits(root, planned.edits);
+    const body = await readFile(join(root, ".agents", "agents", "adel.md"), "utf8");
+    expect(body).toContain("subagent: true");
   });
 
   it("overwrites non-Catenext stubs when force is true", async () => {

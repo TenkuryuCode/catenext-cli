@@ -60,7 +60,17 @@ import {
 } from "./planning.js";
 import { listSkills, loadSkill, SkillError } from "./skills.js";
 import { planSubagents } from "./subagents.js";
+import {
+  buildTemplateBundle,
+  formatImportSummary,
+  importTemplateBundle,
+  loadTemplateBundle,
+  TemplateBundleError,
+  warnRedactions,
+  writeTemplateBundle,
+} from "./template-bundle.js";
 import { formatChecks, verifySetup } from "./verify.js";
+import { runWatch } from "./watch.js";
 import {
   pruneWorktrees,
   readWorktreeInventory,
@@ -88,6 +98,7 @@ async function friendly(fn: () => Promise<void>) {
       err instanceof McpConfigError ||
       err instanceof SkillError ||
       err instanceof PlanningInputError ||
+      err instanceof TemplateBundleError ||
       err instanceof WorktreeError
     ) {
       console.error(`✗ ${err.message}`);
@@ -462,6 +473,41 @@ program
       if (opts.json) return console.log(JSON.stringify(res, null, 2));
       console.log(`ready=${res.ready_count} blocked=${res.blocked_count} draft=${res.draft_count}`);
       for (const line of res.lines) console.log(`[${line.kind}] ${line.text}`);
+    }),
+  );
+
+program
+  .command("watch")
+  .description(
+    "Monitor board, lease/worktree, persetujuan manusia, dan task_events (read-only, polling)",
+  )
+  .option(
+    "--interval <ms>",
+    "Interval polling dalam milidetik (default: 2000)",
+    (value: string) => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 250) {
+        throw new InvalidArgumentError("--interval minimal 250 ms");
+      }
+      return Math.floor(n);
+    },
+    2000,
+  )
+  .option("--once", "Cetak satu snapshot lalu keluar")
+  .option("--epic <id>", "Filter board/lease/approval/event untuk epic ini")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { interval: number; once?: boolean; epic?: string; json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot(true);
+      const config = await readConfig(root);
+      await runWatch({
+        root,
+        config,
+        intervalMs: opts.interval,
+        once: Boolean(opts.once),
+        epic: opts.epic,
+        json: Boolean(opts.json),
+      });
     }),
   );
 
@@ -960,6 +1006,75 @@ program
         opts.json ? JSON.stringify({ ...skill, revision: opts.revision }, null, 2) : skill.content,
       );
     }),
+  );
+
+const templateCmd = program
+  .command("template")
+  .description("Ekspor/impor bundle persona + skill repo lintas proyek (disensor secret)");
+
+templateCmd
+  .command("export")
+  .description("Ekspor personas + skill repo ke JSON (secret di-scrub)")
+  .option("-o, --out <file>", "Tulis ke file (default: stdout)")
+  .option("--json", "Alias stdout JSON (sama seperti tanpa -o)")
+  .action((opts: { out?: string; json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot();
+      const config = await readConfig(root);
+      const service = await cliService(root);
+      const { bundle, redacted, redactions } = await buildTemplateBundle(service, root, config);
+      warnRedactions(redacted, redactions);
+      if (opts.out) {
+        await writeTemplateBundle(opts.out, bundle);
+        console.log(
+          `✓ Template diekspor ke ${opts.out} (${bundle.personas.length} persona, ${bundle.skills.length} skill).`,
+        );
+        return;
+      }
+      console.log(JSON.stringify(bundle, null, 2));
+    }),
+  );
+
+templateCmd
+  .command("import")
+  .description("Impor bundle persona + skill (scrub ulang; upsert)")
+  .argument("<file>", "Path JSON bundle (atau - untuk stdin)")
+  .option("--personas-only", "Hanya impor personas")
+  .option("--skills-only", "Hanya impor skills")
+  .option("--dry-run", "Tampilkan ringkasan tanpa menulis")
+  .option("--json", "Keluaran JSON")
+  .action(
+    (
+      file: string,
+      opts: { personasOnly?: boolean; skillsOnly?: boolean; dryRun?: boolean; json?: boolean },
+    ) =>
+      friendly(async () => {
+        if (opts.personasOnly && opts.skillsOnly) {
+          throw new TemplateBundleError(
+            "Pilih --personas-only atau --skills-only, bukan keduanya.",
+          );
+        }
+        const root = await requireRoot();
+        const service = await cliService(root);
+        const { bundle, redacted, redactions } = await loadTemplateBundle(file);
+        warnRedactions(redacted, redactions);
+        const result = await importTemplateBundle(service, root, bundle, {
+          personas: !opts.skillsOnly,
+          skills: !opts.personasOnly,
+          dryRun: Boolean(opts.dryRun),
+        });
+        result.redacted = redacted;
+        if (opts.json) return console.log(JSON.stringify(result, null, 2));
+        console.log(formatImportSummary(result));
+        if (result.personas.created.length)
+          console.log(`  personas created: ${result.personas.created.join(", ")}`);
+        if (result.personas.updated.length)
+          console.log(`  personas updated: ${result.personas.updated.join(", ")}`);
+        if (result.skills.created.length)
+          console.log(`  skills created: ${result.skills.created.join(", ")}`);
+        if (result.skills.updated.length)
+          console.log(`  skills updated: ${result.skills.updated.join(", ")}`);
+      }),
   );
 
 function confirm(question: string): Promise<boolean> {

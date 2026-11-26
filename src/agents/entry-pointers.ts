@@ -1,6 +1,7 @@
 import type { PlatformId } from "@catenext/shared";
 import { readRepoFile } from "../init/repo-files.js";
 import type { FileEdit } from "../maintenance.js";
+import { SUBAGENT_DIRS } from "../subagents.js";
 
 export const ENTRY_MARKER = "<!-- catenext:entry -->";
 export const MASTER_MARKER = "<!-- catenext:master -->";
@@ -29,6 +30,12 @@ function masterLinkFrom(entryPath: string): string {
   const depth = entryPath.split("/").length - 1;
   if (depth <= 0) return "./CATENEXT.md";
   return `${"../".repeat(depth)}CATENEXT.md`;
+}
+
+function agentsLinkFrom(entryPath: string, agentsDir: string): string {
+  const depth = entryPath.split("/").length - 1;
+  const prefix = depth <= 0 ? "./" : "../".repeat(depth);
+  return `${prefix}${agentsDir}/`;
 }
 
 /**
@@ -62,39 +69,88 @@ export function renderMasterPrompt(): string {
   ].join("\n");
 }
 
+type PlatformEntryMeta = {
+  title: string;
+  agentsNote: string;
+  syncHint: string;
+};
+
+function platformMeta(platform: PlatformId, entryPath: string): PlatformEntryMeta {
+  const agentsDir = SUBAGENT_DIRS[platform];
+  const agentsHref = agentsDir ? agentsLinkFrom(entryPath, agentsDir) : null;
+  switch (platform) {
+    case "claude-code":
+      return {
+        title: "Claude Code · Catenext entry",
+        agentsNote: agentsHref
+          ? `Persona agents (Markdown): [\`.claude/agents/\`](${agentsHref}).`
+          : "Persona agents: `.claude/agents/`.",
+        syncHint: "`catenext sync --platform claude-code`",
+      };
+    case "cursor":
+      return {
+        title: "Cursor · Catenext entry",
+        agentsNote: agentsHref
+          ? `Subagents (Markdown, \`model: inherit\`): [\`.cursor/agents/\`](${agentsHref}).`
+          : "Subagents: `.cursor/agents/`.",
+        syncHint: "`catenext sync --platform cursor`",
+      };
+    case "codex":
+      return {
+        title: "Codex · Catenext entry",
+        agentsNote: agentsHref
+          ? `Custom agents (TOML): [\`.codex/agents/\`](${agentsHref}). Project instructions still come from root \`AGENTS.md\`.`
+          : "Custom agents: `.codex/agents/*.toml`.",
+        syncHint: "`catenext sync --platform codex`",
+      };
+    case "antigravity":
+      return {
+        title: "Antigravity · Catenext entry",
+        agentsNote: agentsHref
+          ? `Custom agents (Markdown under native discovery): [\`.agents/agents/\`](${agentsHref}).`
+          : "Custom agents: `.agents/agents/`.",
+        syncHint: "`catenext sync --platform antigravity`",
+      };
+    case "opencode":
+      return {
+        title: "OpenCode · Catenext entry",
+        agentsNote: agentsHref
+          ? `Persona agents: [\`.opencode/agents/\`](${agentsHref}).`
+          : "Persona agents: `.opencode/agents/`.",
+        syncHint: "`catenext sync --platform opencode`",
+      };
+    default:
+      return {
+        title: `${platform} · Catenext entry`,
+        agentsNote: "Follow root CATENEXT.md / AGENTS.md for orchestration.",
+        syncHint: "`catenext sync`",
+      };
+  }
+}
+
 /** Thin redirect so IDE-native entry files land on the master prompt. */
 export function renderEntryPointer(platform: PlatformId, entryPath: string): string {
   const link = masterLinkFrom(entryPath);
+  const agentsMd = masterLinkFrom(entryPath).replace("CATENEXT.md", "AGENTS.md");
+  const meta = platformMeta(platform, entryPath);
   return [
     ENTRY_MARKER,
-    `# ${platform} · Catenext entry`,
+    `# ${meta.title}`,
     "",
     `**New session:** open **[${MASTER_PROMPT_FILE}](${link})** first (master prompt).`,
     "",
-    "Then follow [AGENTS.md](" +
-      masterLinkFrom(entryPath).replace("CATENEXT.md", "AGENTS.md") +
-      ") for full orchestrator rules.",
+    `Then follow [AGENTS.md](${agentsMd}) for full orchestrator rules.`,
+    meta.agentsNote,
     "",
     "Do not duplicate the master prompt here — this file is only a pointer.",
     "",
-    "Useful: `catenext brief` · `catenext board` · `catenext sync`.",
+    `Useful: \`catenext brief\` · \`catenext board\` · ${meta.syncHint}.`,
     "",
   ].join("\n");
 }
 
 export function renderClaudeEntry(): string {
-  return [
-    ENTRY_MARKER,
-    "# Claude Code · Catenext entry",
-    "",
-    `**New / first session:** read **[${MASTER_PROMPT_FILE}](./${MASTER_PROMPT_FILE})** before anything else.`,
-    "",
-    "That file is the master prompt. Detailed orchestrator rules: [AGENTS.md](./AGENTS.md).",
-    "Persona agents: `.claude/agents/`.",
-    "",
-    "Commands: `catenext brief` · `catenext board` · `catenext sync --platform claude-code`.",
-    "",
-  ].join("\n");
+  return renderEntryPointer("claude-code", "CLAUDE.md");
 }
 
 export async function planEntryPointers(
@@ -117,8 +173,7 @@ export async function planEntryPointers(
     if (!path) continue;
     const before = await readRepoFile(root, path);
     if (!opts.force && before !== null && !before.includes(ENTRY_MARKER)) continue;
-    const after =
-      platform === "claude-code" ? renderClaudeEntry() : renderEntryPointer(platform, path);
+    const after = renderEntryPointer(platform, path);
     if (after !== before) edits.push({ path, before, after });
   }
   return edits;

@@ -225,7 +225,8 @@ describe("local remove", () => {
     }
     expect(fullPaths).toContain(join(".claude", "agents", "be.md"));
     expect(fullPaths).toContain(join(".cursor", "agents", "be.md"));
-    expect(fullPaths).toContain(join(".agents", "catenext", "be.md"));
+    expect(fullPaths).toContain(join(".agents", "agents", "be.md"));
+    expect(fullPaths).toContain(join(".codex", "agents", "be.toml"));
     expect(fullPaths).toContain(join(".opencode", "agents", "be.md"));
     await applyFileEdits(root, full);
     await expect(read(MASTER_PROMPT_FILE)).rejects.toMatchObject({ code: "ENOENT" });

@@ -10,6 +10,13 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.11.0] - 2026-11-27
+
+### Ditambahkan
+- `catenext template export` / `catenext template import` untuk bundle personas + skill repo (JSON `catenext.persona-skills` v1) dengan scrubbing secret; opsi `--dry-run`, `--personas-only`, `--skills-only`.
+- Stub agen IDE lebih native: Cursor (`model: inherit`), Antigravity (`.agents/agents` + flag subagent), Codex (`.codex/agents/*.toml`), serta entry pointer Claude Code yang diperkaya.
+- `catenext watch` (`--interval`, `--once`, `--epic`, `--json`): ringkasan terminal board, lease/worktree aktif, pending approval, dan `task_events` terbaru lewat polling SQLite read-only tanpa mengunci writer.
+
 ## [0.10.0] - 2026-11-27
 
 ### Ditambahkan

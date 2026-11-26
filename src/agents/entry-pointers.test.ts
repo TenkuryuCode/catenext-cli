@@ -42,13 +42,17 @@ describe("entry-pointers rendering", () => {
   it("renderEntryPointer resolves relative links for root, single-depth, and multi-depth paths", () => {
     const nested = renderEntryPointer("cursor", ".cursor/CATENEXT.md");
     expect(nested.startsWith(ENTRY_MARKER)).toBe(true);
-    expect(nested).toContain("# cursor · Catenext entry");
+    expect(nested).toContain("# Cursor · Catenext entry");
     expect(nested).toContain("[CATENEXT.md](../CATENEXT.md)");
     expect(nested).toContain("[AGENTS.md](../AGENTS.md)");
+    expect(nested).toContain(".cursor/agents/");
+    expect(nested).toContain("model: inherit");
 
     const deep = renderEntryPointer("codex", ".codex/sub/CATENEXT.md");
     expect(deep).toContain("[CATENEXT.md](../../CATENEXT.md)");
     expect(deep).toContain("[AGENTS.md](../../AGENTS.md)");
+    expect(deep).toContain(".codex/agents/");
+    expect(deep).toContain("TOML");
 
     const rootLevel = renderEntryPointer("opencode", "ENTRY.md");
     expect(rootLevel).toContain("[CATENEXT.md](./CATENEXT.md)");
@@ -62,6 +66,12 @@ describe("entry-pointers rendering", () => {
     expect(md).toContain("[CATENEXT.md](./CATENEXT.md)");
     expect(md).toContain("[AGENTS.md](./AGENTS.md)");
     expect(md).toContain(".claude/agents/");
+  });
+
+  it("antigravity entry points at native .agents/agents/", () => {
+    const md = renderEntryPointer("antigravity", ".agents/CATENEXT.md");
+    expect(md).toContain(".agents/agents/");
+    expect(md).toContain("catenext sync --platform antigravity");
   });
 });
 
