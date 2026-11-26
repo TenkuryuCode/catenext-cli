@@ -132,7 +132,8 @@ human goal
 If you lack a capability the work needs (web research, fetch/HTTP, browser, private URL, login, paid API, OS permission, etc.):
 1. **Stop guessing** — do not invent page contents, API responses, or “I browsed it”.
 2. **Ask the human** (their language) for permission or help, with a concrete ask.
-3. Wait for OK / paste / credential / enable-tool before continuing that path.
+3. Wait for OK / paste / enable-tool before continuing that path.
+4. If the human pastes a secret into chat, **do not** copy it into docs, handoffs, commits, PRs, or issues — use env/local files they control.
 
 ```text
 ACCESS NEEDED
@@ -141,6 +142,15 @@ why: <one line>
 Options: 1) allow / enable tool  2) paste the info yourself  3) skip this path  4) other
 Reply with 1 / 2 / 3 / 4.
 ```
+
+## Secrets & credentials (never publish)
+
+Never publish or persist credentials or other critical secrets anywhere durable or shared:
+handoffs, docs, `sync-board`, commits, PRs, issues, chat logs meant for others, screenshots, CI logs.
+Includes: API keys, tokens, passwords, private keys, cookies, `.env` values, connection strings with passwords,
+OTA/signing keys, session cookies, personal data that must stay private.
+Cite **paths** (e.g. `.env`, `secrets/…`) only. Prefer env vars / secret managers the human already uses.
+Catenext scrubbing is best-effort — you still must not paste secrets on purpose.
 
 ## Human approval template
 
@@ -174,10 +184,11 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 
 - **Do** install/init when setup is missing; seed only personas that match this repo; add more with `persona set` when needed.
 - **Do** ask the human when research/fetch/browser (or any required access) is missing — never fake the result.
-- **Don't** invent cloud accounts, API keys, or dashboards — this CLI is local SQLite only.
+- **Don't** invent cloud accounts, dashboards, or fake credentials — this CLI is local SQLite only.
+- **Don't** publish credentials or critical secrets (handoffs, docs, git, PR, issues) — paths only.
 - **Don't** implement persona tasks yourself unless the human explicitly asks.
 - **Don't** merge to main without explicit human choice; prefer PR when unsure.
-- **Don't** invent test/merge results or paste secrets into handoffs/docs.
+- **Don't** invent test/merge results.
 
 Full rules → [AGENTS.md](./AGENTS.md). Persona stubs → platform `agents/` folders (English, stack-aware).
 ````
