@@ -21,6 +21,7 @@ import { isMissingFile } from "./config.js";
 import type { LocalService } from "./local-service.js";
 import { type LocalPermission, PERMISSION_ACTIONS } from "./local-state.js";
 import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
+import { scrubText } from "./scrubber.js";
 
 /**
  * Fallback CLI untuk agen tanpa MCP (blueprint §4.3): `catenext next/claim/done/block`.
@@ -162,16 +163,26 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   if (res.dependencies.length > 0) {
     out.push("## Handoff dari task dependensi", "");
     for (const d of res.dependencies) {
-      const h = d.handoff_summary;
       out.push(`### ${d.title}`, "");
-      out.push(`- Branch/commit: ${h.git_branch} @ ${h.last_commit_hash}`);
-      if (d.integrated_commit) {
-        out.push(`- Terintegrasi: ${d.integrated_commit.branch} @ ${d.integrated_commit.sha}`);
+      if (d.handoff_summary) {
+        const h = d.handoff_summary;
+        out.push(`- Branch/commit: ${h.git_branch} @ ${h.last_commit_hash}`);
+        if (d.integrated_commit) {
+          out.push(`- Terintegrasi: ${d.integrated_commit.branch} @ ${d.integrated_commit.sha}`);
+        }
+        if (h.files_modified.length) out.push(`- File: ${h.files_modified.join(", ")}`);
+        for (const k of h.key_decisions) out.push(`- Keputusan: ${k}`);
+        if (h.verification_command) out.push(`- Verifikasi: \`${h.verification_command}\``);
+        out.push(`- Catatan: ${h.notes_for_next_agent}`, "");
+      } else if (d.compact_handoff) {
+        const h = d.compact_handoff;
+        if (d.integrated_commit) {
+          out.push(`- Terintegrasi: ${d.integrated_commit.branch} @ ${d.integrated_commit.sha}`);
+        }
+        if (h.files_modified.length) out.push(`- File: ${h.files_modified.join(", ")}`);
+        for (const k of h.key_decisions) out.push(`- Keputusan: ${k}`);
+        out.push(`- Catatan: ${h.notes_for_next_agent}`, "");
       }
-      if (h.files_modified.length) out.push(`- File: ${h.files_modified.join(", ")}`);
-      for (const k of h.key_decisions) out.push(`- Keputusan: ${k}`);
-      if (h.verification_command) out.push(`- Verifikasi: \`${h.verification_command}\``);
-      out.push(`- Catatan: ${h.notes_for_next_agent}`, "");
     }
   }
   for (const w of res.warnings) out.push(`! ${w}`);
@@ -375,26 +386,115 @@ export async function taskManage(service: LocalService, input: unknown, json: bo
 const TaskLogInput = z.strictObject({
   task_id: IdSchema.optional(),
   limit: z.number().int().min(1).max(200).default(20),
+  event: z.string().trim().min(1).max(200).optional(),
+  actor: z.string().trim().min(1).max(200).optional(),
+  since: z.string().trim().min(1).optional(),
+  format: z.enum(["table", "json", "csv"]).optional(),
 });
 
-export async function taskLog(
-  service: LocalService,
-  taskId?: string,
-  opts: { limit?: number; json?: boolean } = {},
-) {
-  const body = prepare(
-    TaskLogInput,
-    {
-      ...(taskId !== undefined ? { task_id: taskId } : {}),
-      ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
-    },
-    ["task_id", "limit"],
+export type TaskLogOptions = Omit<z.input<typeof TaskLogInput>, "task_id" | "format"> & {
+  format?: string;
+  json?: boolean;
+};
+
+const ISO_TIMESTAMP = z.iso.datetime({ offset: true });
+const DURATION_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+
+function logSince(since: string | undefined): string | undefined {
+  if (since === undefined) return undefined;
+  const relative = /^(\d+)([mhd])$/.exec(since);
+  let timestamp = Number.NaN;
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2] as keyof typeof DURATION_MS;
+    if (Number.isSafeInteger(amount) && amount > 0) {
+      timestamp = Date.now() - amount * DURATION_MS[unit];
+    }
+  } else if (ISO_TIMESTAMP.safeParse(since).success) {
+    timestamp = Date.parse(since);
+  }
+  const date = new Date(timestamp);
+  if (
+    !Number.isFinite(date.getTime()) ||
+    date.getUTCFullYear() < 0 ||
+    date.getUTCFullYear() > 9999
+  ) {
+    throw new PlanningInputError(
+      "--since harus timestamp ISO dengan zona waktu atau durasi positif (24h, 7d, 30m).",
+    );
+  }
+  return date.toISOString();
+}
+
+const AUDIT_COLUMNS = [
+  "id",
+  "project_id",
+  "task_id",
+  "task_title",
+  "event",
+  "actor",
+  "note",
+  "detail",
+  "created_at",
+] as const;
+
+// Scrub both free text and legacy structured details, where secrets can also be object keys.
+const SECRET_FIELD =
+  /^(?:password|passwd|pwd|secret|token|(?:api|access|private|signing)[_-]?key|(?:access|refresh|auth)[_-]?token|credentials?|authorization|cookies?|lease[_-]?id)$/i;
+function scrubAuditValue<T>(value: T): T {
+  const walk = (v: unknown): unknown => {
+    if (typeof v === "string") return scrubText(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v !== null && typeof v === "object") {
+      return Object.fromEntries(
+        Object.entries(v).map(([key, child]) => [
+          scrubText(key),
+          SECRET_FIELD.test(key) ? "[REDACTED:field]" : walk(child),
+        ]),
+      );
+    }
+    return v;
+  };
+  return walk(value) as T;
+}
+
+function csvCell(value: string | number | Record<string, unknown> | null): string {
+  let cell =
+    value === null ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
+  // RFC 4180 quoting alone does not stop spreadsheet formulas.
+  if (typeof value === "string" && /^(?:\s*[=+@-]|[\t\r\n])/.test(cell)) cell = `'${cell}`;
+  return /[",\r\n]/.test(cell) ? `"${cell.replaceAll('"', '""')}"` : cell;
+}
+
+export async function taskLog(service: LocalService, taskId?: string, opts: TaskLogOptions = {}) {
+  const { json, ...options } = opts;
+  const body = prepare(TaskLogInput, { task_id: taskId, ...options }, [
+    "task_id",
+    "limit",
+    "event",
+    "actor",
+    "since",
+    "format",
+  ]);
+  if (json && body.format && body.format !== "json") {
+    throw new PlanningInputError("--json tidak bisa digabung dengan --format selain json.");
+  }
+  const format = body.format ?? (json ? "json" : "table");
+  const events = scrubAuditValue(
+    await service.readTaskEvents({
+      taskId: body.task_id,
+      limit: body.limit,
+      event: body.event,
+      actor: body.actor,
+      since: logSince(body.since),
+    }),
   );
-  const events = await service.readTaskEvents({
-    taskId: body.task_id,
-    limit: body.limit,
-  });
-  if (opts.json) return console.log(JSON.stringify({ events }, null, 2));
+  if (format === "json") return console.log(JSON.stringify({ events }, null, 2));
+  if (format === "csv") {
+    const rows = events.map((event) => AUDIT_COLUMNS.map((key) => csvCell(event[key])).join(","));
+    process.stdout.write([AUDIT_COLUMNS.join(","), ...rows, ""].join("\r\n"));
+    return;
+  }
   if (events.length === 0) {
     return console.log(
       body.task_id

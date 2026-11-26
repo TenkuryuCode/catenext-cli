@@ -184,35 +184,28 @@ settings:
 importers:
 
   .:
-    dependencies:
+    devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
         version: 1.32.2(zod@4.6.7)
+      '@types/node':
+        specifier: ^22.20.5
+        version: 22.20.7
       commander:
         specifier: ^15.1.0
         version: 15.1.0
       diff:
         specifier: ^9.0.0
         version: 9.0.0
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       jsonc-parser:
         specifier: ^3.3.1
         version: 3.3.1
       toml-eslint-parser:
         specifier: ^1.0.3
         version: 1.0.3
-      yaml:
-        specifier: ^2.9.1
-        version: 2.9.1
-      zod:
-        specifier: ^4.6.7
-        version: 4.6.7
-    devDependencies:
-      '@types/node':
-        specifier: ^22.20.5
-        version: 22.20.7
-      esbuild:
-        specifier: 0.28.2
-        version: 0.28.2
       tsx:
         specifier: ^4.23.15
         version: 4.23.15
@@ -222,6 +215,12 @@ importers:
       vitest:
         specifier: ^5.1.1
         version: 5.1.2(@types/node@22.20.7)(vite@8.3.8(@types/node@22.20.7)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
+      yaml:
+        specifier: ^2.9.1
+        version: 2.9.1
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
 
 packages:
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { renderMasterPrompt } from "../agents/entry-pointers.js";
 import { BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./agents-md.js";
 
 describe("blok AGENTS.md", () => {
@@ -15,6 +16,17 @@ describe("blok AGENTS.md", () => {
     expect(block).toContain("pending_approvals");
     expect(block).toContain("session_brief");
     expect(block).toContain("catenext revise");
+    expect(block).toContain("APPROVAL NEEDED");
+    expect(block).toContain("ACCESS NEEDED");
+  });
+
+  it("tidak menduplikasi template panjang di CATENEXT.md", () => {
+    const master = renderMasterPrompt();
+    const agents = upsertAgentsBlock(null);
+    expect(master.length).toBeLessThan(agents.length * 0.45);
+    expect(agents).toContain("APPROVAL NEEDED");
+    expect(master).not.toContain("APPROVAL NEEDED");
+    expect(master).not.toContain("Then read **`AGENTS.md`**");
   });
 
   it("mengganti blok lama di tempatnya tanpa menyentuh teks lain", () => {

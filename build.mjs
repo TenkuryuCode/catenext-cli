@@ -1,5 +1,4 @@
-// Bundel CLI menjadi satu file dist/index.js untuk npm. @catenext/shared (private, tidak
-// dipublikasikan) ikut di-bundle dari source; dependensi npm lain tetap eksternal.
+// Bundel CLI menjadi satu file dist/index.js tanpa runtime dependency npm untuk distribusi.
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,16 +15,24 @@ const sharedCandidates = [
 const shared = sharedCandidates.find((p) => existsSync(p));
 if (!shared) throw new Error("Source @catenext/shared tidak ditemukan.");
 
+const watch = process.argv.includes("--watch");
+const sourcemap = watch || process.argv.includes("--sourcemap");
+
 const options = {
   entryPoints: [resolve(here, "src/index.ts")],
   outfile: resolve(here, "dist/index.js"),
   bundle: true,
   platform: "node",
   format: "esm",
+  mainFields: ["module", "main"],
   target: "node22",
-  sourcemap: true,
+  minify: !watch,
+  sourcemap,
   alias: { "@catenext/shared": shared },
   external: Object.keys(pkg.dependencies ?? {}),
+  banner: {
+    js: 'import { createRequire as __catenextCreateRequire } from "node:module"; const require = __catenextCreateRequire(import.meta.url);',
+  },
   define: {
     "process.env.CATENEXT_BUILD_VERSION": JSON.stringify(pkg.version),
   },
@@ -35,7 +42,7 @@ const options = {
 // Bersihkan sisa build lama (mis. keluaran tsc per file) agar paket npm hanya berisi bundel.
 rmSync(resolve(here, "dist"), { recursive: true, force: true });
 
-if (process.argv.includes("--watch")) {
+if (watch) {
   const ctx = await context(options);
   await ctx.watch();
 } else {

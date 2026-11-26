@@ -10,6 +10,19 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.9.0] - 2026-11-27
+
+### Ditambahkan
+- Filter katalog MCP opsional lewat `catenext mcp --role <orchestrator|worker>`; tanpa flag, semua tool tetap tersedia.
+- `get_document` dapat mengembalikan outline heading Markdown (`outline_only`) atau satu bagian (`section`). `claim_task` dengan `compact: true` mengembalikan ringkasan handoff dependensi; handoff lengkap tetap menjadi default dan bisa dibaca lewat `get_project_context` dengan lease aktif.
+- `catenext log` mendukung filter `--event`, `--actor`, dan `--since`, serta keluaran `--format table|json|csv`. Opsi `--json` tetap tersedia.
+
+### Diubah
+- Katalog `tools/list` MCP lebih ringkas: deskripsi dipendekkan dan metadata JSON Schema yang berulang dikurangi, tanpa melonggarkan validasi input.
+- Server MCP memakai implementasi stdio internal yang ringan. Paket CLI dibundel tanpa dependensi npm runtime.
+- Kebijakan MCP konsisten menolak `approve_plan` dan `approve`, serta mengarahkan pengguna ke `catenext task approve` dan `catenext review approve` di CLI.
+- Validasi skill repo diperketat: indeks melaporkan nama duplikat atau skill tidak valid, dan pembacaan serta penulisan memeriksa path, isi skill, dan indikasi secret.
+
 ## [0.8.0] - 2026-11-27
 
 ### Ditambahkan

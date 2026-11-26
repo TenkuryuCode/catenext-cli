@@ -19,10 +19,20 @@ export type SkillFrontmatter = z.infer<typeof SkillFrontmatterSchema>;
 
 function longestCodeBlockLines(markdown: string): number {
   let longest = 0;
-  const blocks = markdown.match(/```[\s\S]*?```/g) ?? [];
-  for (const block of blocks) {
-    const lines = block.split("\n").length - 2;
-    if (lines > longest) longest = lines;
+  let fence: { marker: string; lines: number } | undefined;
+  for (const line of markdown.split(/\r?\n/)) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    const marker = match?.[1];
+    const rest = match?.[2]?.trim() ?? "";
+    if (!fence) {
+      if (marker && (!marker.startsWith("`") || !rest.includes("`"))) {
+        fence = { marker, lines: 0 };
+      }
+    } else if (marker?.startsWith(fence.marker) && !rest) {
+      fence = undefined;
+    } else {
+      longest = Math.max(longest, ++fence.lines);
+    }
   }
   return longest;
 }

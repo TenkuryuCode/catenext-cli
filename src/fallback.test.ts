@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatenextConfigSchema } from "@catenext/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { openDatabaseAt } from "./db/open.js";
+import { insertTaskEvents } from "./db/task-events.js";
 import {
   buildHandoff,
   permissionGrant,
@@ -268,6 +270,86 @@ describe("fallback CLI", () => {
     logSpy.mockClear();
     await taskLog(service, "99999999-2222-4333-8444-555555555555", {});
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Belum ada event audit"));
+  });
+
+  it("filters audit exports and scrubs legacy CSV fields before escaping", async () => {
+    const { dir } = await makeTempGitRepo();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: "11111111-2222-4333-8444-555555555555",
+      repo_name: "be",
+    });
+    const service = new LocalService(dir, config);
+    const { epic } = await service.callTool("create_epic", { title: "Export" });
+    const {
+      created: [task],
+    } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [{ ref: "a", title: "=Audit", prompt_instruction: "Review export" }],
+    });
+    if (!task) throw new Error("Expected task");
+    const taskId = task.task_id;
+    const secret = `ghp_${"X".repeat(24)}`;
+    const point = "2026-01-02T00:00:00.000Z";
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-02T00:30:00Z"));
+    const event = {
+      task_id: taskId,
+      event: "handoff",
+      actor: "be",
+      created_at: point,
+      note: `First, "quoted"\r\n${secret}`,
+      detail: { nested: [{ password: "fixture", [secret]: "example" }] },
+    };
+    const db = openDatabaseAt(service.stateFile);
+    try {
+      insertTaskEvents(db, config.project_id, [
+        event,
+        { ...event, created_at: "2026-01-01T23:59:59.999Z", note: "too old" },
+        { ...event, event: "claim", note: "wrong event" },
+        { ...event, actor: "human", note: "wrong actor" },
+      ]);
+    } finally {
+      db.close();
+    }
+
+    const query = { event: "handoff", actor: "be", limit: 1 };
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await taskLog(service, taskId, { ...query, since: "2026-01-02T01:00:00+01:00", json: true });
+    const expectedJson = log.mock.lastCall?.[0];
+    expect(JSON.parse(String(expectedJson))).toMatchObject({
+      events: [
+        {
+          event: "handoff",
+          actor: "be",
+          created_at: point,
+          note: 'First, "quoted"\r\n[REDACTED:github_token]',
+          detail: {
+            nested: [{ password: "[REDACTED:field]", "[REDACTED:github_token]": "example" }],
+          },
+        },
+      ],
+    });
+    await taskLog(service, taskId, { ...query, since: "30m", format: "json" });
+    expect(log.mock.lastCall?.[0]).toBe(expectedJson);
+    await taskLog(service, taskId, { event: "handoff", actor: "be", since: "29m", format: "json" });
+    expect(JSON.parse(String(log.mock.lastCall?.[0]))).toEqual({ events: [] });
+
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await taskLog(service, taskId, { ...query, since: "30m", format: "csv" });
+    const csv = String(stdout.mock.lastCall?.[0]);
+    expect(csv).toBe(
+      [
+        "id,project_id,task_id,task_title,event,actor,note,detail,created_at",
+        `1,${config.project_id},${taskId},'=Audit,handoff,be,"First, ""quoted""\r\n[REDACTED:github_token]","{""nested"":[{""password"":""[REDACTED:field]"",""[REDACTED:github_token]"":""example""}]}",${point}`,
+        "",
+      ].join("\r\n"),
+    );
+    await taskLog(service, taskId, { ...query, since: "29m", format: "csv" });
+    expect(stdout.mock.lastCall?.[0]).toBe(`${csv.split("\r\n")[0]}\r\n`);
+    stdout.mockRestore();
+    await expect(taskLog(service, taskId, { since: "yesterday" })).rejects.toThrow(/--since/);
+    await expect(taskLog(service, taskId, { format: "xml" })).rejects.toThrow(/format/);
+    await expect(taskLog(service, taskId, { format: "csv", json: true })).rejects.toThrow(/--json/);
   });
 
   it("mengelola permission lewat permissionList, permissionSet, permissionGrant, dan permissionRevoke", async () => {

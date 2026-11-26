@@ -1,7 +1,8 @@
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ConfigError, findProjectRoot, readConfig } from "../config.js";
 import { LocalService } from "../local-service.js";
+import type { McpRole } from "./catalog.js";
 import { createCatenextMcpServer, type ServerContext } from "./server.js";
+import { StdioServerTransport } from "./stdio.js";
 
 /**
  * Tentukan titik awal pencarian project. Fail closed: --root yang kosong atau tidak ter-expand
@@ -15,7 +16,7 @@ export function resolveStart(root: string | undefined, cwd: string): string | nu
 }
 
 /** stdout khusus protokol MCP. Muat config secara lazy agar tool memberi petunjuk bila belum init. */
-export async function runMcpServer(opts: { root?: string; version: string }) {
+export async function runMcpServer(opts: { root?: string; role?: McpRole; version: string }) {
   let cached: Promise<ServerContext> | undefined;
 
   const load = async (): Promise<ServerContext> => {
@@ -49,6 +50,7 @@ export async function runMcpServer(opts: { root?: string; version: string }) {
 
   const server = createCatenextMcpServer({
     version: opts.version,
+    role: opts.role,
     context: async () => {
       cached ??= load();
       const pending = cached;

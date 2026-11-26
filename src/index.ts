@@ -18,6 +18,7 @@ import {
   permissionList,
   permissionRevoke,
   permissionSet,
+  type TaskLogOptions,
   taskBlock,
   taskClaim,
   taskDone,
@@ -31,6 +32,7 @@ import { McpConfigError } from "./init/mcp-config.js";
 import { LocalServiceError } from "./local-service.js";
 import { PERMISSION_ACTIONS } from "./local-state.js";
 import { applyFileEdits, planRemove, planSync, summarize } from "./maintenance.js";
+import { MCP_ROLES, McpRoleSchema } from "./mcp/catalog.js";
 import { runMcpServer } from "./mcp/run.js";
 import { hasVersionedSegment, stableNodeCommand } from "./node-command.js";
 import {
@@ -429,9 +431,16 @@ program
   .command("log")
   .description("Tampilkan riwayat audit event task lokal")
   .argument("[task_id]", "Filter berdasarkan ID task (opsional)")
-  .option("-n, --limit <n>", "Jumlah maksimal event", (v) => Number.parseInt(v, 10), 20)
-  .option("--json", "Keluaran JSON")
-  .action((taskId: string | undefined, opts: { limit: number; json?: boolean }) =>
+  .option("-n, --limit <n>", "Jumlah maksimal event", Number, 20)
+  .option("--event <type>", "Filter jenis event (cocok persis)")
+  .option("--actor <actor>", "Filter pelaku (cocok persis)")
+  .option(
+    "--since <iso-or-relative>",
+    "Sejak timestamp ISO dengan zona waktu atau durasi (24h, 7d, 30m)",
+  )
+  .option("--format <table|json|csv>", "Format keluaran (default: table)")
+  .option("--json", "Keluaran JSON (alias --format json)")
+  .action((taskId: string | undefined, opts: TaskLogOptions) =>
     friendly(async () => taskLog(await cliService(), taskId, opts)),
   );
 
@@ -892,7 +901,7 @@ function confirm(question: string): Promise<boolean> {
 
 program
   .command("verify")
-  .description("Verifikasi config, state lokal, dan entri MCP")
+  .description("Verifikasi config, state, batas persetujuan, skill lokal, dan entri MCP")
   .option(...PLATFORM_OPT)
   .action((opts: PlatformOptions) =>
     friendly(async () => {
@@ -1003,7 +1012,18 @@ program
   .command("mcp")
   .description("Jalankan server MCP lokal (stdio)")
   .option("--root <path>", "Root repo (default: cari .catenext/config.yaml dari folder saat ini)")
-  .action((opts: { root?: string }) => runMcpServer({ root: opts.root, version: VERSION }));
+  .option("--role <role>", `Filter tool MCP per peran (${MCP_ROLES.join(" | ")})`, (v: string) => {
+    const parsed = McpRoleSchema.safeParse(v.trim());
+    if (!parsed.success) {
+      throw new InvalidArgumentError(
+        `Role tidak valid: ${JSON.stringify(v)}. Pilih: ${MCP_ROLES.join(", ")}.`,
+      );
+    }
+    return parsed.data;
+  })
+  .action((opts: { root?: string; role?: "orchestrator" | "worker" }) =>
+    runMcpServer({ root: opts.root, role: opts.role, version: VERSION }),
+  );
 
 program
   .command("config")

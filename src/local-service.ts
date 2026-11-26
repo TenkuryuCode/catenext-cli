@@ -7,6 +7,7 @@ import {
   briefText,
   type CatenextConfig,
   DOCUMENT_LIMITS,
+  type DocumentHeading,
   DocumentIndexEntrySchema,
   findCycle,
   GENERAL_RULES,
@@ -28,6 +29,7 @@ import {
   UpdateTaskInput,
 } from "@catenext/shared";
 import type { z } from "zod";
+import { HUMAN_APPROVAL_COMMANDS, requireHumanApproval } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { graphNeighbors, symbolSearch } from "./db/graph-index.js";
 import { LocalStore, newRootId } from "./db/store.js";
@@ -121,6 +123,57 @@ function recordIndex(doc: ProjectDocument) {
   return DocumentIndexEntrySchema.parse(doc);
 }
 
+function extractMarkdownOutline(content: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = [];
+  const lines = content.split(/\r?\n/);
+  let fence: { char: "`" | "~"; len: number } | null = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? "";
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1] ?? "```";
+      const char = marker[0] as "`" | "~";
+      if (!fence) fence = { char, len: marker.length };
+      else if (fence.char === char && marker.length >= fence.len) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const headingMatch = line.match(/^(#{1,6})(\s.*)$/);
+    if (!headingMatch) continue;
+    const hashes = headingMatch[1];
+    const title = headingMatch[2]?.trimEnd().replace(/\s#+$/, "").trim();
+    if (!hashes || !title) continue;
+    headings.push({ level: hashes.length, title, line: i + 1 });
+  }
+  return headings;
+}
+
+function extractMarkdownSection(
+  content: string,
+  sectionQuery: string,
+): { title: string; content: string; truncated: boolean } | null {
+  const headings = extractMarkdownOutline(content);
+  const needle = sectionQuery
+    .trim()
+    .replace(/^#{1,6}\s+/, "")
+    .toLowerCase();
+  if (!needle) return null;
+  const matched =
+    headings.find((h) => h.title.trim().toLowerCase() === needle) ??
+    headings.find((h) => h.title.trim().toLowerCase().includes(needle));
+  if (!matched) return null;
+  const nextHeading = headings.find((h) => h.line > matched.line && h.level <= matched.level);
+  const lines = content.split(/\r?\n/);
+  const startIdx = matched.line - 1;
+  const endIdx = nextHeading ? nextHeading.line - 1 : lines.length;
+  const slice = lines.slice(startIdx, endIdx).join("\n").trimEnd();
+  return {
+    title: matched.title,
+    content: slice,
+    truncated: slice.length < content.length,
+  };
+}
+
 /** Shared local orchestration boundary for standalone CLI and MCP processes. */
 export class LocalService {
   readonly stateFile: string;
@@ -148,6 +201,9 @@ export class LocalService {
       stack?: string[];
     } = {},
   ): Promise<void> {
+    if (this.caller === "agent") {
+      fail("permission_denied", "Inisialisasi proyek hanya lewat CLI manusia.");
+    }
     await this.store.transaction(
       this.config.project_id,
       this.config.repo_name,
@@ -638,6 +694,9 @@ export class LocalService {
       ];
       fail("invalid_input", `Input ${name} tidak valid: ${paths.join(", ")}.`, { fields: paths });
     }
+    if (name === "manage_task") {
+      requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
+    }
     const existed = existsSync(this.stateFile);
     const out = await this.store.transaction(
       this.config.project_id,
@@ -721,7 +780,7 @@ class LocalWorkflow {
     release_task: (input) => this.release(input),
     report_blocker: (input) => this.block(input),
     complete_handoff: (input) => this.handoff(input),
-    get_document: ({ slug }) => this.document(slug),
+    get_document: (input) => this.document(input),
     save_document: (input) => this.saveDocument(input),
     search_context: (input) => this.search(input),
     review_pull_request: ({ request }) => this.review(request),
@@ -987,8 +1046,7 @@ class LocalWorkflow {
       {
         id: "approve" as const,
         label: kind === "plan" ? "Approve plan" : "Approve handoff",
-        command_hint:
-          kind === "plan" ? `catenext task approve ${taskId}` : `catenext review approve ${taskId}`,
+        command_hint: `${HUMAN_APPROVAL_COMMANDS[kind === "plan" ? "approve_plan" : "approve"]} ${taskId}`,
       },
       {
         id: "revise" as const,
@@ -1217,6 +1275,29 @@ class LocalWorkflow {
     });
   }
 
+  private claimDependencyHandoffs(task: LocalTask, compact: boolean) {
+    if (!compact) return this.dependencyHandoffs(task);
+    return task.dependencies.flatMap((id) => {
+      const dep = this.tasks.get(id);
+      if (!dep?.handoff) return [];
+      const integrated =
+        dep.integrated_commit ??
+        (dep.handoff as { integrated_commit?: { branch: string; sha: string } }).integrated_commit;
+      return [
+        {
+          task_id: id,
+          title: dep.title,
+          compact_handoff: {
+            files_modified: dep.handoff.files_modified,
+            key_decisions: dep.handoff.key_decisions,
+            notes_for_next_agent: dep.handoff.notes_for_next_agent,
+          },
+          ...(integrated ? { integrated_commit: integrated } : {}),
+        },
+      ];
+    });
+  }
+
   private async context(
     input: Parsed<"get_project_context">,
   ): Promise<McpToolOutput<"get_project_context">> {
@@ -1396,7 +1477,7 @@ class LocalWorkflow {
       ...(persona ? { persona } : {}),
       lease_id: leaseId,
       lease_expires_at: expiry,
-      dependencies: this.dependencyHandoffs(task),
+      dependencies: this.claimDependencyHandoffs(task, Boolean(input.compact)),
       ...(revision ? { revision } : {}),
       warnings: [],
     };
@@ -1532,16 +1613,6 @@ class LocalWorkflow {
   }
 
   private manageTask(input: Parsed<"manage_task">): McpToolOutput<"manage_task"> {
-    // Persetujuan rencana/hasil hanya milik manusia; agen MCP tidak boleh meloloskan task sendiri.
-    if (
-      this.caller === "agent" &&
-      (input.action === "approve" || input.action === "approve_plan")
-    ) {
-      fail(
-        "human_approval_required",
-        `Aksi ${input.action} hanya lewat CLI manusia (catenext task approve). Agen MCP tidak boleh menyetujui.`,
-      );
-    }
     const task = this.task(input.task_id);
     const fromStatus = task.status;
     let stale: string[] = [];
@@ -1630,11 +1701,33 @@ class LocalWorkflow {
     };
   }
 
-  private document(slug: string): ProjectDocument {
-    return (
-      this.project.documents.find((doc) => doc.slug === slug) ??
-      fail("not_found", `Dokumen "${slug}" tidak ditemukan di proyek ini.`)
-    );
+  private document(input: Parsed<"get_document">): McpToolOutput<"get_document"> {
+    const doc =
+      this.project.documents.find((row) => row.slug === input.slug) ??
+      fail("not_found", `Dokumen "${input.slug}" tidak ditemukan di proyek ini.`);
+    if (input.outline_only) {
+      return {
+        ...doc,
+        content: "",
+        outline: extractMarkdownOutline(doc.content),
+        truncated: doc.content.length > 0,
+      };
+    }
+    if (input.section !== undefined) {
+      const matched = extractMarkdownSection(doc.content, input.section);
+      if (!matched) {
+        fail("not_found", `Bagian "${input.section}" tidak ditemukan di dokumen "${input.slug}".`, {
+          outline: extractMarkdownOutline(doc.content),
+        });
+      }
+      return {
+        ...doc,
+        content: matched.content,
+        section: matched.title,
+        truncated: matched.truncated,
+      };
+    }
+    return doc;
   }
 
   private saveDocument(input: Parsed<"save_document">): McpToolOutput<"save_document"> {
@@ -1838,6 +1931,7 @@ class LocalWorkflow {
         },
       });
     }
+    // A reviewer recommendation is not an approval; only the human manage_task path can set DONE.
     review.decision = { value: input.decision, reviewer, feedback: input.feedback };
     review.updatedAt = this.iso;
     this.dirty();

@@ -356,7 +356,9 @@ describe("LocalService approval gate", () => {
     const { id } = await draft([plan("gated")]);
     await expect(manage("approve_plan", id("gated"), {}, agent)).rejects.toMatchObject({
       code: "human_approval_required",
+      message: expect.stringContaining(`catenext task approve ${id("gated")}`),
     });
+    expect(await service.readTaskEvents({ taskId: id("gated") })).toEqual([]);
     await manage("approve_plan", id("gated"));
     const { lease_id } = await service.callTool("claim_task", { task_id: id("gated") });
     await service.callTool("complete_handoff", {
@@ -366,7 +368,9 @@ describe("LocalService approval gate", () => {
     });
     await expect(manage("approve", id("gated"), {}, agent)).rejects.toMatchObject({
       code: "human_approval_required",
+      message: expect.stringContaining(`catenext review approve ${id("gated")}`),
     });
+    expect(await service.readTaskEvents({ taskId: id("gated"), event: "approve" })).toEqual([]);
     expect(await service.callTool("get_project_board", {})).toMatchObject({
       tasks: [{ id: id("gated"), status: "NEEDS_REVIEW" }],
     });
@@ -419,6 +423,20 @@ describe("LocalService approval gate", () => {
     } finally {
       await rm(extDir, { recursive: true, force: true });
     }
+  });
+
+  it("denies agent attempts to reseed project state or change permissions", async () => {
+    const agent = new LocalService(root, config, "agent");
+    await expect(agent.ensureSeed()).rejects.toMatchObject({ code: "permission_denied" });
+    await expect(agent.setPermissions("manage_roots", ["orchestrator"])).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    await expect(agent.grantPermission("approve_plan", "human")).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    await expect(agent.revokePermission("approve_plan", "human")).rejects.toMatchObject({
+      code: "permission_denied",
+    });
   });
 
   it("manage_roots menolak path hilang, file biasa, dan symlink", async () => {
@@ -703,8 +721,9 @@ describe("LocalService reviews and context", () => {
     });
     const { id } = await draft([plan("pr")]);
     const task_id = id("pr");
+    const agent = new LocalService(root, config, "agent");
     const review = (request: Record<string, unknown>) =>
-      service.callTool("review_pull_request", { request: { task_id, ...request } });
+      agent.callTool("review_pull_request", { request: { task_id, ...request } });
     const pr = {
       url: "https://github.com/example/repo/pull/42",
       head_sha: heads.current,
@@ -787,6 +806,7 @@ describe("LocalService reviews and context", () => {
         feedback: "Looks good",
       }),
     ).toMatchObject({ status: "NEEDS_REVIEW", review: { stage: "awaiting_human_approval" } });
+    expect(await service.readTaskEvents({ taskId: task_id, event: "approve" })).toEqual([]);
     expect(await manage("approve", task_id)).toMatchObject({ status: "DONE" });
     expect(await review({ action: "refresh" })).toMatchObject({
       status: "DONE",
@@ -1262,5 +1282,151 @@ describe("LocalService state persistence", () => {
     await expect(agent.setTaskDependencies(id("a"), { depends_on: [] })).rejects.toMatchObject({
       code: "permission_denied",
     });
+  });
+
+  it("preserves literal trailing hashes in outlines and exact section lookups", async () => {
+    await service.callTool("save_document", {
+      slug: "language-guide",
+      title: "Language Guide",
+      kind: "architecture",
+      content: [
+        "## C# setup",
+        "Setup details.",
+        "## C#",
+        "Language details.",
+        "## F# ###  ",
+        "More details.",
+        "## Usage ###",
+        "## Notes##",
+      ].join("\n"),
+    });
+
+    const outline = await service.callTool("get_document", {
+      slug: "language-guide",
+      outline_only: true,
+    });
+    expect(outline.outline).toEqual([
+      { level: 2, title: "C# setup", line: 1 },
+      { level: 2, title: "C#", line: 3 },
+      { level: 2, title: "F#", line: 5 },
+      { level: 2, title: "Usage", line: 7 },
+      { level: 2, title: "Notes##", line: 8 },
+    ]);
+
+    await expect(
+      service.callTool("get_document", { slug: "language-guide", section: "C#" }),
+    ).resolves.toMatchObject({ section: "C#", content: "## C#\nLanguage details." });
+    await expect(
+      service.callTool("get_document", { slug: "language-guide", section: "F#" }),
+    ).resolves.toMatchObject({ section: "F#", content: "## F# ###  \nMore details." });
+  });
+
+  it("supports outline_only and section extraction in get_document and compact delta handoffs in claim_task", async () => {
+    const markdown = [
+      "# Architecture",
+      "",
+      "High-level overview.",
+      "",
+      "```md",
+      "# Not a real heading",
+      "```",
+      "",
+      "## Auth Flow",
+      "",
+      "Uses JWT tokens.",
+      "",
+      "### Refresh Tokens",
+      "",
+      "Rotate every 7 days.",
+      "",
+      "## Database",
+      "",
+      "SQLite WAL mode.",
+    ].join("\n");
+
+    await service.callTool("save_document", {
+      slug: "arch-doc",
+      title: "Architecture",
+      kind: "architecture",
+      content: markdown,
+    });
+
+    const outlineDoc = await service.callTool("get_document", {
+      slug: "arch-doc",
+      outline_only: true,
+    });
+    expect(outlineDoc.content).toBe("");
+    expect(outlineDoc.truncated).toBe(true);
+    expect(outlineDoc.outline).toEqual([
+      { level: 1, title: "Architecture", line: 1 },
+      { level: 2, title: "Auth Flow", line: 9 },
+      { level: 3, title: "Refresh Tokens", line: 13 },
+      { level: 2, title: "Database", line: 17 },
+    ]);
+
+    const authSection = await service.callTool("get_document", {
+      slug: "arch-doc",
+      section: "auth flow",
+    });
+    expect(authSection.section).toBe("Auth Flow");
+    expect(authSection.truncated).toBe(true);
+    expect(authSection.content).toContain("## Auth Flow");
+    expect(authSection.content).toContain("### Refresh Tokens");
+    expect(authSection.content).not.toContain("## Database");
+    expect(authSection.content.length).toBeLessThan(markdown.length);
+
+    await expect(
+      service.callTool("get_document", { slug: "arch-doc", section: "Missing" }),
+    ).rejects.toMatchObject({ code: "not_found" });
+
+    // Compact delta handoffs in claim_task vs full default + on-demand lookup via get_project_context
+    const { id } = await draft([plan("dep"), plan("main", { depends_on: ["dep"] })]);
+    await manage("approve_plan", id("dep"));
+    await manage("approve_plan", id("main"));
+    const depClaim = await service.callTool("claim_task", { task_id: id("dep") });
+    await service.callTool("complete_handoff", {
+      task_id: id("dep"),
+      lease_id: depClaim.lease_id,
+      handoff_summary: handoff({
+        files_modified: ["src/auth.ts"],
+        key_decisions: ["Use JWT"],
+        verification_command: "pnpm test",
+        notes_for_next_agent: "Auth middleware ready.",
+      }),
+    });
+    await manage("approve", id("dep"));
+
+    const compactClaim = await service.callTool("claim_task", {
+      task_id: id("main"),
+      compact: true,
+    });
+    expect(compactClaim.dependencies).toHaveLength(1);
+    expect(compactClaim.dependencies[0]?.handoff_summary).toBeUndefined();
+    expect(compactClaim.dependencies[0]?.compact_handoff).toEqual({
+      files_modified: ["src/auth.ts"],
+      key_decisions: ["Use JWT"],
+      notes_for_next_agent: "Auth middleware ready.",
+    });
+
+    // On-demand full lookup via get_project_context with active lease_id
+    const fullCtx = await service.callTool("get_project_context", {
+      lease_id: compactClaim.lease_id,
+    });
+    expect(fullCtx.recent_handoffs[0]?.handoff_summary).toMatchObject({
+      git_branch: "feat/local",
+      verification_command: "pnpm test",
+    });
+
+    // Backward-compatible default (compact omitted) returns full handoff_summary
+    await service.callTool("release_task", {
+      task_id: id("main"),
+      lease_id: compactClaim.lease_id,
+    });
+    const fullClaim = await service.callTool("claim_task", { task_id: id("main") });
+    expect(fullClaim.dependencies[0]?.handoff_summary).toMatchObject({
+      git_branch: "feat/local",
+      verification_command: "pnpm test",
+    });
+    expect(fullClaim.dependencies[0]?.compact_handoff).toBeUndefined();
   });
 });

@@ -34,6 +34,25 @@ describe("skills lokal", () => {
     expect((await loadSkill(root, "a")).content).toBe("dua");
   });
 
+  it("blocks loading or saving recognized credentials and omits YAML source from diagnostics", async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-skills-"));
+    const saved = await saveSkill(root, {
+      name: "api",
+      when_to_use: "API work",
+      content: "Run tests.",
+    });
+    const fixture = `ghp_${"X".repeat(24)}`;
+    await writeFile(join(root, saved.path), renderSkill({ ...saved.skill, content: fixture }));
+    await expect(loadSkill(root, "api")).rejects.toThrow(/potensi secret/);
+    await expect(
+      saveSkill(root, { name: "api", when_to_use: "API work", content: fixture }),
+    ).rejects.toThrow(/potensi secret/);
+    await writeFile(join(root, saved.path), `---\nname: [${fixture}\n---\nContent`);
+    const { invalid } = await listSkills(root);
+    expect(invalid).toEqual([{ file: "api.md", error: "api.md: frontmatter bukan YAML valid." }]);
+    expect(JSON.stringify(invalid)).not.toContain(fixture);
+  });
+
   it("menolak nama yang mencoba keluar dari folder skills", async () => {
     root = await mkdtemp(join(tmpdir(), "catenext-skills-"));
     await expect(loadSkill(root, "../config")).rejects.toThrow(/tidak valid/);

@@ -23,6 +23,10 @@ export interface TaskEventRecord {
 
 export interface ReadTaskEventsOptions {
   taskId?: string;
+  event?: string;
+  actor?: string;
+  /** Inclusive lower bound, normalized to UTC ISO timestamp by the caller. */
+  since?: string;
   limit?: number;
 }
 
@@ -55,31 +59,29 @@ export function queryTaskEvents(
   options: ReadTaskEventsOptions = {},
 ): TaskEventRecord[] {
   const limit = Math.max(1, Math.min(200, options.limit ?? 20));
-  const rows = (
-    options.taskId
-      ? db
-          .prepare(
-            `SELECT e.id, e.project_id, e.task_id, t.title AS task_title,
-                    e.event, e.actor, e.note, e.detail_json, e.created_at
-             FROM task_events e
-             LEFT JOIN tasks t ON t.project_id = e.project_id AND t.id = e.task_id
-             WHERE e.project_id = ? AND e.task_id = ?
-             ORDER BY e.created_at DESC, e.id DESC
-             LIMIT ?`,
-          )
-          .all(projectId, options.taskId, limit)
-      : db
-          .prepare(
-            `SELECT e.id, e.project_id, e.task_id, t.title AS task_title,
-                    e.event, e.actor, e.note, e.detail_json, e.created_at
-             FROM task_events e
-             LEFT JOIN tasks t ON t.project_id = e.project_id AND t.id = e.task_id
-             WHERE e.project_id = ?
-             ORDER BY e.created_at DESC, e.id DESC
-             LIMIT ?`,
-          )
-          .all(projectId, limit)
-  ) as Array<{
+  const where = ["e.project_id = ?"];
+  const params: Array<string | number> = [projectId];
+  for (const [condition, value] of [
+    ["e.task_id = ?", options.taskId],
+    ["e.event = ?", options.event],
+    ["e.actor = ?", options.actor],
+    ["e.created_at >= ?", options.since],
+  ] as const) {
+    if (value === undefined) continue;
+    where.push(condition);
+    params.push(value);
+  }
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.project_id, e.task_id, t.title AS task_title,
+              e.event, e.actor, e.note, e.detail_json, e.created_at
+       FROM task_events e
+       LEFT JOIN tasks t ON t.project_id = e.project_id AND t.id = e.task_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY e.created_at DESC, e.id DESC
+       LIMIT ?`,
+    )
+    .all(...params, limit) as Array<{
     id: number;
     project_id: string;
     task_id: string;

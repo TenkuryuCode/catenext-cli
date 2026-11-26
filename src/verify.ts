@@ -1,6 +1,8 @@
 import { lstat } from "node:fs/promises";
-import type { CatenextConfig, PlatformId } from "@catenext/shared";
+import { type CatenextConfig, type PlatformId, TASK_EVENT_ACTOR } from "@catenext/shared";
+import type { HUMAN_APPROVAL_COMMANDS } from "./approval-policy.js";
 import { configuredPlatforms, isMissingFile, stateFilePath } from "./config.js";
+import { openDatabaseAt } from "./db/open.js";
 import {
   entryMatchesRoot,
   inspectMcp,
@@ -9,12 +11,73 @@ import {
   WINDSURF_UNSUPPORTED,
 } from "./init/mcp-config.js";
 import { readRepoFile } from "./init/repo-files.js";
+import { PERMISSION_ACTIONS } from "./local-state.js";
 import { entryIsStale } from "./maintenance.js";
+import { listSkills, SKILLS_DIR } from "./skills.js";
 
 export interface CheckLine {
   ok: boolean;
   label: string;
   hint?: string;
+}
+
+const APPROVAL_EVENTS = [
+  "approve_plan",
+  "approve",
+] as const satisfies readonly (keyof typeof HUMAN_APPROVAL_COMMANDS)[];
+
+function verifyApprovalState(state: string, projectId: string): CheckLine[] {
+  const label = "Matriks izin dan aktor persetujuan";
+  try {
+    // No migrations or repairs during verify. Only look at this project in shared state.
+    const db = openDatabaseAt(state, { readOnly: true });
+    try {
+      const placeholders = PERMISSION_ACTIONS.map(() => "?").join(", ");
+      const invalidPermission = db
+        .prepare(
+          `SELECT 1 FROM permissions WHERE project_id = ? AND
+          (action NOT IN (${placeholders}) OR trim(principal) = '' OR
+           (action = 'approve_plan' AND principal <> 'human')) LIMIT 1`,
+        )
+        .get(projectId, ...PERMISSION_ACTIONS);
+      const hasEvents = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events'")
+        .get();
+      const invalidActor =
+        hasEvents &&
+        db
+          .prepare(
+            "SELECT 1 FROM task_events WHERE project_id = ? AND event IN (?, ?) AND actor <> 'human' LIMIT 1",
+          )
+          .get(projectId, ...APPROVAL_EVENTS);
+      const lines: CheckLine[] = [];
+      if (invalidPermission) {
+        lines.push({
+          ok: false,
+          label,
+          hint: "Aturan izin tidak valid. Periksa `catenext permission list`; approve_plan hanya menerima principal human.",
+        });
+      }
+      if (invalidActor) {
+        lines.push({
+          ok: false,
+          label,
+          hint: "Audit berisi persetujuan dengan aktor selain human. Periksa event approve_plan dan approve.",
+        });
+      }
+      return lines.length ? lines : [{ ok: true, label }];
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [
+      {
+        ok: false,
+        label,
+        hint: "Tidak dapat membaca matriks izin dan audit SQLite tanpa mengubah state.",
+      },
+    ];
+  }
 }
 
 /** Verify local configuration and server launch mapping without starting any process. */
@@ -40,9 +103,25 @@ export async function verifySetup(
       label: `File state lokal: ${state}`,
       hint,
     });
+    if (regular && modeOk) lines.push(...verifyApprovalState(state, config.project_id));
   } catch (error) {
     if (!isMissingFile(error)) throw error;
     lines.push({ ok: true, label: `State belum dibuat: ${state}` });
+  }
+  const humanActors = APPROVAL_EVENTS.every((event) => TASK_EVENT_ACTOR[event] === "human");
+  lines.push({
+    ok: humanActors,
+    label: "Batas aktor persetujuan: CLI manusia",
+    hint: humanActors ? undefined : "approve_plan dan approve harus memakai aktor human.",
+  });
+  const { skills, invalid } = await listSkills(root);
+  if (invalid.length === 0) {
+    lines.push({ ok: true, label: `Skill lokal valid: ${skills.length}` });
+  } else {
+    for (const { file, error } of invalid) {
+      const path = file === SKILLS_DIR ? file : `${SKILLS_DIR}/${file}`;
+      lines.push({ ok: false, label: `Skill lokal: ${path}`, hint: error });
+    }
   }
   if (platforms.includes("windsurf"))
     lines.push({ ok: false, label: "Windsurf", hint: WINDSURF_UNSUPPORTED });

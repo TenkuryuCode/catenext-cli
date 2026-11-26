@@ -1,6 +1,6 @@
 {
   "name": "catenext",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Estafet task & konteks antar-agen AI coding (Claude Code, Cursor, Codex, ...) lewat MCP lokal",
   "keywords": [
     "mcp",
@@ -43,21 +43,19 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
-  "dependencies": {
+  "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@types/node": "^22.20.5",
     "commander": "^15.1.0",
     "diff": "^9.0.0",
+    "esbuild": "0.28.2",
     "jsonc-parser": "^3.3.1",
     "toml-eslint-parser": "^1.0.3",
-    "yaml": "^2.9.1",
-    "zod": "^4.6.7"
-  },
-  "devDependencies": {
-    "@types/node": "^22.20.5",
-    "esbuild": "0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
-    "vitest": "^5.1.1"
+    "vitest": "^5.1.1",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
   },
   "packageManager": "pnpm@12.23.0+sha512.02da94ffaf133f46074322afe552f90d40b5f71ae259aefbccdacc5085b1d617e98d65e0131f5748b9b67445978ee5055d7d59a473f1eef0d504854fefcd5975"
 }

@@ -21,6 +21,7 @@ import type { LocalTask } from "../local-state.js";
 import { openDatabaseAt } from "./open.js";
 import { loadDocument, loadTask, saveDocumentRow, saveTask } from "./project-codec.js";
 import { LocalStore } from "./store.js";
+import { insertTaskEvents } from "./task-events.js";
 
 let dir: string;
 let dbPath: string;
@@ -475,6 +476,40 @@ describe("LocalStore read-only queries & partial diff persistence", () => {
     expect(finalProject.tasks.map((t) => t.id)).toEqual([t1, t2]);
     expect(finalProject.session_prefs).toEqual({ locale: "id" });
     expect(finalProject.platform_setup?.sort()).toEqual(["codex", "cursor"]);
+  });
+
+  it("combines audit filters before limiting and keeps project isolation", async () => {
+    const db = openDatabaseAt(dbPath);
+    const taskId = randomUUID();
+    const otherProject = randomUUID();
+    const cutoff = "2026-01-02T00:00:00.000Z";
+    const matching = { task_id: taskId, event: "approve", actor: "human", created_at: cutoff };
+    try {
+      const addProject = db.prepare("INSERT INTO projects (id, created_at) VALUES (?, ?)");
+      addProject.run(projectId, cutoff);
+      addProject.run(otherProject, cutoff);
+      insertTaskEvents(db, projectId, [
+        { ...matching, created_at: "2026-01-01T23:59:59.999Z", note: "too old" },
+        { ...matching, note: "first" },
+        { ...matching, note: "last" },
+        { ...matching, actor: "agent" },
+        { ...matching, event: "approve_plan" },
+        { ...matching, task_id: randomUUID() },
+      ]);
+      insertTaskEvents(db, otherProject, [{ ...matching, note: "other project" }]);
+    } finally {
+      db.close();
+    }
+    const store = new LocalStore(dbPath);
+    const filters = { taskId, event: "approve", actor: "human", since: cutoff };
+    expect((await store.readTaskEvents(projectId, filters)).map((row) => row.note)).toEqual([
+      "last",
+      "first",
+    ]);
+    expect(await store.readTaskEvents(projectId, { ...filters, limit: 1 })).toMatchObject([
+      { task_id: taskId, task_title: null, note: "last" },
+    ]);
+    expect(await store.readTaskEvents(projectId, { event: "missing" })).toEqual([]);
   });
 
   it("handles LocalServiceError cleanly when DB path is invalid", () => {

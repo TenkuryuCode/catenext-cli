@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -12,6 +12,9 @@ import {
   skillPath,
 } from "@catenext/shared";
 import { parse, stringify } from "yaml";
+import { isMissingFile } from "./config.js";
+import { readRepoFile } from "./init/repo-files.js";
+import { scrubText } from "./scrubber.js";
 
 /** Repository skills live in Markdown files; the index exposes only names and usage hints. */
 export const SKILLS_DIR = join(".catenext", "skills");
@@ -44,8 +47,8 @@ export function parseSkill(source: string, fileName: string): Skill {
   let raw: unknown;
   try {
     raw = parse(m[1] ?? "");
-  } catch (err) {
-    throw new SkillError(`${fileName}: frontmatter bukan YAML valid: ${(err as Error).message}`);
+  } catch {
+    throw new SkillError(`${fileName}: frontmatter bukan YAML valid.`);
   }
   const fm = SkillFrontmatterSchema.safeParse(raw);
   if (!fm.success) {
@@ -64,27 +67,79 @@ export function renderSkill(skill: Skill): string {
   return `---\n${fm}\n---\n\n${skill.content.trim()}\n`;
 }
 
+function checkSkill(source: string, file: string, skill: Skill): void {
+  if (`${skill.name}.md` !== file) {
+    throw new SkillError(`${file}: name harus sama dengan nama file.`);
+  }
+  const body = SkillContentSchema.safeParse(skill.content);
+  if (!body.success)
+    throw new SkillError(`${file}: ${body.error.issues.map((i) => i.message).join("; ")}.`);
+  if (scrubText(source) !== source) {
+    throw new SkillError(`${file}: potensi secret; hapus nilainya dan rujuk path saja.`);
+  }
+}
+
+async function skillDirectoryExists(root: string): Promise<boolean> {
+  try {
+    for (const path of [".catenext", SKILLS_DIR]) {
+      if (!(await lstat(join(root, path))).isDirectory()) {
+        throw new SkillError(`${path}: harus folder biasa, bukan symlink.`);
+      }
+    }
+    return true;
+  } catch (error) {
+    if (isMissingFile(error)) return false;
+    throw error;
+  }
+}
+
 /** Semua skill valid di repo. File rusak dilewati dan dilaporkan lewat `invalid`. */
 export async function listSkills(
   root: string,
 ): Promise<{ skills: Skill[]; invalid: { file: string; error: string }[] }> {
-  let files: string[];
-  try {
-    files = await readdir(join(root, SKILLS_DIR));
-  } catch {
-    return { skills: [], invalid: [] };
-  }
   const skills: Skill[] = [];
   const invalid: { file: string; error: string }[] = [];
+  let files: string[];
+  try {
+    if (!(await skillDirectoryExists(root))) return { skills, invalid };
+    files = await readdir(join(root, SKILLS_DIR));
+  } catch {
+    return {
+      skills,
+      invalid: [{ file: SKILLS_DIR, error: "Folder skill tidak dapat dibaca dengan aman." }],
+    };
+  }
+  const candidates: { file: string; source: string; skill: Skill }[] = [];
+  const nameCounts = new Map<string, number>();
   for (const file of files.filter((f) => f.endsWith(".md")).sort()) {
+    const label = scrubText(file);
     try {
-      const skill = parseSkill(await readFile(join(root, SKILLS_DIR, file), "utf8"), file);
-      if (`${skill.name}.md` !== file) {
-        throw new SkillError(`${file}: name "${skill.name}" harus sama dengan nama file.`);
-      }
-      skills.push(skill);
-    } catch (err) {
-      invalid.push({ file, error: (err as Error).message });
+      const source = await readRepoFile(root, join(SKILLS_DIR, file));
+      if (source === null) throw new SkillError(`${label}: file tidak ditemukan.`);
+      const skill = parseSkill(source, label);
+      nameCounts.set(skill.name, (nameCounts.get(skill.name) ?? 0) + 1);
+      candidates.push({ file, source, skill });
+    } catch (error) {
+      invalid.push({
+        file: label,
+        error:
+          error instanceof SkillError
+            ? error.message
+            : `${label}: file skill tidak dapat dibaca dengan aman.`,
+      });
+    }
+  }
+  for (const { file, source, skill } of candidates) {
+    const label = scrubText(file);
+    if ((nameCounts.get(skill.name) ?? 0) > 1) {
+      invalid.push({ file: label, error: `${label}: name duplikat.` });
+    }
+    try {
+      checkSkill(source, label, skill);
+      if (nameCounts.get(skill.name) === 1) skills.push(skill);
+    } catch (error) {
+      if (!(error instanceof SkillError)) throw error;
+      invalid.push({ file: label, error: error.message });
     }
   }
   return { skills, invalid };
@@ -112,18 +167,18 @@ export async function loadSkill(root: string, name: string, revision?: string): 
       );
     }
     const skill = parseSkill(source, file);
-    if (skill.name !== name) throw new SkillError(`${file}: name harus sama dengan nama file.`);
+    checkSkill(source, file, skill);
     return skill;
   }
-  let source: string;
-  try {
-    source = await readFile(join(root, SKILLS_DIR, file), "utf8");
-  } catch {
+  const source = await readRepoFile(root, join(SKILLS_DIR, file));
+  if (source === null) {
     const { skills } = await listSkills(root);
     const names = skills.map((s) => s.name).join(", ") || "(belum ada)";
     throw new SkillError(`Skill "${name}" tidak ada. Skill tersedia: ${names}.`);
   }
-  return parseSkill(source, file);
+  const skill = parseSkill(source, file);
+  checkSkill(source, file, skill);
+  return skill;
 }
 
 /** Write a repository skill atomically (temporary file and rename). */
@@ -138,21 +193,21 @@ export async function saveSkill(
   if (!when || when.length > SKILL_LIMITS.maxWhenToUseLength) {
     throw new SkillError(`when_to_use wajib, maks ${SKILL_LIMITS.maxWhenToUseLength} karakter.`);
   }
-  const dir = join(root, SKILLS_DIR);
-  await mkdir(dir, { recursive: true });
-  const target = join(dir, `${name}.md`);
-  let created = true;
-  try {
-    await readFile(target);
-    created = false;
-  } catch {}
+  const file = `${name}.md`;
   const skill: Skill = { name, when_to_use: when, updated_at: now.toISOString(), content };
+  const source = renderSkill(skill);
+  checkSkill(source, file, skill);
+  const dir = join(root, SKILLS_DIR);
+  if (!(await skillDirectoryExists(root))) await mkdir(dir, { recursive: true });
+  const path = join(SKILLS_DIR, file);
+  const target = join(root, path);
+  const created = (await readRepoFile(root, path)) === null;
   const tmp = `${target}.${randomUUID()}.tmp`;
   try {
-    await writeFile(tmp, renderSkill(skill), { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await writeFile(tmp, source, { encoding: "utf8", flag: "wx", mode: 0o600 });
     await rename(tmp, target);
   } finally {
     await rm(tmp, { force: true });
   }
-  return { path: join(SKILLS_DIR, `${name}.md`), created, skill };
+  return { path, created, skill };
 }

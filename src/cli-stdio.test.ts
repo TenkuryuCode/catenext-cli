@@ -204,6 +204,15 @@ describe("CLI dan MCP stdio lokal", () => {
       const [first, second] = created;
       if (!first || !second) throw new Error("Expected two tasks");
       expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
+      const planDenied = await client.callTool({
+        name: "manage_task",
+        arguments: { action: "approve_plan", task_id: first.task_id },
+      });
+      expect(planDenied.isError).toBe(true);
+      expect(planDenied.content).toContainEqual({
+        type: "text",
+        text: expect.stringContaining(`catenext task approve ${first.task_id}`),
+      });
       expect(cliJson("manage_task", ["task", "approve", first.task_id]).status).toBe("TODO");
       expect(cliJson("manage_task", ["task", "approve", second.task_id]).status).toBe("TODO");
       const firstClaim = cliJson("claim_task", ["claim", first.task_id]);
@@ -231,6 +240,16 @@ describe("CLI dan MCP stdio lokal", () => {
           `STRIPE_SECRET=${secret}`,
         ]).status,
       ).toBe("NEEDS_REVIEW");
+      expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
+      const reviewDenied = await client.callTool({
+        name: "manage_task",
+        arguments: { action: "approve", task_id: first.task_id },
+      });
+      expect(reviewDenied.isError).toBe(true);
+      expect(reviewDenied.content).toContainEqual({
+        type: "text",
+        text: expect.stringContaining(`catenext review approve ${first.task_id}`),
+      });
       expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
       expect(cliJson("manage_task", ["review", "approve", first.task_id]).status).toBe("DONE");
       const next = await mcp(client, "claim_task", { task_id: second.task_id });
@@ -261,6 +280,23 @@ describe("CLI dan MCP stdio lokal", () => {
         "claim",
         "approve_plan",
       ]);
+      const logFilters = [
+        "log",
+        first.task_id,
+        "--event",
+        "approve",
+        "--actor",
+        "human",
+        "--since",
+        "24h",
+      ];
+      const filtered = JSON.parse(cli([...logFilters, "--format", "json"])) as typeof logOut;
+      expect(filtered.events.map((e) => e.event)).toEqual(["approve"]);
+      expect(JSON.parse(cli([...logFilters, "--json"]))).toEqual(filtered);
+      const [header, row, end] = cli([...logFilters, "--format", "csv"]).split("\r\n");
+      expect(header).toContain("event,actor");
+      expect(row).toContain(",approve,human,");
+      expect(end).toBe("");
       expect(stderr).toContain("[catenext]");
     } finally {
       await client.close();

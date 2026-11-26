@@ -56,7 +56,28 @@ export const SaveDocumentInput = z.object({
 });
 export type SaveDocumentInputType = z.infer<typeof SaveDocumentInput>;
 
-export const GetDocumentInput = z.object({ slug: DocumentSlugSchema });
+export const DocumentHeadingSchema = z.object({
+  level: z.number().int().min(1).max(6),
+  title: z.string(),
+  line: z.number().int().min(1),
+});
+export type DocumentHeading = z.infer<typeof DocumentHeadingSchema>;
+
+export const GetDocumentInput = z.object({
+  slug: DocumentSlugSchema,
+  /** Kembalikan hanya daftar heading Markdown tanpa isi lengkap. */
+  outline_only: z.boolean().optional(),
+  /** Kembalikan hanya bagian Markdown yang cocok dengan judul heading ini. */
+  section: z.string().trim().min(1).max(200).optional(),
+});
+
+export const GetDocumentOutput = ProjectDocumentSchema.extend({
+  outline: z.array(DocumentHeadingSchema).optional(),
+  section: z.string().optional(),
+  truncated: z.boolean().optional(),
+});
+export type GetDocumentOutputType = z.infer<typeof GetDocumentOutput>;
+
 export const SaveDocumentOutput = z.object({
   document: DocumentIndexEntrySchema,
   created: z.boolean(),

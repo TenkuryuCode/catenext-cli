@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { CatenextConfigSchema, type PlatformId } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { stateFilePath } from "./config.js";
+import { openDatabaseAt } from "./db/open.js";
+import { insertTaskEvents } from "./db/task-events.js";
 import { applyInit, planInit } from "./init/index.js";
 import { entryMatchesRoot, selectedAdapters, WINDSURF_UNSUPPORTED } from "./init/mcp-config.js";
+import { renderSkill } from "./skills.js";
 import { formatChecks, verifySetup } from "./verify.js";
 
 const CLAUDE_ROOT_TOKEN = "$" + "{CLAUDE_PROJECT_DIR}";
@@ -94,6 +97,75 @@ describe("verifySetup", () => {
     const ok = await verifySetup(root, config, []);
     const okState = ok.find((l) => l.label === `File state lokal: ${state}`);
     expect(okState).toEqual({ ok: true, label: `File state lokal: ${state}`, hint: undefined });
+  });
+
+  it("flags invalid approval grants and audit actors only in the configured project", async () => {
+    const config = makeConfig([]);
+    const state = stateFilePath(root, config);
+    await mkdir(join(state, ".."), { recursive: true });
+    const db = openDatabaseAt(state);
+    const project = config.project_id;
+    const other = randomUUID();
+    const created_at = "2026-01-02T00:00:00.000Z";
+    const approval = { task_id: randomUUID(), event: "approve", created_at, actor: "human" };
+    try {
+      const addProject = db.prepare("INSERT INTO projects (id, created_at) VALUES (?, ?)");
+      addProject.run(project, created_at);
+      addProject.run(other, created_at);
+      const grant = db.prepare(
+        "INSERT INTO permissions (project_id, action, principal) VALUES (?, ?, ?)",
+      );
+      grant.run(project, "approve_plan", "human");
+      grant.run(other, "approve_plan", "orchestrator");
+      insertTaskEvents(db, project, [approval]);
+      insertTaskEvents(db, other, [{ ...approval, actor: "agent" }]);
+      expect((await verifySetup(root, config)).every(({ ok }) => ok)).toBe(true);
+
+      grant.run(project, "approve_plan", "orchestrator");
+      insertTaskEvents(db, project, [{ ...approval, actor: "agent" }]);
+      const label = "Matriks izin dan aktor persetujuan";
+      const failures = (await verifySetup(root, config)).filter((check) => !check.ok);
+      expect(failures).toEqual([
+        { ok: false, label, hint: expect.stringContaining("Aturan izin tidak valid") },
+        { ok: false, label, hint: expect.stringContaining("aktor selain human") },
+      ]);
+      expect(
+        db.prepare("SELECT count(*) AS count FROM permissions WHERE project_id = ?").get(project),
+      ).toMatchObject({ count: 2 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reports skill hygiene failures without exposing fixture secrets", async () => {
+    const config = makeConfig([]);
+    const fixture = `ghp_${"X".repeat(24)}`;
+    const good = {
+      name: "guide",
+      when_to_use: "When writing tests",
+      updated_at: "2026-01-02T00:00:00.000Z",
+      content: "Run tests.",
+    };
+    await writeRepo(".catenext/skills/guide.md", renderSkill(good));
+    await writeRepo(".catenext/skills/duplicate.md", renderSkill(good));
+    await writeRepo(".catenext/skills/missing.md", renderSkill(good).replace(/^name: .*\n/m, ""));
+    await writeRepo(".catenext/skills/raw.md", "No frontmatter");
+    await writeRepo(
+      ".catenext/skills/secret.md",
+      renderSkill({ ...good, name: "secret", content: fixture }),
+    );
+    await writeRepo(
+      ".catenext/skills/dump.md",
+      renderSkill({ ...good, name: "dump", content: `~~~ts\n${"example();\n".repeat(16)}~~~` }),
+    );
+    const output = formatChecks(await verifySetup(root, config));
+    expect(output).toContain("name duplikat");
+    expect(output).toContain("name harus sama dengan nama file");
+    expect(output).toMatch(/missing\.md: frontmatter tidak valid \(name:/);
+    expect(output).toContain("raw.md: tidak punya frontmatter");
+    expect(output).toContain("dump.md: Blok kode maksimal 15 baris");
+    expect(output).toContain("secret.md: potensi secret");
+    expect(output).not.toContain(fixture);
   });
 
   it("flags symlink and hardlink state files as non-regular", async () => {

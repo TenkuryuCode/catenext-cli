@@ -24,7 +24,7 @@ import { findCycle } from "./dag.js";
 import {
   DocumentIndexEntrySchema,
   GetDocumentInput,
-  ProjectDocumentSchema,
+  GetDocumentOutput,
   SaveDocumentInput,
   SaveDocumentOutput,
 } from "./documents.js";
@@ -67,6 +67,21 @@ const DependencyHandoffSchema = z.object({
   task_id: IdSchema,
   title: z.string(),
   handoff_summary: HandoffSummarySchema,
+  integrated_commit: z.object({ branch: z.string(), sha: CommitShaSchema }).optional(),
+});
+
+export const CompactHandoffSummarySchema = z.object({
+  files_modified: z.array(z.string()),
+  key_decisions: z.array(z.string()),
+  notes_for_next_agent: z.string(),
+});
+export type CompactHandoffSummary = z.infer<typeof CompactHandoffSummarySchema>;
+
+const ClaimDependencyHandoffSchema = z.object({
+  task_id: IdSchema,
+  title: z.string(),
+  handoff_summary: HandoffSummarySchema.optional(),
+  compact_handoff: CompactHandoffSummarySchema.optional(),
   integrated_commit: z.object({ branch: z.string(), sha: CommitShaSchema }).optional(),
 });
 
@@ -178,6 +193,8 @@ export const ClaimTaskInput = z.object({
   task_id: IdSchema,
   /** Alias persona yang sedang dipakai agen. Task milik persona lain ditolak. */
   agent_alias: AgentAliasSchema.optional(),
+  /** Kembalikan ringkasan delta handoff dependensi (key_decisions, files_modified, notes) alih-alih payload penuh. */
+  compact: z.boolean().optional(),
 });
 export const ClaimTaskOutput = z.object({
   task: z.object({
@@ -194,7 +211,7 @@ export const ClaimTaskOutput = z.object({
   /** Token lease unik per claim. Wajib dikirim ulang untuk release, handoff, blocker, dan renewal. */
   lease_id: IdSchema,
   lease_expires_at: IsoDateTimeSchema,
-  dependencies: z.array(DependencyHandoffSchema),
+  dependencies: z.array(ClaimDependencyHandoffSchema),
   /** Diisi bila task diambil dari REVISION_REQUESTED. */
   revision: z
     .object({
@@ -482,7 +499,7 @@ export const MCP_TOOLS = {
   get_document: tool(
     "Baca isi dokumen proyek lokal (blueprint, ERD, arsitektur, kontrak API, keputusan) berdasarkan slug dari get_project_context.",
     GetDocumentInput,
-    ProjectDocumentSchema,
+    GetDocumentOutput,
   ),
   save_document: tool(
     "Buat/perbarui dokumen proyek lokal agar sesi/IDE/CLI lain tidak kehilangan konteks. Markdown ringkas, tanpa code dump atau secret. Kirim expected_version dari versi yang Anda baca (0 = baru).",
@@ -490,7 +507,7 @@ export const MCP_TOOLS = {
     SaveDocumentOutput,
   ),
   manage_task: tool(
-    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; approve_plan menyetujui DRAFT -> TODO; return_to_draft menarik kembali TODO; approve mencatat persetujuan lokal (NEEDS_REVIEW -> DONE) tanpa verifikasi merge; unblock mengembalikan BLOCKED -> TODO.",
+    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; return_to_draft menarik kembali TODO; unblock mengembalikan BLOCKED -> TODO. Persetujuan hanya lewat CLI manusia: `catenext task approve <id>` atau `catenext review approve <id>`.",
     ManageTaskInput,
     ManageTaskOutput,
   ),
@@ -525,7 +542,7 @@ export const MCP_TOOLS = {
     ReportBlockerOutput,
   ),
   create_tasks: tool(
-    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT; setujui lewat manage_task approve_plan atau `catenext task approve`).",
+    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT; setujui lewat CLI manusia `catenext task approve`).",
     CreateTasksInput,
     CreateTasksOutput,
   ),

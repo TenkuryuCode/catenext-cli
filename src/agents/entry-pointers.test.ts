@@ -25,13 +25,18 @@ afterEach(async () => {
 });
 
 describe("entry-pointers rendering", () => {
-  it("renderMasterPrompt includes marker, AGENTS.md pointer, and key workflow sections", () => {
+  it("renderMasterPrompt is a crisp <=30-line boot pointer without duplicating AGENTS.md", () => {
     const md = renderMasterPrompt();
+    const lines = md.trimEnd().split("\n");
+    expect(lines.length).toBeLessThanOrEqual(30);
     expect(md.startsWith(MASTER_MARKER)).toBe(true);
     expect(md).toContain("[AGENTS.md](./AGENTS.md)");
+    expect(md).toContain("## Bootstrap (install if missing)");
+    expect(md).toContain("npm install -g catenext");
     expect(md).toContain("catenext brief");
-    expect(md).toContain("APPROVAL NEEDED");
-    expect(md).toContain("ACCESS NEEDED");
+    expect(md).not.toContain("APPROVAL NEEDED");
+    expect(md).not.toContain("ACCESS NEEDED");
+    expect(md).not.toContain("INTEGRATE READY");
   });
 
   it("renderEntryPointer resolves relative links for root, single-depth, and multi-depth paths", () => {

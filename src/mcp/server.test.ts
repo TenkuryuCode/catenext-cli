@@ -5,8 +5,9 @@ import type { McpToolName } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-
+import { ROLE_TOOLS } from "./catalog.js";
 import { createCatenextMcpServer, LOCAL_TOOLS, type ServerContext } from "./server.js";
+import type { McpTransport } from "./stdio.js";
 
 const TASK = "11111111-2222-4333-8444-555555555555";
 
@@ -26,6 +27,7 @@ afterEach(async () => {
 async function setup(
   respond = (_call: Captured): unknown => ({ ok: 1 }),
   ctxOverride?: ServerContext,
+  role?: "orchestrator" | "worker",
 ) {
   const calls: Captured[] = [];
   const service = {
@@ -42,10 +44,22 @@ async function setup(
     version: "test",
     context: async () => ctxOverride ?? { ok: true, service, root: repoRoot },
     log: (m) => logs.push(m),
+    role,
   });
   const [a, b] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "claude-code", version: "1.0.0" });
-  await Promise.all([server.connect(a), client.connect(b)]);
+  // The SDK's in-memory transport omits the ID for errors it cannot correlate.
+  // Keep that convention in this test adapter; stdio tests assert the wire ID is null.
+  const transport: McpTransport = {
+    async start() {
+      a.onmessage = transport.onmessage;
+      a.onclose = transport.onclose;
+      await a.start();
+    },
+    close: () => a.close(),
+    send: (msg) => a.send("error" in msg ? { ...msg, id: msg.id ?? undefined } : msg),
+  };
+  await Promise.all([server.connect(transport), client.connect(b)]);
   close = async () => {
     await client.close();
     await server.close();
@@ -87,6 +101,27 @@ describe("server MCP catenext", () => {
     const { client, calls } = await setup();
     await client.callTool({ name: "get_ready_tasks", arguments: {} });
     expect(calls).toEqual([{ name: "get_ready_tasks", body: { limit: 10 } }]);
+  });
+
+  it.each([
+    ["approve_plan", "catenext task approve"],
+    ["approve", "catenext review approve"],
+  ])("rejects %s over JSON-RPC without forwarding to the service", async (action, command) => {
+    const { client, calls } = await setup(undefined, undefined, "orchestrator");
+    const result = await client.callTool({
+      name: "manage_task",
+      arguments: { action, task_id: TASK, caller: "human", agent_alias: "human" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(`${command} ${TASK}`);
+    expect(calls).toEqual([]);
+
+    const revision = await client.callTool({
+      name: "manage_task",
+      arguments: { action: "request_revision", task_id: TASK, feedback: "Add test coverage" },
+    });
+    expect(revision.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
   });
 
   it("tidak meneruskan project_id dari agen", async () => {
@@ -322,5 +357,34 @@ describe("server MCP catenext", () => {
     });
     expect(calls[1]?.body).toMatchObject({ path: secretLikePath });
     expect(calls[2]?.body).toMatchObject({ query: secretLikeQuery });
+  });
+
+  it("tools/list mengembalikan schema ringkas tanpa regex UUID panjang namun validasi runtime tetap ketat", async () => {
+    const { client, calls } = await setup();
+    const { tools } = await client.listTools();
+    expect(tools).toHaveLength(24);
+    for (const t of tools) {
+      expect(t.description ?? "").not.toContain("\n");
+      expect((t.description ?? "").trim().split(/\s+/).length).toBeLessThanOrEqual(12);
+      expect(JSON.stringify(t.inputSchema)).not.toContain("[0-9a-fA-F]{8}");
+    }
+    const invalid = await client.callTool({
+      name: "claim_task",
+      arguments: { task_id: "not-a-uuid" },
+    });
+    expect(invalid.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("memfilter tool tools/list saat role orchestrator atau worker diset", async () => {
+    const orch = await setup(undefined, undefined, "orchestrator");
+    const orchList = await orch.client.listTools();
+    expect(orchList.tools.map((t) => t.name).sort()).toEqual([...ROLE_TOOLS.orchestrator].sort());
+    await close?.();
+    close = undefined;
+
+    const worker = await setup(undefined, undefined, "worker");
+    const workerList = await worker.client.listTools();
+    expect(workerList.tools.map((t) => t.name).sort()).toEqual([...ROLE_TOOLS.worker].sort());
   });
 });
