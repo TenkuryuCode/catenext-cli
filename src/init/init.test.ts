@@ -1,149 +1,168 @@
-import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_PLATFORMS, type PlatformId } from "@catenext/shared";
 import { parse } from "jsonc-parser";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it } from "vitest";
+import { CONFIG_PATH, readConfig } from "../config.js";
 import { ensureGitignore } from "./gitignore.js";
 import { applyInit, planInit, renderDiff } from "./index.js";
-import { CURSOR_WORKSPACE_FOLDER, upsertMcpEntry } from "./mcp-config.js";
+import { CURSOR_WORKSPACE_FOLDER, inspectMcp, selectedAdapters } from "./mcp-config.js";
 
+const CMD = { command: "node", args: ["cli.js"] };
 const PROJECT = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
-const CMD = { command: "/usr/bin/node", args: ["/opt/catenext/dist/index.js"] };
-const ENTRY = { command: "node", args: ["cli.js", "mcp"] };
+const PLATFORMS: PlatformId[] = [...DEFAULT_PLATFORMS, "opencode", "vscode"];
+let workspace: string;
+let root: string;
+let home: string;
 
-describe("upsertMcpEntry", () => {
-  it("membuat file baru bila belum ada", () => {
-    const out = upsertMcpEntry(null, ENTRY, ".mcp.json");
-    expect(JSON.parse(out)).toEqual({ mcpServers: { catenext: ENTRY } });
-  });
+beforeEach(async () => {
+  workspace = await mkdtemp(join(tmpdir(), "catenext-init-"));
+  root = join(workspace, 'Repo "spaces"');
+  home = join(workspace, "fake-home");
+  await mkdir(root);
+  await mkdir(join(home, ".gemini", "config"), { recursive: true });
+  await writeFile(join(root, "package.json"), '{"dependencies":{"hono":"4"}}');
+});
+afterEach(() => rm(workspace, { recursive: true, force: true }));
 
-  it("mempertahankan komentar JSONC dan server lain", () => {
-    const src = `{
-  // server milik pengguna
-  "mcpServers": {
-    /* jangan disentuh */
-    "github": { "command": "gh-mcp", "args": [] },
-  },
+async function write(path: string, contents: string) {
+  await mkdir(join(root, path, ".."), { recursive: true });
+  await writeFile(join(root, path), contents);
 }
-`;
-    const out = upsertMcpEntry(src, ENTRY, ".cursor/mcp.json");
-    expect(out).toContain("// server milik pengguna");
-    expect(out).toContain("/* jangan disentuh */");
-    const doc = parse(out) as { mcpServers: Record<string, unknown> };
-    expect(doc.mcpServers.github).toEqual({ command: "gh-mcp", args: [] });
-    expect(doc.mcpServers.catenext).toEqual(ENTRY);
-  });
 
-  it("idempoten: menjalankan dua kali tidak menduplikasi entri", () => {
-    const once = upsertMcpEntry("{}", ENTRY, ".mcp.json");
-    const twice = upsertMcpEntry(once, ENTRY, ".mcp.json");
-    expect(twice).toBe(once);
-    expect(once.match(/"catenext"/g)).toHaveLength(1);
+it("plans default adapters without writing, then applies repo-scoped launches", async () => {
+  const global = join(home, ".gemini/config/mcp_config.json");
+  await writeFile(global, '{"mcpServers":{"other":{}}}');
+  const changes = await planInit({ root, mcpCommand: CMD });
+  expect(changes.map(({ path }) => path)).toEqual([
+    CONFIG_PATH,
+    ".mcp.json",
+    ".cursor/mcp.json",
+    ".codex/config.toml",
+    ".agents/mcp_config.json",
+    ".gitignore",
+    "AGENTS.md",
+    "CATENEXT.md",
+    "CLAUDE.md",
+    ".cursor/CATENEXT.md",
+    ".codex/CATENEXT.md",
+    ".agents/CATENEXT.md",
+  ]);
+  expect(await readdir(root)).toEqual(["package.json"]);
+  expect(renderDiff(changes)).toContain("+repo_name: repo-spaces");
+  await applyInit(root, changes);
+  const config = await readConfig(root);
+  expect(config).toMatchObject({
+    repo_name: "repo-spaces",
+    project_name: 'Repo "spaces"',
+    stack: ["node", "hono"],
+    platforms: DEFAULT_PLATFORMS,
   });
-
-  it("memperbarui entri catenext lama di tempat", () => {
-    const old = upsertMcpEntry("{}", { command: "old", args: [] }, ".mcp.json");
-    const out = upsertMcpEntry(old, ENTRY, ".mcp.json");
-    expect(out.match(/"catenext"/g)).toHaveLength(1);
-    expect((parse(out) as { mcpServers: { catenext: unknown } }).mcpServers.catenext).toEqual(
-      ENTRY,
-    );
-  });
-
-  it("menolak menyentuh file yang rusak", () => {
-    expect(() => upsertMcpEntry("{ nope", ENTRY, ".mcp.json")).toThrow(/tidak disentuh/);
-  });
+  expect(config.project_id).toMatch(/^[\da-f-]{36}$/);
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
+  const expectedRoots = ["${CLAUDE_PROJECT_DIR}", CURSOR_WORKSPACE_FOLDER, root, root];
+  for (const [i, adapter] of (await selectedAdapters(root, DEFAULT_PLATFORMS)).entries()) {
+    const source = await readFile(join(root, adapter.path), "utf8");
+    expect(inspectMcp(source, adapter)).toEqual({
+      count: 1,
+      entry: { command: "node", args: ["cli.js", "mcp", "--root", expectedRoots[i]] },
+      managed: true,
+      compatible: true,
+    });
+    if (adapter.kind !== "toml") expect(() => JSON.parse(source)).not.toThrow();
+  }
+  expect(await readFile(global, "utf8")).toBe('{"mcpServers":{"other":{}}}');
+  expect(await planInit({ root, mcpCommand: CMD })).toEqual([]);
 });
 
-describe("ensureGitignore", () => {
-  it("menambahkan sekali dan mempertahankan isi lama", () => {
-    const once = ensureGitignore("node_modules/\n");
-    expect(once).toContain(".catenext/cache.json");
-    expect(once).toContain(".catenext/cache/");
-    expect(ensureGitignore(once)).toBe(once);
+it("supports OpenCode workspace JSONC and VS Code editor-managed workspace config", async () => {
+  const openCode =
+    '{\n  "mcp": {\n    // retain formatting\n    "other"  :  {"type":"local","command":["tool"]},\n  },\n}\n';
+  await write("opencode.jsonc", openCode);
+  await applyInit(root, await planInit({ root, platforms: PLATFORMS, mcpCommand: CMD }));
+  const text = await readFile(join(root, "opencode.jsonc"), "utf8");
+  expect(text).toContain(
+    '// retain formatting\n    "other"  :  {"type":"local","command":["tool"]},',
+  );
+  expect(parse(text)).toMatchObject({
+    mcp: {
+      catenext: {
+        type: "local",
+        command: ["node", "cli.js", "mcp", "--root", root],
+        enabled: true,
+      },
+    },
   });
-
-  it("membuat isi baru bila .gitignore belum ada", () => {
-    const created = ensureGitignore(null);
-    expect(created).toContain(".catenext/cache.json");
-    expect(created).toContain(".catenext/cache/");
+  const vscode = JSON.parse(await readFile(join(root, ".vscode/mcp.json"), "utf8"));
+  expect(vscode).toEqual({
+    servers: {
+      catenext: { type: "stdio", command: "node", args: ["cli.js", "mcp", "--root", root] },
+    },
   });
+  expect(await planInit({ root, mcpCommand: CMD })).toEqual([]);
 });
 
-describe("planInit + applyInit", () => {
-  let root: string;
-  beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), "catenext-init-"));
-    await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: { hono: "4" } }));
-    await mkdir(join(root, ".github", "workflows"), { recursive: true });
-    await writeFile(join(root, ".github", "workflows", "ci.yml"), "name: CI\n");
-  });
-
-  it("dry-run (plan) tidak menulis apa pun", async () => {
-    const before = await readdir(root);
-    const changes = await planInit({
+it("adds a selection without replacing project identity or previous launcher", async () => {
+  await applyInit(
+    root,
+    await planInit({ root, projectId: PROJECT, platforms: ["cursor"], mcpCommand: CMD }),
+  );
+  const config = await readFile(join(root, CONFIG_PATH), "utf8");
+  const cursor = await readFile(join(root, ".cursor/mcp.json"), "utf8");
+  await write(CONFIG_PATH, `${config}state_file: ../project-state.json # managed by team\n`);
+  await applyInit(
+    root,
+    await planInit({
       root,
-      projectId: PROJECT,
-      repoName: "backend",
-      mcpCommand: CMD,
-    });
-    expect(changes.map((c) => c.path).sort()).toEqual(
-      [".cursor/mcp.json", ".gitignore", ".mcp.json", ".catenext/config.yaml", "AGENTS.md"].sort(),
-    );
-    expect(renderDiff(changes)).toContain("+repo_name: backend");
-    expect(await readdir(root)).toEqual(before);
+      platforms: ["codex", "cursor"],
+      mcpCommand: { command: "new", args: [] },
+    }),
+  );
+  expect(await readConfig(root)).toMatchObject({
+    project_id: PROJECT,
+    platforms: ["cursor", "codex"],
+    state_file: "../project-state.json",
   });
+  expect(await readFile(join(root, CONFIG_PATH), "utf8")).toContain("# managed by team");
+  expect(await readFile(join(root, ".cursor/mcp.json"), "utf8")).toBe(cursor);
+  await expect(
+    planInit({ root, projectId: "25c8b7a2-fc5a-4407-bae7-4294a5b604f2", mcpCommand: CMD }),
+  ).rejects.toThrow(/identitas/);
+});
 
-  it("menulis file, idempoten, dan tidak menyentuh .github", async () => {
-    await applyInit(
-      root,
-      await planInit({ root, projectId: PROJECT, repoName: "backend", mcpCommand: CMD }),
-    );
+it("refuses broken configs, foreign entires, symlink paths and global-only Windsurf", async () => {
+  await write(".mcp.json", '{"mcpServers":{"catenext":{"url":"https://other.example"}}}');
+  await expect(planInit({ root, platforms: ["claude-code"], mcpCommand: CMD })).rejects.toThrow(
+    /tidak disentuh/,
+  );
+  await write(".mcp.json", "{broken");
+  await expect(planInit({ root, platforms: ["claude-code"], mcpCommand: CMD })).rejects.toThrow(
+    /JSON/,
+  );
+  await symlink(join(home, ".gemini/config"), join(root, ".agents"), "dir");
+  await expect(planInit({ root, platforms: ["antigravity"], mcpCommand: CMD })).rejects.toThrow(
+    /symlink/,
+  );
+  await expect(planInit({ root, platforms: ["windsurf"], mcpCommand: CMD })).rejects.toThrow(
+    /global/,
+  );
+});
 
-    const config = await readFile(join(root, ".catenext/config.yaml"), "utf8");
-    expect(config).toContain(`project_id: ${PROJECT}`);
-    expect(config).toContain("stack: [node, hono]");
-    const claude = JSON.parse(await readFile(join(root, ".mcp.json"), "utf8"));
-    expect(claude.mcpServers.catenext).toEqual({
-      command: CMD.command,
-      args: [...CMD.args, "mcp"],
-    });
-    const cursor = JSON.parse(await readFile(join(root, ".cursor/mcp.json"), "utf8"));
-    expect(cursor.mcpServers.catenext.args).toEqual([
-      ...CMD.args,
-      "mcp",
-      "--root",
-      CURSOR_WORKSPACE_FOLDER,
-    ]);
+it("preserves existing AGENTS.md and allows opting out on init", async () => {
+  await write("AGENTS.md", "# Team\n\nUse pnpm.\n");
+  const opts = { root, mcpCommand: CMD, platforms: [] };
+  expect((await planInit({ ...opts, agentsMd: false })).map(({ path }) => path)).not.toContain(
+    "AGENTS.md",
+  );
+  await applyInit(root, await planInit(opts));
+  expect(await readFile(join(root, "AGENTS.md"), "utf8")).toMatch(/^# Team\n\nUse pnpm\.\n/);
+});
 
-    expect(await planInit({ root, mcpCommand: CMD })).toEqual([]);
-    expect(await readFile(join(root, ".github/workflows/ci.yml"), "utf8")).toBe("name: CI\n");
-  });
-
-  it("mengubah repo_name di config yang ada tanpa membuang komentar", async () => {
-    await applyInit(root, await planInit({ root, projectId: PROJECT, mcpCommand: CMD }));
-    const changes = await planInit({ root, repoName: "frontend", mcpCommand: CMD });
-    expect(changes.map((c) => c.path)).toEqual([".catenext/config.yaml"]);
-    expect(changes[0]?.after).toContain("repo_name: frontend");
-    expect(changes[0]?.after).toContain("# Identitas repo ini");
-  });
-
-  it("menjaga isi AGENTS.md yang ada dan bisa dimatikan", async () => {
-    await writeFile(join(root, "AGENTS.md"), "# Aturan tim\n\nPakai pnpm.\n");
-    await applyInit(root, await planInit({ root, projectId: PROJECT, mcpCommand: CMD }));
-    const agents = await readFile(join(root, "AGENTS.md"), "utf8");
-    expect(agents.startsWith("# Aturan tim\n\nPakai pnpm.\n")).toBe(true);
-    expect(agents).toContain("catenext claim <task_id>");
-    const skipped = await planInit({
-      root: await mkdtemp(join(tmpdir(), "catenext-init-")),
-      projectId: PROJECT,
-      mcpCommand: CMD,
-      agentsMd: false,
-    });
-    expect(skipped.map((c) => c.path)).not.toContain("AGENTS.md");
-  });
-
-  it("meminta --project saat config belum ada", async () => {
-    await expect(planInit({ root, mcpCommand: CMD })).rejects.toThrow(/--project/);
-  });
+it("adds local state ignores once without rewriting existing rules", () => {
+  const once = ensureGitignore("node_modules/\r\n");
+  expect(once).toContain(".catenext/catenext.sqlite\r\n");
+  expect(once).toContain(".catenext/state.json\r\n");
+  expect(ensureGitignore(once)).toBe(once);
+  expect(ensureGitignore("/.catenext/\n")).toBe("/.catenext/\n");
 });

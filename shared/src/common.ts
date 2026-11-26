@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-/** ID entitas di Catenext Cloud (UUID). */
+/** ID entitas di Catenext (UUID). */
 export const IdSchema = z.uuid();
 export type Id = z.infer<typeof IdSchema>;
 
@@ -11,7 +11,7 @@ export const SlugSchema = z
   .max(64)
   .regex(/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/, "Harus slug huruf kecil (a-z, 0-9, '-' atau '_')");
 
-/** Layout checkout git proyek Cloud: monorepo (satu git) vs polyrepo (clone terpisah). */
+/** Layout checkout git proyek: monorepo (satu git) vs polyrepo (clone terpisah). */
 export const PROJECT_LAYOUTS = ["monorepo", "polyrepo"] as const;
 export const ProjectLayoutSchema = z.enum(PROJECT_LAYOUTS);
 export type ProjectLayout = z.infer<typeof ProjectLayoutSchema>;

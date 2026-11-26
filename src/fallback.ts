@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import {
   ClaimTaskInput,
   CompleteHandoffInput,
+  GetReadyTasksInput,
   HANDOFF_LIMITS,
   type HandoffSummary,
   ManageTaskInput,
@@ -11,12 +12,12 @@ import {
   ReportBlockerInput,
   ReviewInput,
 } from "@catenext/shared";
-import type { AgentApi } from "./api-client.js";
+import type { LocalService } from "./local-service.js";
 import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
 
 /**
  * Fallback CLI untuk agen tanpa MCP (blueprint §4.3): `catenext next/claim/done/block`.
- * Endpoint, sensor secret, dan validasi Zod sama persis dengan tool MCP.
+ * State lokal, sensor secret, dan validasi Zod sama seperti tool MCP.
  */
 
 const exec = promisify(execFile);
@@ -49,18 +50,19 @@ export async function readGitState(cwd: string = process.cwd()): Promise<GitStat
 }
 
 export async function taskNext(
-  api: AgentApi,
+  service: LocalService,
   opts: { as?: string; limit?: number; json?: boolean; lease?: string },
 ) {
-  const res = await api.post<McpToolOutput<"get_ready_tasks">>("ready-tasks", {
-    limit: opts.limit ?? 10,
-    ...(opts.lease ? { lease_id: opts.lease } : {}),
-    ...(opts.as ? { agent_alias: opts.as } : {}),
-  });
+  const body = prepare(
+    GetReadyTasksInput,
+    { limit: opts.limit, lease_id: opts.lease, agent_alias: opts.as },
+    ["limit", "lease_id", "agent_alias"],
+  );
+  const res = await service.callTool("get_ready_tasks", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   if (res.tasks.length === 0) {
     return console.log(
-      "Tidak ada task siap untuk repo ini. Cek Dashboard untuk task DRAFT/BLOCKED.",
+      "Tidak ada task siap untuk repo ini. Cek `catenext board` untuk task DRAFT/BLOCKED.",
     );
   }
   for (const t of res.tasks) {
@@ -79,7 +81,9 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   const out: string[] = [];
   out.push(`# Task: ${res.task.title}`, "");
   out.push(`- ID: ${res.task.id}`);
-  out.push(`- Lease sampai: ${res.lease_expires_at} (diperpanjang setiap perintah catenext)`);
+  out.push(
+    `- Lease sampai: ${res.lease_expires_at} (perpanjang lewat catenext next --lease bila ada ID lease)`,
+  );
   if (res.lease_id)
     out.push(`- Gunakan --lease ${res.lease_id} saat memperbarui atau menyerahkan task.`);
   if (res.task.role) out.push(`- Role: ${res.task.role}`);
@@ -113,28 +117,19 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   out.push(
     "## Setelah selesai",
     "",
-    "Commit di branch/worktree ini OK. Jangan merge ke default branch — serahkan lewat PR.",
-    `catenext done ${res.task.id} --notes "<ringkasan>" --verify "<perintah tes>" --pr <url> --base <branch>${res.lease_id ? ` --lease ${res.lease_id}` : ""}`,
-    `Bila buntu: catenext block ${res.task.id} --category <kategori> --reason "<alasan spesifik>"`,
+    "Commit pekerjaan Anda di branch kerja. Jangan merge ke default branch tanpa izin pengguna.",
+    `catenext done ${res.task.id} --notes "<ringkasan>" --verify "<perintah tes>"${res.lease_id ? ` --lease ${res.lease_id}` : ""}`,
+    "Jika ada PR, tambahkan --pr <url> --base <branch>. Handoff lokal tidak memerlukan PR.",
+    `Bila buntu: catenext block ${res.task.id} --category <kategori> --reason "<alasan spesifik>"${res.lease_id ? ` --lease ${res.lease_id}` : ""}`,
   );
   return out.join("\n");
 }
 
 export async function taskClaim(
-  api: AgentApi,
+  service: LocalService,
   taskId: string,
   opts: { as?: string; json?: boolean; worktree?: boolean },
 ) {
-  if (!opts.worktree) {
-    const ctx = await api.post<McpToolOutput<"get_project_context">>("context", {
-      ...(opts.as ? { agent_alias: opts.as } : {}),
-    });
-    if (ctx.project.layout === "monorepo") {
-      throw new PlanningInputError(
-        "Proyek ini layout monorepo: claim wajib --worktree (branch/sesi terpisah). Contoh: catenext claim <id> --worktree",
-      );
-    }
-  }
   const branch = opts.worktree
     ? await git(["symbolic-ref", "--short", "HEAD"], process.cwd())
     : null;
@@ -147,9 +142,9 @@ export async function taskClaim(
       ...(opts.as ? { agent_alias: opts.as } : {}),
       ...(branch ? { worktree: { branch, session_id: randomUUID() } } : {}),
     },
-    ["task_id", "session_id"],
+    ["task_id", "session_id", "agent_alias"],
   );
-  const res = await api.post<McpToolOutput<"claim_task">>("claim", payload);
+  const res = await service.callTool("claim_task", payload);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log(renderClaim(res));
 }
@@ -179,10 +174,8 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
       "Tidak bisa membaca branch/commit git. Jalankan di dalam repo git dan commit pekerjaan Anda dulu.",
     );
   }
-  if (!opts.pr || !opts.base) {
-    throw new PlanningInputError(
-      "--pr dan --base wajib: buat PR di branch kerja lalu `catenext done … --pr <url> --base <branch>`.",
-    );
+  if ((opts.pr !== undefined || opts.base !== undefined) && (!opts.pr || !opts.base)) {
+    throw new PlanningInputError("--pr dan --base opsional, tetapi harus diberikan bersama.");
   }
   const files = opts.file.length ? opts.file : gitState.changedFiles;
   return {
@@ -192,11 +185,18 @@ export function buildHandoff(opts: DoneOptions, gitState: GitState): Partial<Han
     notes_for_next_agent: opts.notes,
     git_branch: gitState.branch,
     last_commit_hash: gitState.commit,
-    pull_request: { url: opts.pr, base_branch: opts.base, head_sha: gitState.commit },
+    ...(opts.pr && opts.base
+      ? { pull_request: { url: opts.pr, base_branch: opts.base, head_sha: gitState.commit } }
+      : {}),
   };
 }
 
-export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions) {
+export async function taskDone(service: LocalService, taskId: string, opts: DoneOptions) {
+  if (opts.handoff && (opts.pr !== undefined || opts.base !== undefined)) {
+    throw new PlanningInputError(
+      "Sertakan metadata PR di JSON handoff, bukan lewat --pr atau --base bersamaan dengan --handoff.",
+    );
+  }
   const summary = opts.handoff
     ? await readJsonInput(opts.handoff)
     : buildHandoff(opts, await readGitState());
@@ -205,14 +205,16 @@ export async function taskDone(api: AgentApi, taskId: string, opts: DoneOptions)
     { task_id: taskId, handoff_summary: summary, lease_id: opts.lease },
     ["task_id", "last_commit_hash", "head_sha", "lease_id"],
   );
-  const res = await api.post<McpToolOutput<"complete_handoff">>("complete", body);
+  const res = await service.callTool("complete_handoff", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
-  console.log("✓ Handoff + PR terkirim (NEEDS_REVIEW). Menunggu review/merge manusia.");
+  console.log(
+    "✓ Handoff disimpan (NEEDS_REVIEW). Tinjau lalu catat keputusan dengan `catenext review`.",
+  );
   console.log(`  ${res.next_step_hint}`);
 }
 
 export async function taskBlock(
-  api: AgentApi,
+  service: LocalService,
   taskId: string,
   opts: { category: string; reason: string; json?: boolean; lease?: string },
 ) {
@@ -221,17 +223,23 @@ export async function taskBlock(
     { task_id: taskId, category: opts.category, reason: opts.reason, lease_id: opts.lease },
     ["task_id", "category", "lease_id"],
   );
-  const res = await api.post<McpToolOutput<"report_blocker">>("blocker", body);
+  const res = await service.callTool("report_blocker", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
-  console.log("✓ Task ditandai BLOCKED dan lock dilepas. Manusia akan meninjau di Dashboard.");
+  console.log(
+    "✓ Task ditandai BLOCKED dan lock dilepas. Setelah hambatan teratasi, gunakan `catenext unblock`.",
+  );
 }
 
-export async function taskReview(api: AgentApi, input: unknown, json: boolean) {
-  const body = prepare(ReviewInput, input, ["task_id", "lease_id", "head_sha"]);
-  const result = await api.post<McpToolOutput<"review_pull_request">>(
-    body.action === "list" ? "review/list" : "review",
-    body,
-  );
+export async function taskReview(service: LocalService, input: unknown, json: boolean) {
+  const body = prepare(ReviewInput, input, [
+    "action",
+    "task_id",
+    "lease_id",
+    "head_sha",
+    "decision",
+    "agent_alias",
+  ]);
+  const result = await service.callTool("review_pull_request", { request: body });
   if (json) console.log(JSON.stringify(result, null, 2));
   else if ("reviews" in result) {
     if (!result.reviews.length) console.log("Belum ada PR yang bisa Anda review di repo ini.");
@@ -249,9 +257,9 @@ export async function taskReview(api: AgentApi, input: unknown, json: boolean) {
 }
 
 /** Orchestrator: kembalikan task ke kolom Revisi atau tetapkan persona/role (manage_task). */
-export async function taskManage(api: AgentApi, input: unknown, json: boolean) {
+export async function taskManage(service: LocalService, input: unknown, json: boolean) {
   const body = prepare(ManageTaskInput, input, ["action", "task_id", "agent_alias", "role"]);
-  const res = await api.post<McpToolOutput<"manage_task">>("tasks/manage", body);
+  const res = await service.callTool("manage_task", body);
   if (json) return console.log(JSON.stringify(res, null, 2));
   const owner = res.persona ? `@${res.persona}` : res.role ? `role ${res.role}` : "tanpa persona";
   if (body.action === "request_revision") {
@@ -265,7 +273,11 @@ export async function taskManage(api: AgentApi, input: unknown, json: boolean) {
     );
     if (res.stale_task_ids.length > 0)
       console.log(`  ${res.stale_task_ids.length} task hilir ditandai stale.`);
-  } else {
+  } else if (body.action === "assign") {
     console.log(`✓ Penanggung jawab task: ${owner} (status ${res.status}).`);
+  } else {
+    console.log(`✓ Task ${res.task_id}: ${res.status}.`);
+    if (body.action === "approve")
+      console.log("  Persetujuan dicatat lokal; status merge PR tidak diverifikasi.");
   }
 }

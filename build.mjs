@@ -27,12 +27,7 @@ const options = {
   alias: { "@catenext/shared": shared },
   external: Object.keys(pkg.dependencies ?? {}),
   define: {
-    // Versi ditanam saat build. URL API default = server resmi (lihat credentials.ts), kecuali
-    // CATENEXT_DEFAULT_API_URL diisi (mis. untuk build server self-hosted).
     "process.env.CATENEXT_BUILD_VERSION": JSON.stringify(pkg.version),
-    "process.env.CATENEXT_BUILD_API_URL": JSON.stringify(
-      process.env.CATENEXT_DEFAULT_API_URL ?? "",
-    ),
   },
   logLevel: "info",
 };

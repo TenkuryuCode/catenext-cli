@@ -24,9 +24,12 @@ describe("registry tool MCP", () => {
         "get_project_board",
         "get_project_context",
         "get_ready_tasks",
+        "graph_neighbors",
+        "interview_setup",
         "list_epics",
         "list_personas",
         "load_skill",
+        "manage_roots",
         "manage_task",
         "report_blocker",
         "release_task",
@@ -34,6 +37,8 @@ describe("registry tool MCP", () => {
         "save_document",
         "save_repo_skill",
         "search_context",
+        "session_brief",
+        "symbol_search",
         "upsert_persona",
       ].sort(),
     );
@@ -54,10 +59,12 @@ describe("registry tool MCP", () => {
     expect(parsed).not.toHaveProperty("repo_name");
   });
 
-  it("complete_handoff menolak handoff tanpa pull_request", () => {
+  it("complete_handoff menerima commit lokal dengan atau tanpa pull_request", () => {
     const task_id = EXISTING;
+    const lease_id = "3c9f1e2d-8a7b-4c6d-9e5f-1a2b3c4d5e6f";
     const base = {
       task_id,
+      lease_id,
       handoff_summary: {
         files_modified: ["apps/api/src/x.ts"],
         key_decisions: ["Keputusan singkat"],
@@ -67,7 +74,8 @@ describe("registry tool MCP", () => {
         last_commit_hash: "a".repeat(40),
       },
     };
-    expect(CompleteHandoffInput.safeParse(base).success).toBe(false);
+    expect(CompleteHandoffInput.safeParse(base).success).toBe(true);
+    expect(CompleteHandoffInput.safeParse({ ...base, lease_id: undefined }).success).toBe(false);
     expect(
       CompleteHandoffInput.safeParse({
         ...base,

@@ -4,6 +4,7 @@ import {
   type CatenextConfig,
   CatenextConfigSchema,
   checkConfigCompatibility,
+  type PlatformId,
 } from "@catenext/shared";
 import { parse } from "yaml";
 
@@ -45,10 +46,13 @@ export async function readConfig(cwd: string = process.cwd()): Promise<CatenextC
   let source: string;
   try {
     source = await readFile(join(cwd, CONFIG_PATH), "utf8");
-  } catch {
-    throw new ConfigError(
-      "Belum ada .catenext/config.yaml di folder ini. Jalankan `catenext init --project <project_id>` terlebih dahulu.",
-    );
+  } catch (error) {
+    if (isMissingFile(error)) {
+      throw new ConfigError(
+        "Belum ada .catenext/config.yaml. Jalankan `catenext init` di root repo.",
+      );
+    }
+    throw error;
   }
   return parseConfig(source);
 }
@@ -63,10 +67,39 @@ export async function findProjectRoot(start: string = process.cwd()): Promise<st
     try {
       await access(join(dir, CONFIG_PATH));
       return dir;
-    } catch {
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
       const parent = dirname(dir);
       if (parent === dir) return null;
       dir = parent;
     }
   }
+}
+
+/** Temukan root dan baca config valid dalam satu langkah. */
+export async function loadConfig(
+  start: string = process.cwd(),
+): Promise<{ root: string; config: CatenextConfig }> {
+  const root = await findProjectRoot(start);
+  if (!root) {
+    throw new ConfigError(
+      "Tidak ada .catenext/config.yaml di folder ini atau induknya. Jalankan `catenext init` di root repo.",
+    );
+  }
+  return { root, config: await readConfig(root) };
+}
+
+export function configuredPlatforms(config: CatenextConfig): PlatformId[] {
+  // Config sebelum field `platforms` hanya memasang Claude Code dan Cursor.
+  return [...new Set(config.platforms ?? (["claude-code", "cursor"] as const))];
+}
+
+export function isMissingFile(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+export const DEFAULT_STATE_PATH = join(".catenext", "catenext.sqlite");
+
+export function stateFilePath(root: string, config: Pick<CatenextConfig, "state_file">): string {
+  return resolve(root, config.state_file ?? DEFAULT_STATE_PATH);
 }

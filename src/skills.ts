@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -12,10 +13,7 @@ import {
 } from "@catenext/shared";
 import { parse, stringify } from "yaml";
 
-/**
- * Skill repo 2-tier: file Markdown lokal di .catenext/skills/<name>.md (isi lengkap,
- * tidak pernah dikirim ke Cloud) + indeks ringan (name, when_to_use) yang disinkronkan.
- */
+/** Repository skills live in Markdown files; the index exposes only names and usage hints. */
 export const SKILLS_DIR = join(".catenext", "skills");
 
 export class SkillError extends Error {
@@ -128,9 +126,7 @@ export async function loadSkill(root: string, name: string, revision?: string): 
   return parseSkill(source, file);
 }
 
-/**
- * Tulis skill secara atomik (tmp + rename). Satu-satunya area tulis agen di .catenext/.
- */
+/** Write a repository skill atomically (temporary file and rename). */
 export async function saveSkill(
   root: string,
   input: { name: string; when_to_use: string; content: string },
@@ -151,57 +147,12 @@ export async function saveSkill(
     created = false;
   } catch {}
   const skill: Skill = { name, when_to_use: when, updated_at: now.toISOString(), content };
-  const tmp = `${target}.${process.pid}.tmp`;
-  await writeFile(tmp, renderSkill(skill), "utf8");
-  await rename(tmp, target);
+  const tmp = `${target}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, renderSkill(skill), { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(tmp, target);
+  } finally {
+    await rm(tmp, { force: true });
+  }
   return { path: join(SKILLS_DIR, `${name}.md`), created, skill };
-}
-
-export async function committedSkillIndex(root: string, previous: string | null) {
-  const config = { cwd: root };
-  const branchRef = (
-    await exec("git", ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], config).catch(() => null)
-  )?.stdout.trim();
-  const branch = (
-    await exec("git", ["symbolic-ref", "-q", "HEAD"], config).catch(() => null)
-  )?.stdout.trim();
-  if (
-    !branchRef?.startsWith("refs/remotes/origin/") ||
-    branch !== `refs/heads/${branchRef.slice("refs/remotes/origin/".length)}`
-  )
-    return null;
-  const revision = CommitShaSchema.parse(
-    (await exec("git", ["rev-parse", branchRef], config)).stdout.trim(),
-  );
-  const head = (await exec("git", ["rev-parse", "HEAD"], config)).stdout.trim();
-  if (head !== revision) return null;
-  if (
-    previous &&
-    previous !== revision &&
-    !(await exec("git", ["merge-base", "--is-ancestor", previous, revision], config).catch(
-      () => null,
-    ))
-  ) {
-    throw new SkillError(
-      "Revisi Git lokal tertinggal dari indeks Cloud. Fetch branch utama lalu coba lagi.",
-    );
-  }
-  const names = (
-    await exec("git", ["ls-tree", "-rz", "--name-only", revision, "--", SKILLS_DIR], config)
-  ).stdout
-    .split("\0")
-    .flatMap((path) => {
-      const file = /^\.catenext\/skills\/([^/]+)\.md$/.exec(path);
-      return file?.[1] ? [file[1]] : [];
-    });
-  const skills: Skill[] = [];
-  const invalid: { file: string; error: string }[] = [];
-  for (const name of names) {
-    try {
-      skills.push(await loadSkill(root, name, revision));
-    } catch (err) {
-      invalid.push({ file: `${name}.md`, error: (err as Error).message });
-    }
-  }
-  return { revision, skills: skillIndex(skills), invalid };
 }

@@ -19,7 +19,8 @@ describe("renderTaskDelegatePrompt", () => {
     expect(md).toContain("Buat POST /login.");
     expect(md).toContain("apps/api");
     expect(md).toContain("worktree");
-    expect(md).toContain("pull_request");
+    expect(md).toContain("complete_handoff");
+    expect(md).toContain("--worktree");
   });
 
   it("menyertakan feedback revisi bila ada", () => {
@@ -31,7 +32,7 @@ describe("renderTaskDelegatePrompt", () => {
       reviewFeedback: "Tambah validasi email.",
       layout: "polyrepo",
     });
-    expect(md).toContain("## Feedback revisi");
+    expect(md).toContain("revision feedback:");
     expect(md).toContain("Tambah validasi email.");
     expect(md).not.toContain("Claim wajib mode worktree");
   });

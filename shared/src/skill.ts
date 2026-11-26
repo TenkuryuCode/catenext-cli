@@ -38,7 +38,7 @@ export const SkillContentSchema = z
     message: `Blok kode maksimal ${SKILL_LIMITS.maxCodeBlockLines} baris; rujuk path file, jangan menyalin kode`,
   });
 
-/** Indeks Tier 1 (~10–15 token per skill). Hanya ini yang dikirim ke Cloud. */
+/** Indeks Tier 1 (~10–15 token per skill). Isi lengkap dibaca terpisah dari repo. */
 export const SkillIndexEntrySchema = z.object({
   name: SkillNameSchema,
   when_to_use: z.string().min(1).max(SKILL_LIMITS.maxWhenToUseLength),

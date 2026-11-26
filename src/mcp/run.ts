@@ -1,21 +1,32 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { AgentApi } from "../api-client.js";
 import { ConfigError, findProjectRoot, readConfig } from "../config.js";
-import { CredentialsError, loadCredentials, resolveApiUrl } from "../credentials.js";
+import { LocalService } from "../local-service.js";
 import { createCatenextMcpServer, type ServerContext } from "./server.js";
 
 /**
- * `catenext mcp`: server MCP stdio. stdout khusus protokol MCP, jadi semua log ke stderr.
- * Config & kredensial dibaca sekali saat tool pertama dipanggil; bila gagal, tool
- * membalas pesan perbaikan alih-alih membuat server mati diam-diam di IDE.
+ * Tentukan titik awal pencarian project. Fail closed: --root yang kosong atau tidak ter-expand
+ * (mis. "${CLAUDE_PROJECT_DIR}") tidak boleh diam-diam jatuh ke cwd, karena state bisa tertulis
+ * ke project yang salah. Mengembalikan null bila --root tidak valid.
  */
+export function resolveStart(root: string | undefined, cwd: string): string | null {
+  if (root === undefined) return cwd;
+  if (root.trim() === "" || root.includes("${")) return null;
+  return root;
+}
+
+/** stdout khusus protokol MCP. Muat config secara lazy agar tool memberi petunjuk bila belum init. */
 export async function runMcpServer(opts: { root?: string; version: string }) {
-  let agentName: string | undefined;
   let cached: Promise<ServerContext> | undefined;
 
   const load = async (): Promise<ServerContext> => {
     try {
-      const start = opts.root && !opts.root.includes("${") ? opts.root : process.cwd();
+      const start = resolveStart(opts.root, process.cwd());
+      if (start === null) {
+        return {
+          ok: false,
+          error: `--root "${opts.root}" tidak ter-resolve. Isi dengan path absolut repo, mis. \`--root /path/ke/repo\`.`,
+        };
+      }
       const root = await findProjectRoot(start);
       if (!root) {
         return {
@@ -24,39 +35,32 @@ export async function runMcpServer(opts: { root?: string; version: string }) {
         };
       }
       const config = await readConfig(root);
-      const creds = await loadCredentials();
-      const api = new AgentApi({
-        baseUrl: resolveApiUrl(config.api_url, creds.api_url),
-        apiKey: creds.api_key,
-        projectId: config.project_id,
-        repoName: config.repo_name,
-        agentName: () => agentName,
-      });
+      // MCP selalu agen: approve/approve_plan ditolak di LocalService.
+      const service = new LocalService(root, config, "agent");
       process.stderr.write(
         `[catenext] repo "${config.repo_name}" (project ${config.project_id}) dari ${root}\n`,
       );
-      return { ok: true, api, config, root };
+      return { ok: true, service, root };
     } catch (err) {
-      if (err instanceof ConfigError || err instanceof CredentialsError) {
-        return { ok: false, error: err.message };
-      }
+      if (err instanceof ConfigError) return { ok: false, error: err.message };
       throw err;
     }
   };
 
   const server = createCatenextMcpServer({
     version: opts.version,
-    context: () => {
+    context: async () => {
       cached ??= load();
-      return cached.then((ctx) => {
-        if (!ctx.ok) cached = undefined; // coba lagi setelah pengguna memperbaiki
+      const pending = cached;
+      try {
+        const ctx = await pending;
+        if (!ctx.ok && cached === pending) cached = undefined;
         return ctx;
-      });
+      } catch (err) {
+        if (cached === pending) cached = undefined;
+        throw err;
+      }
     },
   });
-  server.server.oninitialized = () => {
-    agentName = server.server.getClientVersion()?.name;
-  };
-
   await server.connect(new StdioServerTransport());
 }

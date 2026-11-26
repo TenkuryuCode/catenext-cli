@@ -1,8 +1,4 @@
-/**
- * Secret-scrubber lokal: dijalankan di mesin pengguna sebelum teks bebas buatan agen
- * (handoff, alasan blocker) dikirim ke Catenext Cloud. Sengaja berbasis regex sederhana
- * agar mudah diaudit; lebih baik sesekali menyensor berlebihan daripada membocorkan secret.
- */
+/** Best-effort redaction of recognizable secrets before text is stored or returned by Catenext. */
 
 interface Rule {
   kind: string;
@@ -93,5 +89,5 @@ export function scrubDeep<T>(value: T, skipKeys: ReadonlySet<string> = new Set()
 
 export function describeRedactions(r: { redactions: Record<string, number>; total: number }) {
   const parts = Object.entries(r.redactions).map(([k, n]) => `${k}×${n}`);
-  return `secret-scrubber lokal menyensor ${r.total} potensi secret (${parts.join(", ")}) sebelum dikirim ke Catenext Cloud.`;
+  return `Secret scrubber menyensor ${r.total} potensi secret (${parts.join(", ")}).`;
 }

@@ -11,15 +11,16 @@ describe("blok AGENTS.md", () => {
   it("memuat aturan orchestrator: revisi lewat manage_task, bukan task baru", () => {
     const block = upsertAgentsBlock(null);
     expect(block).toContain("**orchestrator**");
-    expect(block).toContain("request_revision");
-    expect(block).toContain("jangan membuat task baru untuk revisi");
+    expect(block).toContain("CATENEXT.md");
+    expect(block).toContain("pending_approvals");
+    expect(block).toContain("session_brief");
     expect(block).toContain("catenext revise");
   });
 
   it("mengganti blok lama di tempatnya tanpa menyentuh teks lain", () => {
-    const src = `# Tim\n\nA\n\n${BLOCK_START}\nlama\n<!-- catenext:end -->\n\n## Lain\nB\n`;
+    const src = `# Tim\n\nA\n\n${BLOCK_START}\nISI-BLOK-USANG-XYZ\n<!-- catenext:end -->\n\n## Lain\nB\n`;
     const out = upsertAgentsBlock(src);
-    expect(out).not.toContain("lama");
+    expect(out).not.toContain("ISI-BLOK-USANG-XYZ");
     expect(out.startsWith("# Tim\n\nA\n\n")).toBe(true);
     expect(out.endsWith("## Lain\nB\n")).toBe(true);
   });

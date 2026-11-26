@@ -10,6 +10,33 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.6.0] - 2026-11-27
+
+### Ditambahkan
+- SQLite state default `.catenext/catenext.sqlite` (migrasi sekali dari `state.json` → `*.bak`).
+- `catenext init` interview (TTY) + `--yes`; seed persona `be`/`fe`/`tester`/`android`/`security`/`reviewer`/`scribe`.
+- MCP/CLI: `interview_setup`, `session_brief` / `catenext brief`, `manage_roots` / `catenext root`, `graph_neighbors`, `symbol_search`, `catenext index`.
+- Agent stubs English multi-platform (Claude/Cursor/Antigravity/OpenCode) + orchestrator stubs; stack in agent context.
+- Root `CATENEXT.md` master prompt for new sessions; platform entry files (`CLAUDE.md`, `.cursor/CATENEXT.md`, …) redirect there, then `AGENTS.md`.
+- `session_brief.pending_approvals` with approve/revise/next options for human chat gates.
+- README Master Prompt awal untuk cold-start chat.
+- Parallel subagents wajib worktree terpisah; orchestrator memantau semua worktree, mengintegrasikan, lalu bertanya manusia: PR | merge | revise | next.
+- Kickoff brainstorm + `sync-board` / skill `cross-agent-sync`; persona `scribe` + skill `docs-hygiene` untuk merapikan dokumen.
+
+### Changed
+- CLI and stdio MCP share local task, handoff, persona, and document state in SQLite.
+- Compact MCP JSON (no pretty-print); board titles/blockers truncated unless `verbose`.
+- `init`, `sync`, `verify`, and `remove` accept `--platform` for MCP setup.
+- `approve` / `approve_plan` hanya lewat CLI manusia; jalur MCP agen ditolak.
+- Token lease task/review di-hash (`sha256.…`) di state; pemanggil tetap memakai token plaintext.
+- README mirror publik (`catenext-cli`): panduan lokal SQLite, master prompt `CATENEXT.md`,
+  worktree paralel, approval manusia; hilangkan alur Cloud/login/dashboard.
+
+### Removed
+- Web dashboard, Cloud API, browser login, premium quotas, and deployment configuration.
+- Existing cloud data is not migrated automatically.
+- Default JSON `state.json` as canonical store (legacy migrate only).
+
 ## [0.5.0] - 2026-11-26
 
 ### Ditambahkan

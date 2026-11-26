@@ -1,6 +1,18 @@
 import { z } from "zod";
 import { ReleaseTaskInput } from "./api.js";
 import {
+  GraphNeighborsInput,
+  GraphNeighborsOutput,
+  InterviewSetupInput,
+  InterviewSetupOutput,
+  ManageRootsInput,
+  ManageRootsOutput,
+  SessionBriefInput,
+  SessionBriefOutput,
+  SymbolSearchInput,
+  SymbolSearchOutput,
+} from "./brief.js";
+import {
   AgentAliasSchema,
   IdSchema,
   IsoDateTimeSchema,
@@ -82,7 +94,7 @@ export const GetProjectContextOutput = z.object({
   recent_handoffs: z.array(DependencyHandoffSchema),
   /** Repo yang dikenal proyek, agar orchestrator tahu ke mana task bisa diarahkan. */
   project_repos: z.array(RepoNameSchema).default([]),
-  /** Indeks dokumen proyek di Cloud (blueprint, ERD, ...); isi lewat get_document. */
+  /** Indeks dokumen proyek lokal (blueprint, ERD, ...); isi lewat get_document. */
   documents: z.array(DocumentIndexEntrySchema).default([]),
 });
 
@@ -94,6 +106,8 @@ export const GetProjectBoardInput = z.object({
   /** Tanpa filter: semua status. */
   status: z.array(TaskStatusSchema).max(7).optional(),
   limit: z.number().int().min(1).max(200).default(100),
+  /** Include longer blocker text; default compact. */
+  verbose: z.boolean().optional(),
 });
 export const BoardTaskSchema = z.object({
   id: IdSchema,
@@ -168,8 +182,9 @@ export const ClaimTaskOutput = z.object({
   }),
   /** Persona penanggung jawab task (atau persona agen): ikuti aturan dan batas wilayahnya. */
   persona: PersonaSchema.optional(),
+  /** Token lease unik per claim. Wajib dikirim ulang untuk release, handoff, blocker, dan renewal. */
+  lease_id: IdSchema,
   lease_expires_at: IsoDateTimeSchema,
-  lease_id: IdSchema.optional(),
   dependencies: z.array(DependencyHandoffSchema),
   /** Diisi bila task diambil dari REVISION_REQUESTED. */
   revision: z
@@ -184,22 +199,11 @@ export const ClaimTaskOutput = z.object({
 
 // --- complete_handoff -------------------------------------------------------
 
-export const CompleteHandoffInput = z
-  .object({
-    lease_id: IdSchema.optional(),
-    task_id: IdSchema,
-    handoff_summary: HandoffSummarySchema,
-  })
-  .superRefine((input, ctx) => {
-    if (!input.handoff_summary.pull_request) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "pull_request wajib: buat PR di branch kerja lalu sertakan url, base_branch, dan head_sha.",
-        path: ["handoff_summary", "pull_request"],
-      });
-    }
-  });
+export const CompleteHandoffInput = z.object({
+  lease_id: IdSchema,
+  task_id: IdSchema,
+  handoff_summary: HandoffSummarySchema,
+});
 export const CompleteHandoffOutput = z.object({
   task_id: IdSchema,
   status: z.literal("NEEDS_REVIEW"),
@@ -211,7 +215,7 @@ export const CompleteHandoffOutput = z.object({
 // --- report_blocker ---------------------------------------------------------
 
 export const ReportBlockerInput = z.object({
-  lease_id: IdSchema.optional(),
+  lease_id: IdSchema,
   task_id: IdSchema,
   category: BlockerCategorySchema,
   reason: z.string().min(10).max(1000),
@@ -227,7 +231,14 @@ export const ReportBlockerOutput = z.object({
  * Aksi orchestrator (agen utama sesi) atas task yang sudah ada. Revisi tidak membuat task
  * baru: task dipindah ke REVISION_REQUESTED dan diambil lagi oleh persona penanggung jawab.
  */
-export const MANAGE_TASK_ACTIONS = ["request_revision", "assign"] as const;
+export const MANAGE_TASK_ACTIONS = [
+  "request_revision",
+  "assign",
+  "approve_plan",
+  "return_to_draft",
+  "approve",
+  "unblock",
+] as const;
 
 export const ManageTaskInput = z
   .object({
@@ -263,6 +274,7 @@ export const ManageTaskOutput = z.object({
   role: RoleSchema.nullable(),
   revision_count: z.number().int().min(0),
   stale_task_ids: z.array(IdSchema),
+  unlocked_task_ids: z.array(IdSchema).optional(),
 });
 
 // --- create_tasks -----------------------------------------------------------
@@ -406,17 +418,16 @@ export const ListPersonasInput = z.object({});
 export const ListPersonasOutput = z.object({
   personas: z.array(
     PersonaSchema.extend({
-      /** "project" = khusus proyek ini (bisa diubah agen); "workspace" = global, hanya dari Web. */
-      scope: z.enum(["project", "workspace"]),
+      /** Persona tersimpan per proyek. */
+      scope: z.literal("project"),
     }),
   ),
 });
 
-/** Agen hanya boleh membuat/mengubah persona khusus proyeknya sendiri, bukan tingkat workspace. */
+/** Agen hanya boleh membuat/mengubah persona proyek ini. */
 export const UpsertPersonaInput = PersonaSchema.extend({
   /**
-   * Tidak dikirim = aturan dipertahankan; persona proyek baru mewarisi aturan persona master
-   * (workspace) dengan alias yang sama.
+   * Tidak dikirim = aturan dipertahankan pada persona yang sudah ada.
    */
   rules: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
   /** Tidak dikirim = repo persona yang ada dipertahankan. */
@@ -445,7 +456,7 @@ function tool<I extends z.ZodType, O extends z.ZodType>(
 
 export const MCP_TOOLS = {
   release_task: tool(
-    "Lepas lease task supaya sesi lain bisa mengambilnya.",
+    "Lepas lease task (lease_id dari claim_task wajib) supaya sesi lain bisa mengambilnya.",
     ReleaseTaskInput,
     z.object({ task_id: IdSchema, status: z.enum(["TODO", "REVISION_REQUESTED"]) }),
   ),
@@ -455,27 +466,27 @@ export const MCP_TOOLS = {
     GetProjectBoardOutput,
   ),
   search_context: tool(
-    "Cari semantik di dokumen Cloud, indeks skill, dan task proyek (embedding + cache; rerank bila tersedia). Pakai sebelum load_skill/get_document buta.",
+    "Cari kata kunci di dokumen proyek, indeks skill repo ini, dan task lokal. Pakai sebelum load_skill/get_document buta.",
     SearchContextInput,
     SearchContextOutput,
   ),
   get_document: tool(
-    "Baca isi dokumen proyek di Cloud (blueprint, ERD, arsitektur, kontrak API, keputusan) berdasarkan slug dari get_project_context.",
+    "Baca isi dokumen proyek lokal (blueprint, ERD, arsitektur, kontrak API, keputusan) berdasarkan slug dari get_project_context.",
     GetDocumentInput,
     ProjectDocumentSchema,
   ),
   save_document: tool(
-    "Buat/perbarui dokumen proyek di Cloud agar sesi/IDE/CLI lain tidak kehilangan konteks. Markdown ringkas, tanpa code dump atau secret. Kirim expected_version dari versi yang Anda baca (0 = baru).",
+    "Buat/perbarui dokumen proyek lokal agar sesi/IDE/CLI lain tidak kehilangan konteks. Markdown ringkas, tanpa code dump atau secret. Kirim expected_version dari versi yang Anda baca (0 = baru).",
     SaveDocumentInput,
     SaveDocumentOutput,
   ),
   manage_task: tool(
-    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback (bukan membuat task baru) dan opsional mengganti persona; assign mengatur persona/role task yang belum dikerjakan.",
+    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; approve_plan menyetujui DRAFT -> TODO; return_to_draft menarik kembali TODO; approve mencatat persetujuan lokal (NEEDS_REVIEW -> DONE) tanpa verifikasi merge; unblock mengembalikan BLOCKED -> TODO.",
     ManageTaskInput,
     ManageTaskOutput,
   ),
   review_pull_request: tool(
-    "Antrean, claim, hasil review, atau cek merge pull request.",
+    "Antrean, claim dan keputusan review berdasarkan PR yang dicatat di handoff. Refresh hanya membaca state lokal; tidak mengecek host atau merge.",
     z.object({ request: ReviewInput }),
     ReviewOutput,
   ),
@@ -490,12 +501,12 @@ export const MCP_TOOLS = {
     GetReadyTasksOutput,
   ),
   claim_task: tool(
-    "Kunci task (lease 30 menit) dan ambil instruksi lengkap, handoff dependensi, serta aturan persona. Bila project.layout=monorepo, kirim worktree (branch + session_id). Polyrepo: worktree opsional. Kirim agent_alias bila bekerja sebagai persona tertentu.",
+    "Kunci task (lease 30 menit, lease_id unik) dan ambil instruksi lengkap, handoff dependensi, serta aturan persona. Simpan lease_id: release_task, complete_handoff, dan report_blocker wajib mengirimnya. Bila project.layout=monorepo, kirim worktree (branch + session_id). Polyrepo: worktree opsional. Kirim agent_alias bila bekerja sebagai persona tertentu.",
     ClaimTaskInput,
     ClaimTaskOutput,
   ),
   complete_handoff: tool(
-    "Selesaikan task dengan handoff terstruktur; pull_request wajib (url, base_branch, head_sha). Status selalu NEEDS_REVIEW sampai manusia approve/merge PR. Commit di branch kerja OK; jangan merge ke default branch sendiri.",
+    "Serahkan handoff terstruktur dengan commit lokal. pull_request opsional. Status NEEDS_REVIEW sampai approve lokal yang eksplisit; tidak ada verifikasi merge.",
     CompleteHandoffInput,
     CompleteHandoffOutput,
   ),
@@ -505,7 +516,7 @@ export const MCP_TOOLS = {
     ReportBlockerOutput,
   ),
   create_tasks: tool(
-    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT untuk ditinjau manusia).",
+    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT; setujui lewat manage_task approve_plan atau `catenext task approve`).",
     CreateTasksInput,
     CreateTasksOutput,
   ),
@@ -525,7 +536,7 @@ export const MCP_TOOLS = {
     ListPersonasOutput,
   ),
   upsert_persona: tool(
-    "Buat atau perbarui persona khusus proyek ini (alias unik, role, aturan). Persona tingkat workspace hanya bisa diubah dari Web.",
+    "Buat atau perbarui persona proyek ini (alias unik, role, aturan, repo yang dipegang).",
     UpsertPersonaInput,
     UpsertPersonaOutput,
   ),
@@ -538,6 +549,31 @@ export const MCP_TOOLS = {
     "Buat atau perbarui skill repo (maks. 500 kata, tanpa code dump) di .catenext/skills/<name>.md.",
     SaveRepoSkillInput,
     SaveRepoSkillOutput,
+  ),
+  interview_setup: tool(
+    "Compact setup option cards for orchestrator interviews (platform, personas, locale). Present options; wait for user choice before writing setup.",
+    InterviewSetupInput,
+    InterviewSetupOutput,
+  ),
+  session_brief: tool(
+    "Token-cheap session summary: ready/blocked/draft counts and short next-ask lines. Prefer this over dumping the full board.",
+    SessionBriefInput,
+    SessionBriefOutput,
+  ),
+  manage_roots: tool(
+    "List/add/remove external workspace roots owned by a persona. Paths may be outside the primary repo.",
+    ManageRootsInput,
+    ManageRootsOutput,
+  ),
+  graph_neighbors: tool(
+    "Compact code-graph neighbors for a file path (imports/defines). Hard-limited fan-out.",
+    GraphNeighborsInput,
+    GraphNeighborsOutput,
+  ),
+  symbol_search: tool(
+    "Search indexed symbols in the local SQLite code graph. Compact hits only.",
+    SymbolSearchInput,
+    SymbolSearchOutput,
   ),
 } as const;
 

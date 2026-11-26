@@ -25,7 +25,7 @@ export const TASK_STATUSES = [
 export const TaskStatusSchema = z.enum(TASK_STATUSES);
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 
-/** Kolom Kanban di Web UI (DRAFT tinggal di layar review rencana, bukan di board). */
+/** Kolom Kanban lokal (DRAFT tinggal di layar review rencana, bukan di board). */
 export const KANBAN_STATUSES = TASK_STATUSES.filter(
   (s): s is Exclude<TaskStatus, "DRAFT"> => s !== "DRAFT",
 );
@@ -38,15 +38,15 @@ export const CLAIMABLE_STATUSES = [
 
 /**
  * Event yang menggerakkan task. Setiap event punya pelaku yang jelas:
- * - human: dari Web UI
+ * - human: dari CLI atau orchestrator
  * - agent: dari tool MCP / CLI
- * - system: dari server (mis. lease habis)
+ * - system: dari layanan lokal (mis. lease habis)
  */
 export const TASK_EVENTS = [
   "approve_plan", // human: DRAFT -> TODO
   "return_to_draft", // human: TODO -> DRAFT
   "claim", // agent: TODO | REVISION_REQUESTED -> IN_PROGRESS
-  "complete", // agent: IN_PROGRESS -> NEEDS_REVIEW (PR wajib di complete_handoff)
+  "complete", // agent: IN_PROGRESS -> NEEDS_REVIEW
   "report_blocker", // agent: IN_PROGRESS -> BLOCKED
   "release", // agent: IN_PROGRESS -> TODO (melepas lock tanpa blocker)
   "lease_expired", // system: IN_PROGRESS -> TODO
@@ -79,7 +79,7 @@ const TRANSITIONS: TransitionTable = {
   approve_plan: { DRAFT: "TODO" },
   return_to_draft: { TODO: "DRAFT" },
   claim: { TODO: "IN_PROGRESS", REVISION_REQUESTED: "IN_PROGRESS" },
-  // PR wajib di complete_handoff; manusia approve/merge → DONE.
+  // Persetujuan lokal eksplisit menyelesaikan review.
   complete: { IN_PROGRESS: "NEEDS_REVIEW" },
   report_blocker: { IN_PROGRESS: "BLOCKED" },
   release: { IN_PROGRESS: "TODO" },
@@ -91,7 +91,7 @@ const TRANSITIONS: TransitionTable = {
 
 export interface TransitionContext {
   /**
-   * @deprecated Complete selalu ke NEEDS_REVIEW (PR wajib). Dipertahankan untuk kompatibilitas.
+   * @deprecated Complete selalu ke NEEDS_REVIEW. Dipertahankan untuk kompatibilitas.
    */
   requiresApproval?: boolean;
 }
@@ -129,7 +129,7 @@ export function transition(
   return to;
 }
 
-/** Event yang sah dari sebuah status (berguna untuk tombol di Web UI). */
+/** Event yang sah dari sebuah status (berguna untuk tombol lokal). */
 export function allowedEvents(from: TaskStatus): TaskEvent[] {
   return TASK_EVENTS.filter((e) => TRANSITIONS[e][from] !== undefined);
 }
@@ -146,7 +146,7 @@ export function isDependencySatisfied(status: TaskStatus): boolean {
 // Lock & lease
 // ---------------------------------------------------------------------------
 
-/** Lease lock task: 30 menit, diperpanjang otomatis setiap kali agen memanggil tool MCP. */
+/** Lease 30 menit; panggilan CLI/MCP yang membawa identitas lease yang sesuai memperpanjangnya. */
 export const LOCK_LEASE_MS = 30 * 60 * 1000;
 
 export function leaseExpiresAt(lockedAt: Date, leaseMs: number = LOCK_LEASE_MS): Date {
@@ -175,8 +175,6 @@ export function lockScopeKey(projectId: string, repoName: string): string {
 
 export const TaskSchema = z.object({
   id: IdSchema,
-  /** Diduplikasi dari project agar kebijakan RLS cukup `workspace_id = current_setting(...)`. */
-  workspace_id: IdSchema,
   project_id: IdSchema,
   epic_id: IdSchema,
   title: z.string().min(1).max(200),
@@ -187,7 +185,6 @@ export const TaskSchema = z.object({
   role: RoleSchema.nullable(),
   /** Persona penanggung jawab. Bila diisi, hanya agen dengan alias persona ini yang boleh mengambilnya. */
   persona_id: IdSchema.nullable(),
-  assignee_id: IdSchema.nullable(),
   locked_by: z.string().max(200).nullable(),
   locked_at: IsoDateTimeSchema.nullable(),
   lease_expires_at: IsoDateTimeSchema.nullable(),

@@ -2,7 +2,7 @@ import { z } from "zod";
 import { IsoDateTimeSchema, SlugSchema } from "./common.js";
 
 /**
- * Dokumen proyek di Cloud: blueprint, ERD, arsitektur, kontrak API, keputusan, runbook.
+ * Dokumen proyek lokal: blueprint, ERD, arsitektur, kontrak API, keputusan, runbook.
  * Konteks bersama lintas sesi/IDE/CLI untuk orchestrator. Markdown pendek, bukan source code.
  */
 export const DOCUMENT_KINDS = [
@@ -49,8 +49,8 @@ export const SaveDocumentInput = z.object({
   kind: DocumentKindSchema,
   content: z.string().trim().min(1).max(DOCUMENT_LIMITS.content),
   /**
-   * Versi yang dibaca penulis. 0 = dokumen baru. Bila versi di server sudah berubah, simpan
-   * ditolak (document_version_conflict) agar sesi lain tidak tertimpa diam-diam.
+   * Versi yang dibaca penulis. 0 atau kosong hanya untuk dokumen baru.
+   * Simpan versi lama ditolak (document_version_conflict) agar sesi lain tidak tertimpa.
    */
   expected_version: z.number().int().min(0).optional(),
 });

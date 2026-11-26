@@ -1,103 +1,40 @@
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { applyEdits, modify, type ParseError, parse, visit } from "jsonc-parser";
-import type { AgentApi } from "./api-client.js";
-import { CONFIG_PATH } from "./config.js";
+import { isAbsolute, join, resolve } from "node:path";
+import { type PlatformId, SUPPORTED_PLATFORMS } from "@catenext/shared";
+import { CONFIG_PATH, configuredPlatforms, parseConfig, stateFilePath } from "./config.js";
 import { AGENTS_MD, BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./init/agents-md.js";
-import { CACHE_DIR_IGNORE, CACHE_IGNORE, ensureGitignore } from "./init/gitignore.js";
+import { updateConfig } from "./init/config-file.js";
+import { ensureGitignore } from "./init/gitignore.js";
 import {
-  ADAPTERS,
-  type ClientAdapter,
-  MCP_SERVER_KEY,
+  changeMcp,
+  entryBase,
+  entryMatchesRoot,
+  inspectMcp,
+  McpConfigError,
   type McpServerEntry,
-  readMcpEntry,
-  upsertMcpEntry,
+  scopedEntry,
+  selectedAdapters,
+  WINDSURF_UNSUPPORTED,
 } from "./init/mcp-config.js";
-import { npxLaunch } from "./node-command.js";
-import { committedSkillIndex, listSkills, SKILLS_DIR } from "./skills.js";
-import { catenextSubagentFiles, SUBAGENTS_DIR } from "./subagents.js";
+import { applyRepoEdits, type FileEdit, readRepoFile } from "./init/repo-files.js";
+import { listSkills, SKILLS_DIR } from "./skills.js";
+import { catenextSubagentFiles } from "./subagents.js";
 
-/** Perubahan file; `after: null` berarti file dihapus. */
-export interface FileEdit {
-  path: string;
-  before: string | null;
-  after: string | null;
-  /** Salin file lama ke <path>.bak sebelum ditimpa (untuk file rusak). */
-  backup?: boolean;
-}
+export type { FileEdit } from "./init/repo-files.js";
 
 export interface Finding {
   level: "ok" | "fixable" | "warn";
   message: string;
 }
 
-const readOrNull = (p: string) =>
-  readFile(p, "utf8").then(
-    (s) => s,
-    () => null,
-  );
-
-/** Berapa kali kunci "catenext" muncul langsung di bawah mcpServers (JSON duplikat). */
-export function countEntries(source: string): number {
-  let count = 0;
-  let depth = 0;
-  let inServers = -1;
-  let pendingServers = false;
-  visit(
-    source,
-    {
-      onObjectBegin: () => {
-        depth++;
-        if (pendingServers) {
-          inServers = depth;
-          pendingServers = false;
-        }
-      },
-      onObjectEnd: () => {
-        if (depth === inServers) inServers = -1;
-        depth--;
-      },
-      onObjectProperty: (name) => {
-        if (depth === 1 && name === "mcpServers") pendingServers = true;
-        else if (depth === inServers && name === MCP_SERVER_KEY) count++;
-      },
-    },
-    { allowTrailingComma: true, disallowComments: false },
-  );
-  return count;
-}
-
-/** Hapus semua kunci "catenext" di mcpServers. Entri lain & komentar tetap. */
-export function removeMcpEntries(source: string): string {
-  let out = source;
-  for (let i = 0; i < 20 && countEntries(out) > 0; i++) {
-    out = applyEdits(out, modify(out, ["mcpServers", MCP_SERVER_KEY], undefined, {}));
-  }
-  return out;
-}
-
-function isValidJsonObject(source: string): boolean {
-  const errors: ParseError[] = [];
-  const doc = parse(source, errors, { allowTrailingComma: true, disallowComments: false });
-  return errors.length === 0 && doc !== null && typeof doc === "object" && !Array.isArray(doc);
-}
-
-/** Entri menunjuk ke file yang tidak ada lagi (mis. folder repo CLI dipindah/di-rename). */
+/**
+ * Stale only when an absolute launch path no longer exists. Paths inside an npx cache are
+ * allowed while they exist: the CLI warns on generation and the file is still a valid launch.
+ */
 export function entryIsStale(entry: McpServerEntry): boolean {
   if (isAbsolute(entry.command) && !existsSync(entry.command)) return true;
   const script = entry.args[0];
-  if (!script || !isAbsolute(script) || !/\.[cm]?js$/.test(script)) return false;
-  // Skrip di cache npx (dari `npx catenext init` versi <= 0.1.1) bisa hilang kapan saja.
-  return !existsSync(script) || npxLaunch(script) !== null;
-}
-
-/** Perintah dasar (tanpa "mcp" + argumen adapter) dari entri yang ada. */
-function baseCommand(entry: McpServerEntry, adapter: ClientAdapter): McpServerEntry {
-  const suffix = ["mcp", ...adapter.extraArgs];
-  const args = [...entry.args];
-  if (args.slice(-suffix.length).join("\0") === suffix.join("\0")) args.splice(-suffix.length);
-  return { command: entry.command, args };
+  return !!script && isAbsolute(script) && /\.[cm]?js$/.test(script) && !existsSync(script);
 }
 
 export interface SyncPlan {
@@ -105,211 +42,143 @@ export interface SyncPlan {
   findings: Finding[];
 }
 
-/**
- * Hitung perbaikan lokal tanpa menulis. Tanpa `fix`: hanya menambah yang hilang (entri MCP,
- * baris .gitignore, isi blok AGENTS.md). Dengan `fix`: juga mengganti entri basi/duplikat dan
- * membuat ulang file MCP yang rusak (file lama disalin ke .bak).
- */
+/** Plan repo-only maintenance; malformed files are never forcibly replaced. */
 export async function planSync(opts: {
   root: string;
+  platforms?: readonly PlatformId[];
   fix: boolean;
   defaultCommand: () => McpServerEntry;
 }): Promise<SyncPlan> {
   const root = resolve(opts.root);
+  const configBefore = await readRepoFile(root, CONFIG_PATH);
+  const config = parseConfig(configBefore ?? "");
+  const previous = configuredPlatforms(config);
+  const platforms = opts.platforms ?? previous;
+  const configured = new Set(previous);
   const edits: FileEdit[] = [];
   const findings: Finding[] = [];
-
-  for (const adapter of ADAPTERS) {
-    const before = await readOrNull(join(root, adapter.path));
-    if (before !== null && before.trim() !== "" && !isValidJsonObject(before)) {
-      if (!opts.fix) {
+  const add = (path: string, before: string | null, after: string | null) => {
+    if (resolve(root, path) === stateFilePath(root, config)) {
+      throw new McpConfigError(`${path} dipakai sebagai state_file; file tidak disentuh.`);
+    }
+    if (before !== after) edits.push({ path, before, after });
+  };
+  if (platforms.includes("windsurf"))
+    findings.push({ level: "warn", message: WINDSURF_UNSUPPORTED });
+  const failed = new Set<PlatformId>();
+  for (const adapter of await selectedAdapters(root, platforms)) {
+    try {
+      const before = await readRepoFile(root, adapter.path);
+      const current = inspectMcp(before, adapter);
+      if (current.count && !current.managed) {
+        throw new McpConfigError(
+          `${adapter.path}: entri catenext bukan peluncur yang dikelola. File tidak disentuh.`,
+        );
+      }
+      const stale = current.entry ? entryIsStale(current.entry) : false;
+      const needsFix =
+        current.count > 1 ||
+        stale ||
+        (current.entry && (!current.compatible || !entryMatchesRoot(current.entry, root, adapter)));
+      if (needsFix && !opts.fix) {
+        for (const id of adapter.ids) failed.add(id);
         findings.push({
           level: "fixable",
-          message: `${adapter.path} bukan JSON valid. \`catenext sync --fix\` akan membuatnya ulang (salinan lama ke .bak).`,
+          message: `${adapter.path}: entri ganda, basi, atau tidak sesuai repo. Jalankan \`catenext sync --fix\`.`,
         });
         continue;
       }
-      const cmd = opts.defaultCommand();
-      edits.push({
-        path: adapter.path,
-        before,
-        backup: true,
-        after: upsertMcpEntry(
-          null,
-          { command: cmd.command, args: [...cmd.args, "mcp", ...adapter.extraArgs] },
-          adapter.path,
-        ),
-      });
-      findings.push({ level: "ok", message: `${adapter.path} dibuat ulang (rusak).` });
-      continue;
-    }
-
-    const entry = before ? readMcpEntry(before) : null;
-    const dupes = before ? countEntries(before) : 0;
-    const stale = entry ? entryIsStale(entry) : false;
-    let base = entry && !stale ? baseCommand(entry, adapter) : opts.defaultCommand();
-    let source = before;
-
-    if (dupes > 1) {
-      if (opts.fix) {
-        source = removeMcpEntries(before ?? "");
+      if (!current.entry || needsFix) {
+        const base = current.entry && !stale ? entryBase(current.entry) : null;
+        const after = changeMcp(
+          before,
+          adapter,
+          scopedEntry(root, adapter, base ?? opts.defaultCommand()),
+        );
+        add(adapter.path, before, after);
         findings.push({
           level: "ok",
-          message: `${adapter.path}: ${dupes} entri "catenext" disatukan.`,
+          message: `${adapter.path}: entri catenext ${current.count ? "diperbaiki" : "ditambahkan"}.`,
         });
-      } else {
-        findings.push({
-          level: "fixable",
-          message: `${adapter.path}: entri "catenext" muncul ${dupes} kali. Jalankan \`catenext sync --fix\`.`,
-        });
-        continue;
       }
+      for (const id of adapter.ids) configured.add(id);
+    } catch (error) {
+      if (!(error instanceof McpConfigError)) throw error;
+      for (const id of adapter.ids) failed.add(id);
+      findings.push({ level: "warn", message: error.message });
     }
-    if (stale) {
-      if (!opts.fix) {
-        findings.push({
-          level: "fixable",
-          message: `${adapter.path}: entri "catenext" menunjuk ke path yang tidak ada (${entry?.command} ${entry?.args[0] ?? ""}). Jalankan \`catenext sync --fix\`.`,
-        });
-        continue;
-      }
-      base = opts.defaultCommand();
-      findings.push({ level: "ok", message: `${adapter.path}: path server MCP diperbarui.` });
-    }
-    if (!entry)
-      findings.push({ level: "ok", message: `${adapter.path}: entri "catenext" ditambahkan.` });
-
-    const after = upsertMcpEntry(
-      source,
-      { command: base.command, args: [...base.args, "mcp", ...adapter.extraArgs] },
-      adapter.path,
-    );
-    if (after !== before) edits.push({ path: adapter.path, before, after });
   }
-
-  const gitignore = await readOrNull(join(root, ".gitignore"));
-  const gitignoreAfter = ensureGitignore(gitignore);
-  if (gitignoreAfter !== gitignore) {
-    edits.push({ path: ".gitignore", before: gitignore, after: gitignoreAfter });
+  const tracked = [...configured].filter(
+    (platform) => previous.includes(platform) || !failed.has(platform),
+  );
+  if (tracked.length !== previous.length && configBefore !== null) {
+    add(CONFIG_PATH, configBefore, updateConfig(configBefore, { platforms: tracked }));
   }
-
-  // Blok AGENTS.md hanya diperbarui bila sudah ada (menghormati --no-agents-md saat init).
-  const agents = await readOrNull(join(root, AGENTS_MD));
-  if (agents?.includes(BLOCK_START)) {
-    const after = upsertAgentsBlock(agents);
-    if (after !== agents) edits.push({ path: AGENTS_MD, before: agents, after });
-  }
-
+  const gitignore = await readRepoFile(root, ".gitignore");
+  add(".gitignore", gitignore, ensureGitignore(gitignore));
+  const agents = await readRepoFile(root, AGENTS_MD);
+  if (agents?.includes(BLOCK_START)) add(AGENTS_MD, agents, upsertAgentsBlock(agents));
   return { edits, findings };
 }
 
-/** Kirim indeks skill lokal ke Cloud. Isi skill tidak pernah dikirim. */
-export async function syncSkills(
-  root: string,
-  api: AgentApi | null,
-): Promise<{ count: number; invalid: { file: string; error: string }[]; skipped: boolean }> {
-  const { revision: previous } = api
-    ? await api.post<{ revision: string | null }>("skills/ref")
-    : { revision: null };
-  const index = await committedSkillIndex(root, previous);
-  if (!index) return { count: 0, invalid: [], skipped: true };
-  if (api && previous !== index.revision) {
-    await api.put("skills", {
-      revision: index.revision,
-      previous_revision: previous,
-      skills: index.skills,
-    });
-  }
-  return { count: index.skills.length, invalid: index.invalid, skipped: false };
-}
-
-/** Rencana `catenext remove`. Skill repo disimpan kecuali `all`. */
-export async function planRemove(opts: { root: string; all: boolean }): Promise<FileEdit[]> {
+/** Remove only local adapter entries; keep project identity, state and skills by default. */
+export async function planRemove(opts: {
+  root: string;
+  platforms?: readonly PlatformId[];
+  all?: boolean;
+}): Promise<FileEdit[]> {
   const root = resolve(opts.root);
+  const configBefore = await readRepoFile(root, CONFIG_PATH);
+  const config = configBefore === null ? null : parseConfig(configBefore);
+  const previous = config ? configuredPlatforms(config) : [];
+  const selected = opts.platforms ?? (config ? previous : SUPPORTED_PLATFORMS);
+  if (opts.platforms?.includes("windsurf")) throw new McpConfigError(WINDSURF_UNSUPPORTED);
+  const remaining = previous.filter((platform) => !selected.includes(platform));
   const edits: FileEdit[] = [];
-
-  for (const adapter of ADAPTERS) {
-    const before = await readOrNull(join(root, adapter.path));
-    if (before === null || countEntries(before) === 0) continue;
-    const stripped = removeMcpEntries(before);
-    const doc = parse(stripped, [], { allowTrailingComma: true }) as Record<string, unknown>;
-    const servers = doc?.mcpServers as Record<string, unknown> | undefined;
-    const emptyDoc =
-      Object.keys(doc ?? {}).every((k) => k === "mcpServers") &&
-      Object.keys(servers ?? {}).length === 0 &&
-      !/\/\/|\/\*/.test(stripped);
-    edits.push({ path: adapter.path, before, after: emptyDoc ? null : stripped });
-  }
-
-  const gitignore = await readOrNull(join(root, ".gitignore"));
-  if (gitignore !== null) {
-    const eol = gitignore.includes("\r\n") ? "\r\n" : "\n";
-    const lines = gitignore.split(/\r?\n/);
-    const catenextIgnore = new Set([CACHE_IGNORE, CACHE_DIR_IGNORE, ".catenext/cache"]);
-    const kept = lines.filter((l, i) => {
-      const t = l.trim();
-      if (catenextIgnore.has(t)) return false;
-      if (l.startsWith("# Catenext:")) {
-        const next = lines[i + 1]?.trim();
-        if (next && catenextIgnore.has(next)) return false;
-      }
-      return true;
-    });
-    if (kept.length !== lines.length) {
-      const text = kept.join(eol).replace(/(\r?\n)+$/, "");
-      edits.push({ path: ".gitignore", before: gitignore, after: text ? `${text}${eol}` : null });
+  const stateFile = stateFilePath(root, config ?? {});
+  const add = (path: string, before: string | null, after: string | null) => {
+    if (before !== after && resolve(root, path) !== stateFile) edits.push({ path, before, after });
+  };
+  for (const adapter of await selectedAdapters(root, selected)) {
+    const before = await readRepoFile(root, adapter.path);
+    if (before !== null && inspectMcp(before, adapter).managed) {
+      add(adapter.path, before, changeMcp(before, adapter, null));
     }
   }
-
-  const agents = await readOrNull(join(root, AGENTS_MD));
-  if (agents?.includes(BLOCK_START)) {
-    edits.push({ path: AGENTS_MD, before: agents, after: removeAgentsBlock(agents) });
+  if (configBefore !== null)
+    add(CONFIG_PATH, configBefore, updateConfig(configBefore, { platforms: remaining }));
+  if (!opts.platforms) {
+    const agents = await readRepoFile(root, AGENTS_MD);
+    if (agents?.includes(BLOCK_START)) add(AGENTS_MD, agents, removeAgentsBlock(agents));
   }
-
-  for (const p of await catenextSubagentFiles(root)) {
-    edits.push({ path: p, before: await readOrNull(join(root, p)), after: null });
-  }
-
-  for (const p of [CONFIG_PATH, join(".catenext", "cache.json")]) {
-    const before = await readOrNull(join(root, p));
-    if (before !== null) edits.push({ path: p, before, after: null });
+  if (!opts.platforms || selected.includes("claude-code")) {
+    for (const path of await catenextSubagentFiles(root)) {
+      add(path, await readRepoFile(root, path), null);
+    }
   }
   if (opts.all) {
     const { skills, invalid } = await listSkills(root);
-    for (const f of [...skills.map((s) => `${s.name}.md`), ...invalid.map((i) => i.file)]) {
-      const p = join(SKILLS_DIR, f);
-      edits.push({ path: p, before: await readOrNull(join(root, p)), after: null });
+    for (const file of [
+      ...skills.map(({ name }) => `${name}.md`),
+      ...invalid.map(({ file }) => file),
+    ]) {
+      const path = join(SKILLS_DIR, file);
+      add(path, await readRepoFile(root, path), null);
     }
   }
   return edits;
 }
 
-/** Terapkan perubahan secara atomik; folder kosong yang ditinggalkan Catenext ikut dihapus. */
 export async function applyFileEdits(root: string, edits: FileEdit[]): Promise<void> {
-  const base = resolve(root);
-  for (const e of edits) {
-    const target = join(base, e.path);
-    if (e.after === null) {
-      await rm(target, { force: true });
-      continue;
-    }
-    await mkdir(dirname(target), { recursive: true });
-    if (e.backup && e.before !== null) await copyFile(target, `${target}.bak`);
-    const tmp = `${target}.catenext-${process.pid}.tmp`;
-    await writeFile(tmp, e.after);
-    await rename(tmp, target);
-  }
-  for (const dir of [SKILLS_DIR, ".catenext", ".cursor", SUBAGENTS_DIR, ".claude"]) {
-    await rmdir(join(base, dir)).catch(() => {}); // hanya berhasil bila kosong
-  }
+  await applyRepoEdits(root, edits);
 }
 
 export function summarize(edits: FileEdit[]): string[] {
-  return edits.map((e) =>
-    e.after === null
-      ? `- dihapus  ${e.path}`
-      : e.before === null
-        ? `+ dibuat   ${e.path}`
-        : `~ diubah   ${e.path}${e.backup ? " (salinan lama: .bak)" : ""}`,
+  return edits.map(({ path, before, after }) =>
+    after === null
+      ? `- dihapus  ${path}`
+      : before === null
+        ? `+ dibuat   ${path}`
+        : `~ diubah   ${path}`,
   );
 }

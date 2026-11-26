@@ -1,27 +1,18 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CatenextConfig } from "@catenext/shared";
+import type { McpToolName } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentApi } from "../api-client.js";
+
 import { createCatenextMcpServer, LOCAL_TOOLS, type ServerContext } from "./server.js";
 
-const CONFIG: CatenextConfig = {
-  schema_version: 1,
-  project_id: "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f",
-  repo_name: "backend",
-  stack: [],
-  overrides: { default_role: "backend" },
-};
 const TASK = "11111111-2222-4333-8444-555555555555";
 
 interface Captured {
-  url: string;
-  method: string;
-  headers: Record<string, string>;
-  body: Record<string, unknown>;
+  name: McpToolName;
+  body: unknown;
 }
 
 let close: (() => Promise<void>) | undefined;
@@ -33,49 +24,25 @@ afterEach(async () => {
 });
 
 async function setup(
-  respond: (c: Captured) => {
-    status: number;
-    body: unknown;
-    headers?: Record<string, string>;
-  } = () => ({
-    status: 200,
-    body: { ok: 1 },
-  }),
+  respond = (_call: Captured): unknown => ({ ok: 1 }),
   ctxOverride?: ServerContext,
 ) {
   const calls: Captured[] = [];
-  const fakeFetch = (async (url: string, init: RequestInit) => {
-    const c: Captured = {
-      url,
-      method: init.method ?? "GET",
-      headers: init.headers as Record<string, string>,
-      body: JSON.parse(init.body as string),
-    };
-    calls.push(c);
-    const r = respond(c);
-    return new Response(JSON.stringify(r.body), { status: r.status, headers: r.headers });
-  }) as typeof fetch;
-
-  let agentName: string | undefined;
-  const api = new AgentApi({
-    baseUrl: "http://api.test",
-    apiKey: "ctnx_testtesttesttesttest",
-    projectId: CONFIG.project_id,
-    repoName: CONFIG.repo_name,
-    agentName: () => agentName,
-    fetch: fakeFetch,
-  });
+  const service = {
+    async callTool(name: McpToolName, body: unknown) {
+      const call = { name, body };
+      calls.push(call);
+      return respond(call);
+    },
+  } as Extract<ServerContext, { ok: true }>["service"];
   const logs: string[] = [];
   root = await mkdtemp(join(tmpdir(), "catenext-mcp-"));
   const repoRoot = root;
   const server = createCatenextMcpServer({
     version: "test",
-    context: async () => ctxOverride ?? { ok: true, api, config: CONFIG, root: repoRoot },
+    context: async () => ctxOverride ?? { ok: true, service, root: repoRoot },
     log: (m) => logs.push(m),
   });
-  server.server.oninitialized = () => {
-    agentName = server.server.getClientVersion()?.name;
-  };
   const [a, b] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "claude-code", version: "1.0.0" });
   await Promise.all([server.connect(a), client.connect(b)]);
@@ -116,52 +83,27 @@ describe("server MCP catenext", () => {
     }
   });
 
-  it("meneruskan ke /api/v1/agent dengan header dari config dan nama klien", async () => {
+  it("meneruskan nama tool dan input tervalidasi ke layanan lokal", async () => {
     const { client, calls } = await setup();
     await client.callTool({ name: "get_ready_tasks", arguments: {} });
-    expect(calls[0]?.url).toBe("http://api.test/api/v1/agent/ready-tasks");
-    expect(calls[0]?.headers).toMatchObject({
-      authorization: "Bearer ctnx_testtesttesttesttest",
-      "x-catenext-project": CONFIG.project_id,
-      "x-catenext-repo": "backend",
-      "x-catenext-agent": "claude-code",
-    });
-    // default_role dari overrides dipakai bila agen tidak mengisi role
-    expect(calls[0]?.body).toEqual({ role: "backend", limit: 10 });
+    expect(calls).toEqual([{ name: "get_ready_tasks", body: { limit: 10 } }]);
   });
 
-  it("menolak input project_id dari agen (tidak diteruskan)", async () => {
+  it("tidak meneruskan project_id dari agen", async () => {
     const { client, calls } = await setup();
     await client.callTool({
       name: "claim_task",
       arguments: { task_id: TASK, project_id: "00000000-0000-4000-8000-000000000000" },
     });
-    // Tanpa worktree: cek layout dulu (context), lalu claim.
-    expect(calls.map((c) => c.url.replace("http://api.test", ""))).toEqual([
-      "/api/v1/agent/context",
-      "/api/v1/agent/claim",
-    ]);
-    expect(calls[1]?.body).toEqual({ task_id: TASK });
-    expect(calls[1]?.headers["x-catenext-project"]).toBe(CONFIG.project_id);
+    expect(calls).toEqual([{ name: "claim_task", body: { task_id: TASK } }]);
   });
 
-  it("claim_task monorepo tanpa worktree ditolak lokal", async () => {
-    const { client, calls } = await setup((c) =>
-      c.url.includes("/context")
-        ? { status: 200, body: { project: { layout: "monorepo" } } }
-        : { status: 200, body: { ok: 1 } },
-    );
-    const res = await client.callTool({ name: "claim_task", arguments: { task_id: TASK } });
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toMatch(/worktree/);
-    expect(calls.some((c) => c.url.includes("/claim"))).toBe(false);
-  });
-
-  it("menyensor secret di handoff sebelum dikirim dan memberi tahu agen", async () => {
+  it("menyensor secret di handoff sebelum disimpan dan memberi tahu agen", async () => {
     const { client, calls, logs } = await setup();
     const res = await client.callTool({
       name: "complete_handoff",
       arguments: {
+        lease_id: TASK,
         task_id: TASK,
         handoff_summary: {
           ...HANDOFF,
@@ -172,15 +114,16 @@ describe("server MCP catenext", () => {
     const sent = JSON.stringify(calls[0]?.body);
     expect(sent).not.toContain("sk_live_abcdefghijklmnop");
     expect(sent).toContain("[REDACTED:");
-    expect(textOf(res)).toContain("secret-scrubber lokal menyensor");
+    expect(textOf(res)).toMatch(/secret scrubber menyensor/i);
     expect(logs).toHaveLength(1);
   });
 
-  it("menolak handoff yang melebihi batas ukuran tanpa memanggil API", async () => {
+  it("menolak handoff yang melebihi batas ukuran tanpa memanggil layanan lokal", async () => {
     const { client, calls } = await setup();
     const res = await client.callTool({
       name: "complete_handoff",
       arguments: {
+        lease_id: TASK,
         task_id: TASK,
         handoff_summary: {
           ...HANDOFF,
@@ -192,42 +135,34 @@ describe("server MCP catenext", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("menampilkan pesan error API yang ramah manusia", async () => {
-    const { client } = await setup((c) =>
-      c.url.includes("/context")
-        ? { status: 200, body: { project: { layout: "polyrepo" } } }
-        : {
-            status: 409,
-            body: {
-              error: { code: "repo_locked", message: "Repo backend sedang mengerjakan task lain." },
-            },
-          },
-    );
+  it("menampilkan pesan error layanan lokal", async () => {
+    const { client } = await setup(() => {
+      throw new Error("Repo backend sedang mengerjakan task lain.");
+    });
     const res = await client.callTool({ name: "claim_task", arguments: { task_id: TASK } });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("Repo backend sedang mengerjakan task lain. [repo_locked]");
+    expect(textOf(res)).toContain("Repo backend sedang mengerjakan task lain.");
   });
 
-  it("memberi langkah perbaikan bila belum init/login", async () => {
+  it("memberi langkah perbaikan bila belum init", async () => {
     const { client, calls } = await setup(undefined, {
       ok: false,
-      error: "Belum login. Jalankan `catenext login`.",
+      error: "Jalankan `catenext init`.",
     });
     const res = await client.callTool({ name: "get_project_context", arguments: {} });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("catenext login");
+    expect(textOf(res)).toContain("catenext init");
     expect(calls).toHaveLength(0);
   });
 
-  it("create_epic & list_epics meneruskan ke endpoint epic", async () => {
+  it("create_epic dan list_epics memakai layanan lokal", async () => {
     const { client, calls } = await setup();
-    await client.callTool({ name: "create_epic", arguments: { title: "Fitur login" } });
+    await client.callTool({ name: "create_epic", arguments: { title: "Perbaiki build" } });
     await client.callTool({ name: "list_epics", arguments: {} });
-    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
-      "POST http://api.test/api/v1/agent/epics",
-      "POST http://api.test/api/v1/agent/epics/list",
+    expect(calls).toEqual([
+      { name: "create_epic", body: { title: "Perbaiki build" } },
+      { name: "list_epics", body: {} },
     ]);
-    expect(calls[0]?.body).toEqual({ title: "Fitur login" });
   });
 
   it("create_tasks menyensor secret di instruksi tapi tidak menyentuh ref/epic_id", async () => {
@@ -247,7 +182,7 @@ describe("server MCP catenext", () => {
       },
     });
     expect(res.isError).toBeFalsy();
-    expect(calls[0]?.url).toBe("http://api.test/api/v1/agent/tasks");
+    expect(calls[0]?.name).toBe("create_tasks");
     const sent = JSON.stringify(calls[0]?.body);
     expect(sent).not.toContain("supersecretvalue123");
     expect(calls[0]?.body).toMatchObject({
@@ -256,7 +191,7 @@ describe("server MCP catenext", () => {
     });
   });
 
-  it("create_tasks menolak dependensi melingkar tanpa memanggil API", async () => {
+  it("create_tasks menolak dependensi melingkar tanpa memanggil layanan lokal", async () => {
     const { client, calls } = await setup();
     const res = await client.callTool({
       name: "create_tasks",
@@ -272,7 +207,7 @@ describe("server MCP catenext", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("upsert_persona memakai PUT dan tidak meneruskan project_id dari agen", async () => {
+  it("upsert_persona tidak meneruskan project_id dari agen", async () => {
     const { client, calls } = await setup();
     await client.callTool({
       name: "upsert_persona",
@@ -283,8 +218,7 @@ describe("server MCP catenext", () => {
         project_id: "00000000-0000-4000-8000-000000000000",
       },
     });
-    expect(calls[0]?.method).toBe("PUT");
-    expect(calls[0]?.url).toBe("http://api.test/api/v1/agent/personas");
+    expect(calls[0]?.name).toBe("upsert_persona");
     expect(calls[0]?.body).toEqual({
       alias: "bambang",
       role: "backend",
@@ -292,7 +226,7 @@ describe("server MCP catenext", () => {
     });
   });
 
-  it("save_repo_skill menulis file lokal dan menyensor secret tanpa mengubah indeks Cloud", async () => {
+  it("save_repo_skill menulis file lokal dan menyensor secret tanpa memanggil layanan", async () => {
     const { client, calls, root: dir } = await setup();
     const res = await client.callTool({
       name: "save_repo_skill",
@@ -311,7 +245,6 @@ describe("server MCP catenext", () => {
     expect(file).toContain("name: db-migrations");
     expect(file).not.toContain("sk_live_abcdefghijklmnop1234");
     expect(calls).toHaveLength(0);
-    expect(textOf(res)).toContain("catenext sync");
 
     const loaded = await client.callTool({
       name: "load_skill",
@@ -342,17 +275,27 @@ describe("server MCP catenext", () => {
     expect(textOf(res)).toContain("tidak ada");
   });
 
-  it("meneruskan peringatan kuota dari API ke agen", async () => {
-    const { client } = await setup(() => ({
-      status: 200,
-      body: { tasks: [] },
-      headers: {
-        "x-catenext-quota-warning": "Panggilan agen (tulis) bulan ini: 410/500 (82% kuota).",
+  it("meneruskan keputusan review lokal dan menyensor feedback", async () => {
+    const { client, calls } = await setup();
+    const result = await client.callTool({
+      name: "review_pull_request",
+      arguments: {
+        request: {
+          action: "submit",
+          task_id: TASK,
+          lease_id: TASK,
+          head_sha: HANDOFF_SHA,
+          decision: "approve",
+          feedback: "API_KEY=sk_live_abcdefghijklmnop",
+        },
       },
-    }));
-    const res = await client.callTool({ name: "get_ready_tasks", arguments: {} });
-    expect(textOf(res)).toContain(
-      "Peringatan kuota Catenext: Panggilan agen (tulis) bulan ini: 410/500",
-    );
+    });
+    expect(result.isError).toBeFalsy();
+    expect(calls[0]).toMatchObject({
+      name: "review_pull_request",
+      body: { request: { action: "submit", task_id: TASK, decision: "approve" } },
+    });
+    expect(JSON.stringify(calls[0])).not.toContain("sk_live_abcdefghijklmnop");
+    expect(textOf(result)).toMatch(/secret scrubber menyensor/i);
   });
 });

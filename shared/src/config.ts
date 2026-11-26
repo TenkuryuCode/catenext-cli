@@ -1,21 +1,44 @@
 import { z } from "zod";
-import { AgentAliasSchema, IdSchema, RepoNameSchema, RoleSchema } from "./common.js";
+import {
+  AgentAliasSchema,
+  IdSchema,
+  ProjectLayoutSchema,
+  RepoNameSchema,
+  RoleSchema,
+} from "./common.js";
 
 /** Versi skema .catenext/config.yaml yang dipahami versi paket ini. */
 export const CONFIG_SCHEMA_VERSION = 1;
 
+/** Platform IDE / CLI yang didukung untuk setup server MCP Catenext. */
+export const SUPPORTED_PLATFORMS = [
+  "claude-code",
+  "cursor",
+  "codex",
+  "antigravity",
+  "opencode",
+  "windsurf",
+  "vscode",
+] as const;
+export const PlatformIdSchema = z.enum(SUPPORTED_PLATFORMS);
+export type PlatformId = z.infer<typeof PlatformIdSchema>;
+
+export const DEFAULT_PLATFORMS: PlatformId[] = ["claude-code", "cursor", "codex", "antigravity"];
+
 /**
  * Isi .catenext/config.yaml. File ini milik manusia: tidak ada tool MCP yang boleh
- * menulisnya. Persona & rules SSOT-nya ada di Cloud; bagian `overrides` hanya
- * penyesuaian lokal opsional.
+ * menulisnya. State orkestrator disimpan secara lokal di .catenext/catenext.sqlite.
  */
 export const CatenextConfigSchema = z.object({
   schema_version: z.number().int().positive(),
   project_id: IdSchema,
+  project_name: z.string().min(1).max(120).optional(),
   repo_name: RepoNameSchema,
+  layout: ProjectLayoutSchema.default("polyrepo"),
   stack: z.array(z.string().min(1).max(40)).max(20).default([]),
-  /** URL Catenext Cloud API; kosong = default bawaan CLI. */
-  api_url: z.url().optional(),
+  platforms: z.array(PlatformIdSchema).optional(),
+  /** Path SQLite state bersama (opsional, untuk proyek multi-repo lintas folder). */
+  state_file: z.string().min(1).max(300).optional(),
   overrides: z
     .object({
       default_agent_alias: AgentAliasSchema.optional(),
@@ -40,7 +63,7 @@ export function checkConfigCompatibility(
     return {
       ok: false,
       reason: "too_new",
-      message: `Config memakai schema_version ${schemaVersion}, CLI ini hanya mendukung ${supported}. Perbarui CLI Catenext ke versi terbaru (sementara: git pull lalu pnpm build).`,
+      message: `Config memakai schema_version ${schemaVersion}, CLI ini hanya mendukung ${supported}. Perbarui CLI Catenext ke versi terbaru.`,
     };
   }
   if (schemaVersion < supported) {

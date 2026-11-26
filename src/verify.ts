@@ -1,9 +1,14 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { CatenextConfig } from "@catenext/shared";
-import { AgentApi, ApiRequestError } from "./api-client.js";
-import { CredentialsError, loadCredentials, resolveApiUrl } from "./credentials.js";
-import { ADAPTERS, readMcpEntry } from "./init/mcp-config.js";
+import { lstat } from "node:fs/promises";
+import type { CatenextConfig, PlatformId } from "@catenext/shared";
+import { configuredPlatforms, isMissingFile, stateFilePath } from "./config.js";
+import {
+  entryMatchesRoot,
+  inspectMcp,
+  McpConfigError,
+  selectedAdapters,
+  WINDSURF_UNSUPPORTED,
+} from "./init/mcp-config.js";
+import { readRepoFile } from "./init/repo-files.js";
 import { entryIsStale } from "./maintenance.js";
 
 export interface CheckLine {
@@ -12,75 +17,58 @@ export interface CheckLine {
   hint?: string;
 }
 
-/** Verifikasi 3 baris: token API, konfigurasi MCP, akses proyek. */
-export async function verifySetup(root: string, config: CatenextConfig): Promise<CheckLine[]> {
-  const lines: CheckLine[] = [];
-
-  let tokenLine: CheckLine;
-  let projectLine: CheckLine;
+/** Verify local configuration and server launch mapping without starting any process. */
+export async function verifySetup(
+  root: string,
+  config: CatenextConfig,
+  selected?: readonly PlatformId[],
+): Promise<CheckLine[]> {
+  const platforms = selected ?? configuredPlatforms(config);
+  const lines: CheckLine[] = [{ ok: true, label: `Config lokal valid: ${config.repo_name}` }];
+  const state = stateFilePath(root, config);
   try {
-    const creds = await loadCredentials();
-    const api = new AgentApi({
-      baseUrl: resolveApiUrl(config.api_url, creds.api_url),
-      apiKey: creds.api_key,
-      projectId: config.project_id,
-      repoName: config.repo_name,
-      agentName: () => "catenext-cli",
+    const stat = await lstat(state);
+    lines.push({
+      ok: stat.isFile() && stat.nlink === 1,
+      label: `File state lokal: ${state}`,
+      hint: "State harus file biasa, bukan symlink atau hardlink.",
     });
-    const res = await api.post<{ project: { name: string } }>("verify");
-    tokenLine = { ok: true, label: "Token API valid" };
-    projectLine = {
-      ok: true,
-      label: `Akses proyek "${res.project.name}" aktif (repo ${config.repo_name})`,
-    };
-  } catch (err) {
-    if (err instanceof CredentialsError) {
-      tokenLine = { ok: false, label: "Token API valid", hint: err.message };
-      projectLine = { ok: false, label: "Akses baca proyek aktif", hint: "Butuh token API dulu." };
-    } else if (err instanceof ApiRequestError && (err.status === 401 || err.status === null)) {
-      tokenLine = { ok: false, label: "Token API valid", hint: err.message };
-      projectLine = { ok: false, label: "Akses baca proyek aktif", hint: "Butuh token API dulu." };
-    } else {
-      tokenLine = { ok: true, label: "Token API valid" };
-      projectLine = {
-        ok: false,
-        label: "Akses baca proyek aktif",
-        hint: `${(err as Error).message} Periksa project_id di .catenext/config.yaml.`,
-      };
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+    lines.push({ ok: true, label: `State belum dibuat: ${state}` });
+  }
+  if (platforms.includes("windsurf"))
+    lines.push({ ok: false, label: "Windsurf", hint: WINDSURF_UNSUPPORTED });
+  for (const adapter of await selectedAdapters(root, platforms)) {
+    let hint: string | undefined;
+    try {
+      const source = await readRepoFile(root, adapter.path);
+      const { count, entry, managed, compatible } = inspectMcp(source, adapter);
+      if (!count) hint = "Entri catenext belum ada. Jalankan `catenext init` atau `catenext sync`.";
+      else if (!managed || !entry)
+        hint = "Nama catenext dipakai oleh entri yang tidak dikelola. Periksa secara manual.";
+      else if (
+        count !== 1 ||
+        !compatible ||
+        !entryMatchesRoot(entry, root, adapter) ||
+        entryIsStale(entry)
+      ) {
+        hint = "Entri ganda, basi, atau tidak sesuai repo. Jalankan `catenext sync --fix`.";
+      }
+    } catch (error) {
+      if (!(error instanceof McpConfigError)) throw error;
+      hint = error.message;
     }
+    lines.push({ ok: hint === undefined, label: `${adapter.label}: ${adapter.path}`, hint });
   }
-
-  const found: string[] = [];
-  const missing: string[] = [];
-  const stale: string[] = [];
-  for (const adapter of ADAPTERS) {
-    const src = await readFile(join(root, adapter.path), "utf8").catch(() => null);
-    const entry = src ? readMcpEntry(src) : null;
-    if (!entry) missing.push(adapter.label);
-    else if (entryIsStale(entry)) stale.push(adapter.label);
-    else found.push(adapter.label);
-  }
-  const mcpLine: CheckLine =
-    missing.length > 0
-      ? {
-          ok: false,
-          label: "Konfigurasi MCP terbaca",
-          hint: `Entri "catenext" belum ada untuk ${missing.join(", ")}. Jalankan \`catenext init\`.`,
-        }
-      : stale.length > 0
-        ? {
-            ok: false,
-            label: "Konfigurasi MCP terbaca",
-            hint: `Entri "catenext" untuk ${stale.join(", ")} menunjuk ke path yang sudah tidak ada. Jalankan \`catenext sync --fix\`.`,
-          }
-        : { ok: true, label: `Konfigurasi MCP terbaca (${found.join(", ")})` };
-
-  lines.push(tokenLine, mcpLine, projectLine);
+  if (!platforms.length) lines.push({ ok: true, label: "Tidak ada platform MCP yang dipilih." });
   return lines;
 }
 
 export function formatChecks(lines: CheckLine[]): string {
   return lines
-    .map((l) => `${l.ok ? "✓" : "✗"} ${l.label}${l.hint && !l.ok ? `\n    → ${l.hint}` : ""}`)
+    .map(
+      ({ ok, label, hint }) => `${ok ? "✓" : "✗"} ${label}${hint && !ok ? `\n    → ${hint}` : ""}`,
+    )
     .join("\n");
 }

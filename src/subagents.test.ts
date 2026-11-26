@@ -20,7 +20,8 @@ describe("subagent persona", () => {
     expect(md).toContain(SUBAGENT_MARKER);
     expect(md).toContain('`agent_alias: "adel"`');
     expect(md).toContain("- Hanya apps/api");
-    expect(md).toContain("Repo yang dipegang: `be`");
+    expect(md).toContain("Owned repos: `be`");
+    expect(md).toContain("Stack:");
   });
 
   it("membuat, memperbarui, menghapus file Catenext saja, dan tidak menimpa file manusia", async () => {
@@ -39,12 +40,17 @@ describe("subagent persona", () => {
       "subagent buatan sendiri\n",
     );
 
-    // Idempoten, lalu persona adel hilang dari Cloud: file-nya dihapus.
+    // Refresh orchestrator for adel-only, then idempotent.
+    const mid = await planSubagents(root, [adel]);
+    expect(mid.edits.map((e) => e.path)).toContain(join(".claude", "agents", "orchestrator.md"));
+    await applyFileEdits(root, mid.edits);
     expect((await planSubagents(root, [adel])).edits).toEqual([]);
     const gone = await planSubagents(root, []);
-    expect(gone.edits.map((e) => [e.path, e.after])).toEqual([
-      [join(".claude", "agents", "adel.md"), null],
+    expect(gone.edits.map((e) => e.path).sort()).toEqual([
+      join(".claude", "agents", "adel.md"),
+      join(".claude", "agents", "orchestrator.md"),
     ]);
+    expect(gone.edits.find((e) => e.path.endsWith("adel.md"))?.after).toBeNull();
 
     // remove ikut membersihkan subagent buatan Catenext.
     const removed = await planRemove({ root, all: false });

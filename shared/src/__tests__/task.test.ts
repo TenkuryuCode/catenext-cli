@@ -43,7 +43,7 @@ describe("state machine", () => {
     expect(s).toBe("DONE");
   });
 
-  it("complete selalu ke NEEDS_REVIEW (PR wajib; requiresApproval diabaikan)", () => {
+  it("complete selalu ke NEEDS_REVIEW (requiresApproval diabaikan)", () => {
     expect(transition("IN_PROGRESS", "complete")).toBe("NEEDS_REVIEW");
     expect(transition("IN_PROGRESS", "complete", { requiresApproval: false })).toBe("NEEDS_REVIEW");
     expect(transition("NEEDS_REVIEW", "approve")).toBe("DONE");

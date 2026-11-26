@@ -28,11 +28,20 @@ describe("fallback CLI", () => {
     });
   });
 
-  it("buildHandoff menolak tanpa --notes, --pr/--base, atau di luar git", () => {
+  it("buildHandoff mendukung handoff tanpa PR", () => {
+    const handoff = buildHandoff({ notes: "Siap", decision: [], file: [] }, GIT);
+    expect(handoff).not.toHaveProperty("pull_request");
+    expect(handoff.last_commit_hash).toBe(GIT.commit);
+  });
+
+  it("buildHandoff menolak tanpa --notes, pasangan --pr/--base yang tidak lengkap, atau di luar git", () => {
     expect(() => buildHandoff({ decision: [], file: [] }, GIT)).toThrow(/--notes/);
     expect(() =>
       buildHandoff({ notes: "x", decision: [], file: [], pr: "https://x/y/z/pull/1" }, GIT),
     ).toThrow(/--pr/);
+    expect(() => buildHandoff({ notes: "x", decision: [], file: [], base: "main" }, GIT)).toThrow(
+      /--base/,
+    );
     expect(() =>
       buildHandoff({ notes: "x", decision: [], file: [] }, { ...GIT, commit: null }),
     ).toThrow(/git/);
@@ -47,6 +56,7 @@ describe("fallback CLI", () => {
         status: "IN_PROGRESS",
         revision_count: 1,
       },
+      lease_id: "99999999-2222-4333-8444-555555555555",
       lease_expires_at: "2026-11-25T06:00:00Z",
       dependencies: [
         {

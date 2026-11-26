@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { LOCAL_EMBED_DIMS } from "@catenext/shared";
+import { scrubText } from "./scrubber.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,6 +18,7 @@ export type CodeHit = {
 };
 
 const CACHE_DIR = ".catenext/cache/code-embeddings";
+const CACHE_VERSION = 2;
 const TEXT_EXT = new Set([
   ".ts",
   ".tsx",
@@ -84,7 +86,7 @@ async function listTrackedFiles(root: string): Promise<string[]> {
       .filter(Boolean)
       .filter((p) => {
         const ext = p.includes(".") ? `.${p.split(".").pop()?.toLowerCase()}` : "";
-        return TEXT_EXT.has(ext) && !p.startsWith(".catenext/cache/");
+        return TEXT_EXT.has(ext) && !p.startsWith(".catenext/");
       });
   } catch {
     return walkFallback(root, root);
@@ -100,8 +102,7 @@ async function walkFallback(root: string, dir: string): Promise<string[]> {
     return out;
   }
   for (const e of entries) {
-    if (e.name === "node_modules" || e.name === ".git" || e.name === "dist" || e.name === ".next")
-      continue;
+    if (["node_modules", ".git", ".catenext", "dist", ".next"].includes(e.name)) continue;
     const abs = join(dir, e.name);
     if (e.isDirectory()) {
       out.push(...(await walkFallback(root, abs)));
@@ -114,12 +115,19 @@ async function walkFallback(root: string, dir: string): Promise<string[]> {
   return out;
 }
 
-type CacheEntry = { sha: string; vector: number[]; snippet: string; mtimeMs: number };
+type CacheEntry = {
+  version: number;
+  sha: string;
+  vector: number[];
+  snippet: string;
+  mtimeMs: number;
+};
 
 async function loadEntry(cacheRoot: string, rel: string): Promise<CacheEntry | null> {
   const key = sha256(rel).slice(0, 24);
   try {
-    return JSON.parse(await readFile(join(cacheRoot, `${key}.json`), "utf8")) as CacheEntry;
+    const entry = JSON.parse(await readFile(join(cacheRoot, `${key}.json`), "utf8")) as CacheEntry;
+    return entry.version === CACHE_VERSION ? entry : null;
   } catch {
     return null;
   }
@@ -130,7 +138,7 @@ async function saveEntry(cacheRoot: string, rel: string, entry: CacheEntry): Pro
   await writeFile(join(cacheRoot, `${key}.json`), JSON.stringify({ ...entry, path: rel }));
 }
 
-/** Indeks incremental + query lokal (hash embed). Tanpa API key = mode lokal. */
+/** Incremental local index with deterministic hash embeddings. */
 export async function searchLocalCode(
   root: string,
   query: string,
@@ -146,11 +154,11 @@ export async function searchLocalCode(
     const abs = join(root, rel);
     let st: Stats;
     try {
-      st = await stat(abs);
+      st = await lstat(abs);
     } catch {
       continue;
     }
-    if (st.size > 200_000) continue;
+    if (!st.isFile() || st.size > 200_000) continue;
     let text: string;
     try {
       text = await readFile(abs, "utf8");
@@ -160,8 +168,15 @@ export async function searchLocalCode(
     const sha = sha256(text);
     let entry = await loadEntry(cacheRoot, rel);
     if (!entry || entry.sha !== sha) {
-      const snippet = text.slice(0, 400).replace(/\s+/g, " ").trim();
-      entry = { sha, vector: hashEmbed(text.slice(0, 8000)), snippet, mtimeMs: st.mtimeMs };
+      const sanitized = scrubText(text).slice(0, 8000);
+      const snippet = sanitized.slice(0, 400).replace(/\s+/g, " ").trim();
+      entry = {
+        version: CACHE_VERSION,
+        sha,
+        vector: hashEmbed(sanitized),
+        snippet,
+        mtimeMs: st.mtimeMs,
+      };
       await saveEntry(cacheRoot, rel, entry);
     }
     scored.push({
@@ -176,20 +191,19 @@ export async function searchLocalCode(
   scored.sort((a, b) => b.score - a.score);
   return {
     hits: scored.slice(0, limit),
-    degraded: true,
-    note: process.env.CATENEXT_EMBEDDING_API_KEY
-      ? undefined
-      : "Tanpa CATENEXT_EMBEDDING_API_KEY: embedding kode memakai hash lokal (degraded).",
+    degraded: false,
+    note: "Pencarian kode memakai hash lokal.",
   };
 }
 
 /** Fallback keyword bila indeks gagal: ripgrep sederhana. */
 export async function keywordFallback(root: string, query: string, limit = 8): Promise<CodeHit[]> {
   try {
-    const { stdout } = await execFileAsync("rg", ["-l", "--max-count", "1", "-i", query, "."], {
-      cwd: root,
-      maxBuffer: 5e6,
-    });
+    const { stdout } = await execFileAsync(
+      "rg",
+      ["-l", "--max-count", "1", "-i", "-F", "-g", "!.catenext/**", "--", query, "."],
+      { cwd: root, maxBuffer: 5e6 },
+    );
     return stdout
       .split("\n")
       .map((l) => l.trim())
@@ -199,7 +213,7 @@ export async function keywordFallback(root: string, query: string, limit = 8): P
         source: "code" as const,
         ref: rel,
         title: rel,
-        snippet: `Keyword match: ${query}`,
+        snippet: "Keyword match",
         score: 0.1,
       }));
   } catch {

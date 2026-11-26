@@ -1,48 +1,41 @@
-import { CONFIG_SCHEMA_VERSION } from "@catenext/shared";
-import { parseDocument } from "yaml";
+import { type CatenextConfig, CONFIG_SCHEMA_VERSION } from "@catenext/shared";
+import { isNode, parseDocument } from "yaml";
 import { parseConfig } from "../config.js";
 
-export interface ConfigFields {
-  project_id: string;
-  repo_name: string;
-  stack: string[];
-  api_url?: string;
-}
+type ConfigFields = Pick<
+  CatenextConfig,
+  "project_id" | "project_name" | "repo_name" | "stack" | "platforms"
+>;
 
-export function renderNewConfig(f: ConfigFields): string {
-  const lines = [
-    "# Identitas repo ini di Catenext. File milik manusia: agen tidak boleh mengubahnya.",
-    "# Aman di-commit (tidak berisi secret). API key ada di ~/.catenext/credentials.json.",
-    `schema_version: ${CONFIG_SCHEMA_VERSION}`,
-    `project_id: ${f.project_id}`,
-    `repo_name: ${f.repo_name}`,
-    `stack: [${f.stack.join(", ")}]`,
-  ];
-  if (f.api_url) lines.push(`api_url: ${f.api_url}`);
-  lines.push(
-    "# overrides:",
-    "#   default_agent_alias: adel",
-    "#   default_role: backend",
-    "#   extra_rules: []",
+export function renderNewConfig(fields: ConfigFields): string {
+  return updateConfig(
+    "# Identitas repo ini di Catenext. File milik manusia: agen tidak boleh mengubahnya.\n" +
+      `schema_version: ${CONFIG_SCHEMA_VERSION}\n`,
+    fields,
   );
-  const out = `${lines.join("\n")}\n`;
-  parseConfig(out); // pastikan hasilnya valid sebelum ditulis
-  return out;
 }
 
-/**
- * Perbarui config yang sudah ada tanpa membuang komentar: hanya field yang diminta
- * lewat flag yang diubah. stack & overrides tetap milik manusia.
- */
+/** Perbarui hanya field yang diminta, sambil mempertahankan komentar YAML. */
 export function updateConfig(source: string, changes: Partial<ConfigFields>): string {
   const doc = parseDocument(source);
+  let changed = false;
   for (const [key, value] of Object.entries(changes)) {
     if (value === undefined) continue;
-    if (JSON.stringify(doc.get(key)) === JSON.stringify(value)) continue;
-    doc.set(key, value);
+    const current: unknown = doc.get(key, true);
+    if (JSON.stringify(isNode(current) ? current.toJSON() : current) === JSON.stringify(value)) {
+      continue;
+    }
+    const node = doc.createNode(value, { flow: Array.isArray(value) });
+    if (isNode(current)) {
+      node.comment = current.comment;
+      node.commentBefore = current.commentBefore;
+      node.spaceBefore = current.spaceBefore;
+    }
+    doc.set(key, node);
+    changed = true;
   }
+  if (!changed) return source;
   const out = doc.toString();
-  if (out === parseDocument(source).toString()) return source;
   parseConfig(out);
-  return out;
+  return source.includes("\r\n") ? out.replace(/\n/g, "\r\n") : out;
 }

@@ -1,94 +1,158 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as json } from "jsonc-parser";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CONFIG_PATH, readConfig } from "./config.js";
 import { applyInit, planInit } from "./init/index.js";
-import {
-  applyFileEdits,
-  countEntries,
-  entryIsStale,
-  planRemove,
-  planSync,
-  removeMcpEntries,
-} from "./maintenance.js";
+import { applyFileEdits, entryIsStale, planRemove, planSync } from "./maintenance.js";
+import { SUBAGENT_MARKER } from "./subagents.js";
 
-const PROJECT = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 const CMD = { command: "catenext", args: [] as string[] };
-const NEW = () => ({ command: "/usr/bin/node", args: ["/new/cli/dist/index.js"] });
-
+const NEW = () => ({ command: "node", args: ["new.js"] });
 let root: string;
+const read = (path: string) => readFile(join(root, path), "utf8");
+const write = async (path: string, contents: string) => {
+  await mkdir(join(root, path, ".."), { recursive: true });
+  await writeFile(join(root, path), contents);
+};
+
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "catenext-maint-"));
-  await writeFile(
-    join(root, ".mcp.json"),
-    '{\n  // punya saya\n  "mcpServers": { "gh": { "command": "gh", "args": [] } }\n}\n',
+  await write(
+    ".mcp.json",
+    '{\n  // user comment\n  "mcpServers": { "gh": { "command": "gh", "args": [] } }\n}\n',
   );
-  await applyInit(root, await planInit({ root, projectId: PROJECT, mcpCommand: CMD }));
+  await applyInit(root, await planInit({ root, mcpCommand: CMD }));
 });
 afterEach(() => rm(root, { recursive: true, force: true }));
 
-describe("catenext sync", () => {
-  it("tidak mengubah apa pun bila sudah selaras", async () => {
-    const plan = await planSync({ root, fix: false, defaultCommand: NEW });
-    expect(plan.edits).toEqual([]);
+describe("local sync", () => {
+  it("does not replace a working custom command", async () => {
+    expect((await planSync({ root, fix: false, defaultCommand: NEW })).edits).toEqual([]);
   });
 
-  it("memperbaiki path basi hanya dengan --fix", async () => {
-    const stale = { command: "/gone/node", args: ["/gone/dist/index.js", "mcp"] };
-    await writeFile(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { catenext: stale } }));
-    const dry = await planSync({ root, fix: false, defaultCommand: NEW });
-    expect(dry.edits.map((e) => e.path)).not.toContain(".mcp.json");
-    expect(dry.findings.some((f) => f.level === "fixable")).toBe(true);
-    const fixed = await planSync({ root, fix: true, defaultCommand: NEW });
-    await applyFileEdits(root, fixed.edits);
-    const doc = JSON.parse(await readFile(join(root, ".mcp.json"), "utf8"));
-    expect(doc.mcpServers.catenext).toEqual({
-      command: "/usr/bin/node",
-      args: ["/new/cli/dist/index.js", "mcp"],
+  it("repairs duplicates and stale commands only with --fix and keeps comments", async () => {
+    const source =
+      '{"mcpServers": {\n  "catenext":{"command":"catenext","args":["mcp"]},\n  // neighbor comment\n  "x"  : {"command":"x","args":[]},\n  "catenext":{"command":"/gone/node","args":["/gone/script.js","mcp"]},\n}}\n';
+    await write(".mcp.json", source);
+    const opts = { root, platforms: ["claude-code"] as const, defaultCommand: NEW };
+    const plan = await planSync({ ...opts, fix: false });
+    expect(plan.edits).toEqual([]);
+    expect(plan.findings).toMatchObject([{ level: "fixable" }]);
+    const fix = await planSync({ ...opts, fix: true });
+    expect(await read(".mcp.json")).toBe(source);
+    await applyFileEdits(root, fix.edits);
+    const text = await read(".mcp.json");
+    expect(text.match(/"catenext"/g)).toHaveLength(1);
+    expect(text).toContain('// neighbor comment\n  "x"  : {"command":"x","args":[]},');
+    expect(json(text)).toMatchObject({
+      mcpServers: {
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
+        catenext: { command: "node", args: ["new.js", "mcp", "--root", "${CLAUDE_PROJECT_DIR}"] },
+      },
     });
   });
 
-  it("menyatukan entri duplikat dan membuat ulang file rusak dengan .bak", async () => {
-    const dup =
-      '{"mcpServers":{"catenext":{"command":"a","args":[]},"x":{"command":"x","args":[]},"catenext":{"command":"b","args":[]}}}';
-    expect(countEntries(dup)).toBe(2);
-    expect(countEntries(removeMcpEntries(dup))).toBe(0);
-    await writeFile(join(root, ".mcp.json"), dup);
-    await writeFile(join(root, ".cursor/mcp.json"), "{ rusak");
-    const plan = await planSync({ root, fix: true, defaultCommand: NEW });
-    await applyFileEdits(root, plan.edits);
-    const claude = await readFile(join(root, ".mcp.json"), "utf8");
-    expect(countEntries(claude)).toBe(1);
-    expect(JSON.parse(claude).mcpServers.x).toBeTruthy();
-    expect(await readFile(join(root, ".cursor/mcp.json.bak"), "utf8")).toBe("{ rusak");
-    expect(countEntries(await readFile(join(root, ".cursor/mcp.json"), "utf8"))).toBe(1);
+  it("does not replace malformed files even with fix", async () => {
+    const source = "{broken";
+    await write(".cursor/mcp.json", source);
+    const { edits, findings } = await planSync({
+      root,
+      platforms: ["cursor"],
+      fix: true,
+      defaultCommand: NEW,
+    });
+    expect(edits).toEqual([]);
+    expect(findings).toMatchObject([{ level: "warn" }]);
+    expect(await read(".cursor/mcp.json")).toBe(source);
+  });
+
+  it("tracks explicitly added platforms and refuses stale plans", async () => {
+    const { edits } = await planSync({
+      root,
+      platforms: ["vscode"],
+      fix: false,
+      defaultCommand: NEW,
+    });
+    expect(edits.map(({ path }) => path)).toEqual([".vscode/mcp.json", CONFIG_PATH]);
+    await write(".vscode/mcp.json", '{"servers":{}}');
+    await expect(applyFileEdits(root, edits)).rejects.toThrow(/berubah/);
+    const updated = await planSync({
+      root,
+      platforms: ["vscode"],
+      fix: false,
+      defaultCommand: NEW,
+    });
+    await applyFileEdits(root, updated.edits);
+    expect((await readConfig(root)).platforms).toContain("vscode");
   });
 });
 
-describe("catenext remove", () => {
-  it("menghapus semua jejak Catenext tapi menjaga isi milik pengguna", async () => {
-    const edits = await planRemove({ root, all: false });
+describe("local remove", () => {
+  it("removes only selected adapter and preserves project, state, unrelated configs and skills", async () => {
+    const config = await readConfig(root);
+    const cursor = await read(".cursor/mcp.json");
+    await write(".catenext/state.json", '{"private":true}');
+    await write(".catenext/skills/dev.md", "keep skill");
+    const edits = await planRemove({ root, platforms: ["claude-code"] });
+    expect(json(await read(".mcp.json")).mcpServers.catenext).toBeTruthy();
     await applyFileEdits(root, edits);
-    const claude = await readFile(join(root, ".mcp.json"), "utf8");
-    expect(claude).toContain("// punya saya");
-    expect(claude).toContain('"gh"');
-    expect(countEntries(claude)).toBe(0);
-    await expect(readFile(join(root, ".cursor/mcp.json"))).rejects.toThrow();
-    await expect(readFile(join(root, ".catenext/config.yaml"))).rejects.toThrow();
-    await expect(readFile(join(root, "AGENTS.md"))).rejects.toThrow();
-    await expect(readFile(join(root, ".gitignore"))).rejects.toThrow();
-    expect(await planRemove({ root, all: false })).toEqual([]);
+    expect(await read(".mcp.json")).toContain("// user comment");
+    expect(json(await read(".mcp.json"))).toEqual({
+      mcpServers: { gh: { command: "gh", args: [] } },
+    });
+    expect(await read(".cursor/mcp.json")).toBe(cursor);
+    expect(await readConfig(root)).toMatchObject({
+      project_id: config.project_id,
+      platforms: ["cursor", "codex", "antigravity"],
+    });
+    expect(await read(".catenext/state.json")).toBe('{"private":true}');
+    expect(await read(".catenext/skills/dev.md")).toBe("keep skill");
+  });
+
+  it("keeps custom state linkage after full removal; sync does not reinstall", async () => {
+    const project = await readConfig(root);
+    await write(
+      CONFIG_PATH,
+      `${await read(CONFIG_PATH)}state_file: .catenext/skills/custom-state.md\n`,
+    );
+    await write(".catenext/skills/custom-state.md", '{"private":true}');
+    await write(".claude/agents/local.md", "unmanaged\n");
+    await write(".claude/agents/generated.md", `${SUBAGENT_MARKER}\n`);
+    await applyFileEdits(root, await planRemove({ root, all: true }));
+    expect(await readConfig(root)).toMatchObject({
+      project_id: project.project_id,
+      platforms: [],
+      state_file: ".catenext/skills/custom-state.md",
+    });
+    expect(await read(".catenext/skills/custom-state.md")).toBe('{"private":true}');
+    expect(await read(".gitignore")).toContain(".catenext/state.json");
+    expect(await read(".claude/agents/local.md")).toBe("unmanaged\n");
+    await expect(read(".claude/agents/generated.md")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await planRemove({ root })).toEqual([]);
+    expect((await planSync({ root, fix: true, defaultCommand: NEW })).edits).toEqual([]);
+  });
+
+  it("does not delete a foreign MCP server using the same name", async () => {
+    const foreign =
+      '{"mcpServers":{"catenext":{"url":"https://other.example"},"other":{"command":"tool"}}}';
+    await write(".agents/mcp_config.json", foreign);
+    await applyFileEdits(root, await planRemove({ root, platforms: ["antigravity"] }));
+    expect(await read(".agents/mcp_config.json")).toBe(foreign);
   });
 });
 
-describe("entryIsStale", () => {
-  it("menganggap skrip di cache npx basi meski filenya masih ada", () => {
-    expect(
-      entryIsStale({
-        command: "node",
-        args: ["/home/a/.npm/_npx/ab12/node_modules/catenext/dist/index.js", "mcp"],
-      }),
-    ).toBe(true);
+it("flags only missing absolute launch paths and leaves PATH commands alone", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "catenext-stale-"));
+  try {
+    const script = join(dir, "_npx", "catenext.mjs");
+    await mkdir(join(dir, "_npx"), { recursive: true });
+    await writeFile(script, "");
+    expect(entryIsStale({ command: "node", args: [script, "mcp"] })).toBe(false);
+    expect(entryIsStale({ command: "node", args: [join(dir, "gone.js"), "mcp"] })).toBe(true);
     expect(entryIsStale({ command: "npx", args: ["-y", "catenext", "mcp"] })).toBe(false);
-  });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

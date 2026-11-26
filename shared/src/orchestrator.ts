@@ -1,178 +1,176 @@
 /**
- * Aturan orchestrator: agen utama sesi di IDE/CLI adalah orchestrator, persona Catenext
- * adalah subagent-nya. Satu sumber untuk blok AGENTS.md (`catenext init`) dan master prompt
- * di Web, agar keduanya tidak pernah berbeda isi. Satu baris per poin (tanpa patah manual)
- * supaya rapi di Markdown maupun di kotak teks Web.
+ * Orchestrator rules: main session agent delegates to Catenext personas.
+ * Agent markdown stays English. Q&A with the user mirrors the user's language.
  */
 
-/** Aturan untuk agen utama (orchestrator). Markdown, tanpa judul tingkat atas. */
+/** Rules for the main agent (orchestrator). Markdown, no top-level heading. */
 export const ORCHESTRATOR_RULES: readonly string[] = [
-  "Anda, agen utama sesi ini, adalah **orchestrator**. Persona Catenext (mis. `bambang` backend di repo `be`, `mira` frontend di repo `fe`, `qori` QA) adalah **subagent** Anda. Orchestrator tidak memakai `agent_alias`.",
+  "You are the **orchestrator**. Catenext personas are your **subagents**. Do not use `agent_alias` yourself.",
   "",
-  "### Konteks di awal setiap sesi",
+  "### Session start (every new chat)",
   "",
-  "1. `get_project_context`: repo proyek (`project_repos`), indeks dokumen Cloud (`documents`), skill, dan handoff terbaru.",
-  "2. Baca dokumen yang relevan dengan `get_document` (mis. `blueprint`, `erd`, `architecture`). Dokumen ini sumber kebenaran lintas sesi, IDE, dan CLI; jangan mengandalkan ingatan sesi sebelumnya.",
-  "3. `get_project_board` (CLI: `catenext board`): semua epic dan task lintas repo, status, persona, repo tujuan, dan dependensi. Lanjutkan dari sini, bukan dari awal.",
+  "1. Read **`CATENEXT.md`** first (master prompt for cold start). Platform entry files (`CLAUDE.md`, `.cursor/CATENEXT.md`, …) only redirect there.",
+  "2. Then read **`AGENTS.md`** for full orchestrator rules.",
+  "3. Ask the user first in **their language**; keep tool names and agent stubs English.",
+  "4. Call `session_brief` (compact). Present any `pending_approvals` to the human with clear options.",
+  "5. Read docs (`blueprint`, `orchestrator`, `permissions`) and note project **stack** from config/context.",
   "",
-  "### Tugas orchestrator",
+  "### Language & tokens",
   "",
-  "1. Rencanakan: `list_epics`/`create_epic` lalu `create_tasks`. Setiap task wajib punya `target_repo` (repo tempat kode berubah) dan `persona` atau `role`. Pecah pekerjaan lintas repo per repo (mis. kontrak API di `be`, layar di `fe`, uji di `qa`) dan hubungkan dengan `depends_on`. Rencana masuk DRAFT sampai manusia menyetujuinya di Web.",
-  '2. Bagi tugas: tetapkan pemegang repo dengan `upsert_persona` (`repos: ["be"]`; CLI: `catenext persona set bambang --role backend --repo be`). Task tanpa `target_repo` milik persona yang memegang satu repo otomatis diarahkan ke repo itu.',
-  '3. Delegasikan: untuk task yang `is_ready` di board, panggil subagent persona penanggung jawab (mis. "bambang, kerjakan task <task_id> di repo be"). Jangan mengerjakan sendiri task milik persona kecuali manusia memintanya.',
-  "4. Tinjau handoff subagent: ringkasan, perintah verifikasi, dan PR. Jalankan verifikasinya, lalu lanjutkan task hilir yang terbuka.",
-  '5. Revisi: bila hasil perlu diperbaiki (temuan review Anda atau permintaan manusia), pakai `manage_task` dengan `action: request_revision` dan `feedback` yang spesifik (CLI: `catenext revise <task_id> --feedback "..." [--to <alias>]`). Task pindah ke kolom **Revisi**; **jangan membuat task baru untuk revisi**. Lalu delegasikan lagi ke subagent penanggung jawabnya.',
-  "6. Assign: `manage_task` dengan `action: assign` (CLI: `catenext assign <task_id> --to <alias>` atau `--role <role>`) untuk menetapkan atau mengganti penanggung jawab task yang belum dikerjakan.",
-  "7. Catat konteks: keputusan arsitektur, skema data (ERD), dan kontrak antar-repo disimpan dengan `save_document` (kirim `expected_version` dari versi yang Anda baca; 0 = dokumen baru). Ringkas, Markdown, tanpa code dump atau secret.",
+  "- Mirror the user's language for Q&A and approval prompts.",
+  "- Prefer `session_brief` / `interview_setup` — short options, never essays.",
+  "- Delegation briefs stay English and use the GOAL/SCOPE/CONTEXT/CONSTRAINTS/DONE WHEN format.",
   "",
-  "### Subagent per persona dan repo terpisah",
+  "### Professional workflow",
   "",
-  "Setiap persona dari `list_personas` menjadi satu subagent: nama = alias, isi = role, repo yang dipegang, aturan persona, dan alur subagent di bawah.",
+  "1. Clarify ambiguous or high-risk goals before planning.",
+  "2. Plan DRAFT tasks with `target_repo` + `persona`/`role` + `depends_on`.",
+  "3. **Kickoff brainstorm:** before parallel work, sync involved personas (skill `cross-agent-sync`). Capture decisions/contracts/open asks in document `sync-board`. Personas communicate through orchestrator + `sync-board`, not private side channels.",
+  "4. **Human gate:** DRAFT and NEEDS_REVIEW wait for human approval. Report findings, then offer options (chat or numbered).",
+  "5. Delegate ready work to the owning persona. Do **not** implement persona tasks yourself unless the user explicitly asks.",
+  "6. After handoffs: verify notes, then either request revision on the **same** task or present approve options to the human.",
+  "7. Docs hygiene: load skill `docs-hygiene` and/or delegate persona `scribe` to tidy project documents.",
+  "8. Persona aliases/rules are customizable (`persona set`); keep the file **format** stable so every IDE/CLI can read them.",
+  "9. External folders: `manage_roots` — owning persona is responsible.",
   "",
-  "- Claude Code: `catenext sync` membuat `.claude/agents/<alias>.md` secara otomatis.",
-  "- IDE/CLI lain: buat subagent, mode, atau rule dengan format bawaan IDE Anda. Bila IDE tidak punya subagent, buka satu sesi baru per persona.",
-  "- Repo di folder terpisah: jalankan `catenext init --project <project_id> --repo <nama>` sekali di setiap folder repo (`--repo be` di folder backend, `--repo fe` di folder frontend). Subagent bekerja dari folder repo yang ia pegang; dari folder lain ia memakai CLI di folder itu (`cd <folder-be> && npx catenext next --as bambang`), karena MCP di folder ini terikat ke repo folder ini.",
-  "- Persona master (tingkat workspace) berlaku lintas proyek. Untuk memegang repo di proyek ini, buat persona proyek dengan alias yang sama: aturan master diwarisi bila `rules` tidak dikirim.",
-  "- Persona belum ada: usulkan alias, role, repo, dan aturannya ke manusia, lalu `upsert_persona` setelah disetujui.",
+  "### Cross-agent communication",
   "",
-  "### Alur subagent (persona)",
+  "- Start shared work with a short brainstorm (orchestrator hosts).",
+  "- Persist outcomes in `sync-board` (`get_document` / `save_document`).",
+  "- Mid-flight asks use: `ASK: <persona> · NEED: <one line> · BLOCKS: <task id>` → orchestrator updates `sync-board` or briefs the other persona.",
+  "- Handoffs remain the durable completion record; `sync-board` is for live coordination only.",
   "",
-  "1. Pastikan berada di folder repo yang dipegang. `get_ready_tasks` dan `claim_task` dengan `agent_alias: <alias>`; patuhi aturan persona di hasil claim. Bila `layout` proyek = `monorepo`, claim wajib mode worktree. Task di kolom Revisi didahulukan dan membawa feedback revisinya.",
-  "2. Baca dokumen proyek yang dirujuk task (`get_document`) bila perlu konteks desain.",
-  "3. Kerjakan, jalankan tes, commit di branch/worktree kerja (boleh commit sewaktu-waktu; jangan merge ke default branch).",
-  "4. Buat PR, lalu `complete_handoff` dengan `pull_request` wajib (status → NEEDS_REVIEW), atau `report_blocker` bila buntu.",
-  "5. Laporkan ke orchestrator: task, status, URL PR, dan perintah verifikasi.",
+  "### Parallel worktrees (required for concurrent subagents)",
   "",
-  "Subagent hanya mengerjakan satu task per pemanggilan dan tidak memanggil `create_tasks`, `manage_task`, `upsert_persona`, atau `save_document`.",
+  "- Each subagent that implements code works in its **own git worktree + branch** (unique `session_id`). Never share one dirty checkout across parallel personas.",
+  "- Independent tasks may run **in parallel** (different worktrees). Dependent tasks stay **sequential** via `depends_on`.",
+  "- Monorepo: claim **must** use worktree. Polyrepo: still use a distinct worktree/branch whenever more than one subagent runs at once.",
+  "- Orchestrator **watches all active worktrees** (board leases, handoff branches, `git worktree list`) and keeps a compact map: task → persona → worktree/branch → status.",
+  "- Subagents **do not** merge to default/`main`. They hand off from their worktree only.",
+  "",
+  "### Integrate & ship (orchestrator + human)",
+  "",
+  "After handoffs (or when several worktrees are ready), the orchestrator **reviews and integrates** — edit/combine only as needed to resolve conflicts or glue contracts — then asks the human how to land changes:",
+  "",
+  "```text",
+  "INTEGRATE READY",
+  "worktrees: <task/persona/branch list>",
+  "summary: <what landed in each>",
+  "Options:",
+  "  A) PR     — open/update PR(s); wait for review/CI",
+  "  B) merge  — merge to main/default only after explicit human OK",
+  "  C) revise — send feedback to a persona worktree (same task)",
+  "  D) next   — leave branches; continue other work",
+  "```",
+  "",
+  "Follow the user's choice. Never force-push or merge default without explicit approval. Prefer PR unless the user asks for a direct merge.",
+  "",
+  "### Human approval (orchestrator → human)",
+  "",
+  "When something needs a human decision, **report** compactly then ask with options, e.g.:",
+  "",
+  "```text",
+  "APPROVAL NEEDED",
+  "task: <id> · <title> · status=<DRAFT|NEEDS_REVIEW>",
+  "worktree/branch: <if any>",
+  "summary: <one line from handoff or plan>",
+  "verify: <command if any>",
+  "Options:",
+  "  1) approve   — catenext task approve <id>  /  manage_task approve_plan|approve",
+  "  2) revise    — tell me feedback (I will catenext revise)",
+  "  3) next      — skip for now; show session_brief again",
+  "Reply with 1 / 2 / 3 or the same words in chat.",
+  "```",
+  "",
+  "Do not claim tests passed or approval done without evidence. Never invent merge status.",
+  "",
+  "### Subagent briefing template",
+  "",
+  "```text",
+  "GOAL: measurable outcome",
+  "SCOPE: dirs/files allowed",
+  "CONTEXT: stack, docs, prior handoffs, graph neighbors if useful",
+  "CONSTRAINTS: dedicated worktree/branch; no merge to main; no secrets in handoffs",
+  "DONE WHEN: tests/verify command and handoff fields from that worktree",
+  "```",
+  "",
+  "### Subagents",
+  "",
+  "- Each persona from `list_personas` is one subagent file generated for the active IDE/CLI.",
+  "- Claim with `agent_alias` **and** a unique worktree when working in parallel (always for monorepo).",
+  "- Subagents must not call `create_tasks`, `manage_task`, `upsert_persona`, or `save_document`, and must not merge default branch.",
 ];
 
-/** Alur untuk agen tanpa MCP (Codex, Aider, dll.). */
+/** CLI fallback when MCP tools are unavailable. */
 export const CLI_FALLBACK_RULES: readonly string[] = [
-  "### Tanpa tool MCP",
+  "### Without MCP tools",
   "",
-  "- Orchestrator: `catenext board`, `catenext doc list|get|save`, `catenext persona list|set`, `catenext revise`, `catenext assign`.",
-  '- Subagent: `catenext next --as <alias>`, `catenext claim <task_id> --as <alias> [--worktree]` (wajib `--worktree` di monorepo), kerjakan & commit di branch, buat PR, lalu `catenext done <task_id> --notes "..." --verify "..." --pr <url> --base <branch>`.',
-  '- Bila buntu: `catenext block <task_id> --category <missing_env|ambiguous_requirement|failing_tests|dependency_issue|other> --reason "..."`.',
+  "- Orchestrator: `catenext brief`, `catenext board`, `catenext doc …`, `catenext persona …`, `catenext revise`, `catenext assign`, `catenext root …`.",
+  "- Human approve: `catenext task approve <id>` (plan) or `catenext review approve <id>`.",
+  '- Subagent: `catenext next --as <alias>`, `catenext claim <id> --as <alias> [--worktree]`, then `catenext done <id> --lease <id> --notes "..." --verify "..."`.',
+  '- Blocked: `catenext block <id> --category <…> --reason "..."`.',
 ];
 
 export const GENERAL_RULES: readonly string[] = [
-  "Aturan: jangan menyalin kode atau secret ke handoff atau dokumen (rujuk path file); jangan mengedit `.catenext/config.yaml` atau file konfigurasi MCP IDE. Skill repo ada di `.catenext/skills/`.",
+  "Rules: no secrets or code dumps in handoffs/docs (cite paths); do not hand-edit `.catenext/config.yaml` or IDE MCP configs — use init/sync after user confirmation. Skills: `.catenext/skills/`. Prefer compact tool JSON.",
 ];
 
-export interface MasterPromptInput {
-  projectId: string;
-  projectName: string;
-  /** Repo yang sudah dikenal proyek (mis. ["be", "fe"]). */
-  repos?: readonly string[] | undefined;
-  /** Diisi bila API bukan default (self-host / dev lokal). */
-  apiUrl?: string | undefined;
-}
-
-/** Input untuk prompt delegasi satu task (salin dari Web → tempel ke orchestrator). */
+/** Input for a short English delegation paste. */
 export interface TaskDelegatePromptInput {
   taskId: string;
   title: string;
   promptInstruction: string;
   status: string;
-  /** Alias persona penanggung jawab, bila ada. */
   personaAlias?: string | null;
   role?: string | null;
   targetRepo?: string | null;
-  /** Feedback revisi bila status REVISION_REQUESTED / sedang revisi. */
   reviewFeedback?: string | null;
-  /** monorepo → claim wajib worktree. */
   layout?: "monorepo" | "polyrepo";
-  /** Path folder lokal hint (mis. apps/api); opsional. */
   folderHint?: string | null;
+  stack?: string[] | null;
 }
 
-/**
- * Prompt yang disalin manusia ke agen utamanya (IDE atau CLI apa pun) saat proyek baru dibuat.
- * Tidak memuat API key: login selalu dilakukan manusia lewat `catenext login`.
- */
-export function renderMasterPrompt(input: MasterPromptInput): string {
-  const apiFlag = input.apiUrl ? ` --api-url ${input.apiUrl}` : "";
-  const init = `npx -y catenext init --project ${input.projectId} --repo <nama-repo>${apiFlag}`;
-  const known =
-    input.repos && input.repos.length > 0
-      ? `Repo yang sudah dikenal proyek ini: ${input.repos.map((r) => `\`${r}\``).join(", ")}.`
-      : "Satu proyek bisa membawahi beberapa repo (mis. `be` dan `fe` di folder terpisah).";
-  return [
-    `Anda adalah orchestrator Catenext untuk proyek "${input.projectName}" (project_id ${input.projectId}). ${known}`,
-    "Siapkan workspace ini lalu bekerja sebagai orchestrator:",
-    "",
-    "1. Bila komputer ini belum pernah login Catenext (belum ada `~/.catenext/credentials.json`), minta saya menjalankan `npx -y catenext login` sendiri. Jangan meminta, menulis, atau menyalin API key.",
-    `2. Untuk setiap folder repo proyek ini, tanyakan nama repo-nya (mis. \`be\`, \`fe\`), lalu di folder itu jalankan \`${init} --dry-run\`, tunjukkan diff-nya, dan jalankan tanpa \`--dry-run\`. Ini memasang MCP Catenext, menulis aturan orchestrator di AGENTS.md, dan mencetak verifikasi 3 baris. Laporkan bila ada yang gagal.`,
-    "3. Panggil `get_project_context`, `list_personas`, dan `get_project_board`. Usulkan persona per repo/role (mis. bambang → `be`, mira → `fe`, qori → QA) beserta aturannya; setelah saya setujui, simpan dengan `upsert_persona` (sertakan `repos`).",
-    "4. Jalankan `npx -y catenext sync` di setiap folder repo untuk indeks skill dan subagent Claude Code per persona. Bila IDE/CLI Anda bukan Claude Code atau tidak membaca AGENTS.md, salin aturan orchestrator di bawah ke file rules utama IDE Anda dan buat subagent per persona dengan format bawaan IDE Anda.",
-    "5. Bila belum ada dokumen `blueprint` di Cloud, susun ringkasan proyek (tujuan, repo dan tanggung jawabnya, stack, kontrak antar-repo) bersama saya lalu simpan dengan `save_document` (slug `blueprint`, kind `blueprint`, expected_version 0). Lakukan hal serupa untuk `erd` bila ada database.",
-    "6. Laporkan: repo yang terhubung, persona dan repo yang dipegang, subagent yang dibuat, dan dokumen yang tersedia.",
-    "",
-    "## Aturan orchestrator",
-    "",
-    ...ORCHESTRATOR_RULES,
-    "",
-    ...GENERAL_RULES,
-  ].join("\n");
-}
-
-/**
- * Prompt singkat per task untuk ditempel ke orchestrator (IDE).
- * Orchestrator mendelegasikan ke subagent persona; tidak memuat API key atau code dump.
- */
+/** Short English delegation prompt for the orchestrator to paste to a subagent. */
 export function renderTaskDelegatePrompt(input: TaskDelegatePromptInput): string {
   const alias = input.personaAlias?.trim() || null;
   const repo = input.targetRepo?.trim() || null;
   const folder =
     input.folderHint?.trim() ||
-    (repo ? `folder checkout yang repo_name-nya \`${repo}\`` : "folder repo yang sesuai");
+    (repo ? `checkout whose repo_name is \`${repo}\`` : "the matching repo folder");
   const monorepo = input.layout === "monorepo";
   const who = alias
-    ? `\`${alias}\`${input.role ? ` (role ${input.role})` : ""}`
+    ? `\`${alias}\`${input.role ? ` (${input.role})` : ""}`
     : input.role
-      ? `persona ber-role \`${input.role}\``
-      : "persona penanggung jawab yang cocok";
+      ? `persona role \`${input.role}\``
+      : "the owning persona";
+  const stack = input.stack && input.stack.length > 0 ? input.stack.join(", ") : null;
 
   const lines = [
-    `Delegasikan task Catenext berikut ke subagent ${who}. Jangan kerjakan sendiri kecuali saya meminta.`,
+    `Delegate this Catenext task to ${who}. Do not implement it yourself unless I ask.`,
     "",
-    `## Task`,
+    "GOAL: complete the task and hand off with verify evidence",
+    `SCOPE: task \`${input.taskId}\` · ${input.title}${repo ? ` · repo \`${repo}\`` : ""}`,
+    `CONTEXT: status=${input.status}${stack ? ` · stack=${stack}` : ""}`,
+    "CONSTRAINTS: use a dedicated git worktree+branch; no secrets/code dumps; do not merge default/main",
+    "DONE WHEN: tests/verify noted from that worktree; complete_handoff → NEEDS_REVIEW",
     "",
-    `- **ID:** \`${input.taskId}\``,
-    `- **Judul:** ${input.title}`,
-    `- **Status:** ${input.status}`,
-    ...(repo ? [`- **target_repo:** \`${repo}\``] : []),
-    ...(alias ? [`- **persona:** \`${alias}\``] : []),
-    ...(input.role && !alias ? [`- **role:** \`${input.role}\``] : []),
-    "",
-    "## Instruksi task",
-    "",
-    input.promptInstruction.trim(),
-    "",
+    input.promptInstruction.trim().slice(0, 800),
   ];
 
   if (input.reviewFeedback?.trim()) {
-    lines.push("## Feedback revisi", "", input.reviewFeedback.trim(), "");
+    lines.push("", `revision feedback: ${input.reviewFeedback.trim().slice(0, 400)}`);
   }
 
-  const sub = alias ? `\`${alias}\`` : "yang tepat";
-  const claimHint = monorepo
-    ? "3. Claim wajib mode worktree (branch/sesi terpisah). Commit di branch OK; jangan merge ke default branch."
-    : "3. Claim task; worktree opsional kecuali ada reservasi branch. Commit di branch OK; jangan merge ke default branch.";
-  const example = alias
-    ? `Contoh perintah ke subagent: "${alias}, kerjakan task ${input.taskId}${repo ? ` di repo ${repo}` : ""}${monorepo ? " dengan worktree" : ""}."`
-    : `Contoh: "Kerjakan task ${input.taskId}${repo ? ` di repo ${repo}` : ""} lewat persona yang tepat${monorepo ? ", claim dengan worktree" : ""}."`;
-
+  const sub = alias ? `\`${alias}\`` : "the right persona";
   lines.push(
-    "## Yang harus dilakukan orchestrator",
     "",
-    `1. Pastikan subagent bekerja dari ${folder} (.catenext/config.yaml dengan repo yang benar).`,
-    `2. Panggil subagent ${sub}: kerjakan **hanya** task \`${input.taskId}\`.`,
-    claimHint,
-    "4. Setelah selesai: buat PR, lalu complete_handoff / catenext done dengan pull_request wajib → NEEDS_REVIEW.",
-    "5. Laporkan ke saya: status, URL PR, dan perintah verifikasi.",
-    "",
-    example,
+    `1. Work from ${folder} in a **separate worktree** (unique session/branch).`,
+    `2. Call subagent ${sub} for **only** \`${input.taskId}\`.`,
+    monorepo
+      ? "3. Claim with `--worktree` (required); commit only on that branch; never merge default."
+      : "3. Claim with `--worktree` when parallel agents run; commit only on that branch; never merge default.",
+    "4. `complete_handoff` / `catenext done` → NEEDS_REVIEW. Orchestrator integrates / opens PR per human choice.",
+    "5. Report: status, worktree/branch, commit, PR URL if any, verify command.",
   );
 
   return lines.join("\n");

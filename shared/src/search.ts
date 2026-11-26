@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-/** Sumber yang bisa diindeks / dicari di Cloud (kode lokal = CLI saja). */
+/** Sumber konteks lokal. Pencarian kode terpisah di CLI. */
 export const SEARCH_SOURCES = ["document", "skill", "task"] as const;
 export const SearchSourceSchema = z.enum(SEARCH_SOURCES);
 export type SearchSource = z.infer<typeof SearchSourceSchema>;
@@ -24,7 +24,7 @@ export type SearchHit = z.infer<typeof SearchHitSchema>;
 export const SearchContextOutput = z.object({
   hits: z.array(SearchHitSchema),
   reranked: z.boolean(),
-  /** true bila embedding/rerank memakai fallback lokal (tanpa API key provider). */
+  /** True bila pencarian terpaksa memakai fallback. */
   degraded: z.boolean().default(false),
 });
 export type SearchContextOutputType = z.infer<typeof SearchContextOutput>;
