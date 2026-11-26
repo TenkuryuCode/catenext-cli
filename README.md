@@ -47,11 +47,11 @@ catenext sync --platform cursor --force
 
 ## Master prompt (salin ke chat)
 
-Setelah `init`, file **`CATENEXT.md`** di root proyek berisi teks yang sama. Pointer platform
-(`CLAUDE.md`, `.cursor/CATENEXT.md`, …) hanya mengarahkan ke situ, lalu ke `AGENTS.md`.
+Tempel blok di bawah sebagai **pesan pertama** di chat agen (repo kosong atau sudah ada
+kode). Agen akan **menginstall CLI + `init`** bila belum ada, lalu jadi orchestrator.
 
-**Cara pakai:** buka sesi agen baru di repo yang sudah di-`init`, lalu tempel blok di bawah
-sebagai pesan pertama (atau biarkan agen membaca `CATENEXT.md` sendiri).
+Setelah `init`, file **`CATENEXT.md`** di root berisi teks yang sama. Pointer platform
+(`CLAUDE.md`, `.cursor/CATENEXT.md`, …) mengarahkan ke situ, lalu ke `AGENTS.md`.
 
 ````markdown
 # Catenext · Master Prompt
@@ -63,6 +63,20 @@ You are starting a **new Catenext session** in this repo. Follow this file first
 - You are the **orchestrator** (main agent). Do **not** use `agent_alias`.
 - Persona subagents (`be`, `fe`, `tester`, `android`, `security`, `reviewer`, …) do the implementation work.
 - Ask the human first; mirror **their language**. Agent stubs and tool names stay English.
+
+## Bootstrap (install if missing)
+
+If `.catenext/config.yaml` is missing, or `catenext` / MCP is not usable yet, **set up first** — do not invent a cloud login.
+
+1. Require **Node.js ≥ 22.12**. If missing, tell the human how to install it.
+2. Install CLI: `npm install -g catenext` (or `npx -y catenext …` for one-off).
+3. Detect IDE/CLI and **ask the human** which `--platform` to use (recommend what you detect):
+   `cursor` · `claude-code` · `codex` · `antigravity` · `opencode` · `vscode`
+4. Show a dry-run, wait for OK, then apply:
+   `catenext init --platform <id> --dry-run`
+   `catenext init --platform <id>` (TTY interview) or `catenext init --platform <id> --yes`
+5. `catenext verify --platform <id>` — then ask the human to **restart the IDE/CLI** and trust the `catenext` MCP server.
+6. Only after verify: continue with **First 60 seconds** below (read this file / `AGENTS.md`, then `catenext brief`).
 
 ## First 60 seconds
 
@@ -114,6 +128,9 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 
 | Need | Command |
 | --- | --- |
+| Install CLI | `npm install -g catenext` |
+| First-time setup | `catenext init --platform <id>` (`--dry-run` / `--yes`) |
+| Verify MCP | `catenext verify --platform <id>` |
 | Session snapshot | `catenext brief` |
 | Board | `catenext board` |
 | Claim (parallel-safe) | `catenext claim <id> --as <alias> --worktree` |
@@ -124,7 +141,8 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 
 ## Do / Don't
 
-- **Do** keep tool outputs compact; cite paths; one worktree per concurrent subagent.
+- **Do** install/init when setup is missing; keep tool outputs compact; cite paths; one worktree per concurrent subagent.
+- **Don't** invent cloud accounts, API keys, or dashboards — this CLI is local SQLite only.
 - **Don't** implement persona tasks yourself unless the human explicitly asks.
 - **Don't** merge to main without explicit human choice; prefer PR when unsure.
 - **Don't** invent test/merge results or paste secrets into handoffs/docs.
@@ -132,9 +150,8 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 Full rules → [AGENTS.md](./AGENTS.md). Persona stubs → platform `agents/` folders (English, stack-aware).
 ````
 
-Alur singkat setelah prompt di atas: orchestrator (tanpa `agent_alias`) → `catenext brief` →
-tawarkan approval jika ada → baru rencanakan / delegasikan. Bahasa tanya-jawab mengikuti manusia;
-stub agen dan nama tool tetap Inggris.
+Alur: agen install/`init` bila perlu → restart IDE → `catenext brief` → approval jika ada →
+rencana / delegasi. Bahasa tanya-jawab mengikuti manusia; stub agen tetap Inggris.
 
 ## Orchestrator dan persona
 
