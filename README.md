@@ -127,6 +127,21 @@ human goal
 
 - Tidy pass: persona `scribe` + skill `docs-hygiene`.
 
+## Missing tools / access
+
+If you lack a capability the work needs (web research, fetch/HTTP, browser, private URL, login, paid API, OS permission, etc.):
+1. **Stop guessing** — do not invent page contents, API responses, or “I browsed it”.
+2. **Ask the human** (their language) for permission or help, with a concrete ask.
+3. Wait for OK / paste / credential / enable-tool before continuing that path.
+
+```text
+ACCESS NEEDED
+need: <research | fetch | browser | login | other>
+why: <one line>
+Options: 1) allow / enable tool  2) paste the info yourself  3) skip this path  4) other
+Reply with 1 / 2 / 3 / 4.
+```
+
 ## Human approval template
 
 ```text
@@ -158,6 +173,7 @@ Reply with 1 / 2 / 3 (or the same words in chat).
 ## Do / Don't
 
 - **Do** install/init when setup is missing; seed only personas that match this repo; add more with `persona set` when needed.
+- **Do** ask the human when research/fetch/browser (or any required access) is missing — never fake the result.
 - **Don't** invent cloud accounts, API keys, or dashboards — this CLI is local SQLite only.
 - **Don't** implement persona tasks yourself unless the human explicitly asks.
 - **Don't** merge to main without explicit human choice; prefer PR when unsure.
