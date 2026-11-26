@@ -392,6 +392,44 @@ export class LocalStore {
     throw new LocalServiceError("corrupt_state", "Failed to read SQLite state.");
   }
 
+  /** Inspect an existing, current SQLite DB without creating it or running migrations.
+   * With `lock`, serialize a filesystem action with lease writers using the same DB lock.
+   */
+  async inspect<T>(
+    run: (db: DatabaseSync) => Promise<T> | T,
+    { lock = false }: { lock?: boolean } = {},
+  ): Promise<T | null> {
+    const dir = dirname(this.file);
+    if (!existsSync(dir)) return null;
+    const file = join(await realpath(dir), basename(this.file));
+    if (!(await assertRegularFileOrMissing(file))) return null;
+    const lockPath = `${file}.lock`;
+    const owner = lock
+      ? await acquireLock(lockPath, this.lockTimeoutMs, this.staleLockMs)
+      : undefined;
+    try {
+      let db: DatabaseSync | undefined;
+      try {
+        if (!(await assertRegularFileOrMissing(file))) return null;
+        db = openDatabaseAt(file, { readOnly: true });
+        if (
+          getSchemaVersion(db) !== SCHEMA_VERSION ||
+          (!dbHasProjects(db) && existsSync(legacyStateJsonPath(file)))
+        ) {
+          throw new LocalServiceError(
+            "unsupported_schema",
+            "SQLite state requires a compatible CLI and completed migrations before inspection.",
+          );
+        }
+        return await run(db);
+      } finally {
+        db?.close();
+      }
+    } finally {
+      if (owner) await releaseLock(lockPath, owner);
+    }
+  }
+
   /**
    * Read a project's state without acquiring `.lock` or performing any writes.
    */

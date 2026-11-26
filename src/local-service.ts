@@ -12,8 +12,10 @@ import {
   findCycle,
   GENERAL_RULES,
   IdSchema,
+  isMcpCrudTool,
   LOCK_LEASE_MS,
   MCP_TOOLS,
+  type McpCrudToolName,
   type McpToolName,
   type McpToolOutput,
   nextStatus,
@@ -59,7 +61,9 @@ export { LocalServiceError } from "./errors.js";
 
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
-  [N in McpToolName]: (input: Parsed<N>) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
+  [N in Exclude<McpToolName, McpCrudToolName>]: (
+    input: Parsed<N>,
+  ) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
 const offlineReview = "Review lokal saja. Status, head SHA, dan merge PR di host tidak diperiksa.";
 const directives = [
@@ -113,6 +117,18 @@ function returnClaim(task: LocalTask): "TODO" | "REVISION_REQUESTED" {
   endLease(task);
   task.status = task.handoff ? "REVISION_REQUESTED" : "TODO";
   return task.status;
+}
+
+/** UUIDv5 with the project UUID as namespace. Alias remains the persisted identity. */
+function projectPersonaId(projectId: string, alias: string): string {
+  const bytes = createHash("sha1")
+    .update(Buffer.from(projectId.replaceAll("-", ""), "hex"))
+    .update(`catenext:persona:${alias}`)
+    .digest();
+  bytes.writeUInt8((bytes.readUInt8(6) & 0x0f) | 0x50, 6);
+  bytes.writeUInt8((bytes.readUInt8(8) & 0x3f) | 0x80, 8);
+  const hex = bytes.toString("hex", 0, 16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function allowsRepo(persona: Persona | undefined, repo: string): boolean {
@@ -187,6 +203,7 @@ export class LocalService {
     private readonly repoRoot: string,
     private readonly config: CatenextConfig,
     private readonly caller: "human" | "agent" = "human",
+    private readonly capabilities: { readonly allowCrud?: boolean } = {},
   ) {
     this.stateFile = resolve(repoRoot, config.state_file ?? ".catenext/catenext.sqlite");
     this.store = new LocalStore(this.stateFile);
@@ -365,6 +382,16 @@ export class LocalService {
     return out;
   }
 
+  /** Agent callers remain agents even when their local server launch grants CRUD. */
+  private requireCrudPermission(): void {
+    if (this.caller === "agent" && this.capabilities.allowCrud !== true) {
+      fail(
+        "permission_denied",
+        "Perubahan CRUD memerlukan CLI manusia atau peluncuran MCP dengan --allow-crud (bukan worker).",
+      );
+    }
+  }
+
   async updateEpic(
     epicId: string,
     input: z.input<typeof UpdateEpicInput>,
@@ -374,9 +401,7 @@ export class LocalService {
     description: string | null;
     task_counts: Record<string, number>;
   }> {
-    if (this.caller === "agent") {
-      fail("permission_denied", "Pembaruan epic hanya lewat CLI manusia.");
-    }
+    this.requireCrudPermission();
     if (!IdSchema.safeParse(epicId).success) {
       fail("invalid_input", "epic_id harus UUID yang valid.");
     }
@@ -423,9 +448,7 @@ export class LocalService {
   }
 
   async updateTask(taskId: string, input: z.input<typeof UpdateTaskInput>): Promise<LocalTask> {
-    if (this.caller === "agent") {
-      fail("permission_denied", "Pembaruan task hanya lewat CLI manusia.");
-    }
+    this.requireCrudPermission();
     if (!IdSchema.safeParse(taskId).success) {
       fail("invalid_input", "task_id harus UUID yang valid.");
     }
@@ -460,16 +483,36 @@ export class LocalService {
           changedFields.push("target_repo");
         }
 
-        if (data.persona !== undefined) {
-          if (data.persona === null) {
+        let personaAlias = data.persona;
+        if (data.persona_id !== undefined) {
+          const id = data.persona_id;
+          const byId =
+            id === null
+              ? null
+              : project.personas.find(
+                  (persona) =>
+                    projectPersonaId(this.config.project_id, persona.alias) === id.toLowerCase(),
+                )?.alias;
+          if (byId === undefined)
+            fail("persona_not_found", "Persona ID tidak ditemukan di proyek ini.");
+          if (personaAlias !== undefined && personaAlias !== byId) {
+            fail(
+              "invalid_input",
+              "persona dan persona_id harus menunjuk persona yang sama atau sama-sama null.",
+            );
+          }
+          personaAlias = byId;
+        }
+        if (personaAlias !== undefined) {
+          if (personaAlias === null) {
             if (task.persona !== null) {
               task.persona = null;
               changedFields.push("persona");
             }
           } else {
-            const p = project.personas.find((row) => row.alias === data.persona);
+            const p = project.personas.find((row) => row.alias === personaAlias);
             if (!p)
-              fail("persona_not_found", `Persona "${data.persona}" tidak ditemukan di proyek ini.`);
+              fail("persona_not_found", `Persona "${personaAlias}" tidak ditemukan di proyek ini.`);
             if (task.target && !allowsRepo(p, task.target)) {
               fail(
                 "persona_repo_mismatch",
@@ -514,6 +557,10 @@ export class LocalService {
           task.requiresApproval = data.requires_approval;
           changedFields.push("requires_approval");
         }
+        if (data.position !== undefined && data.position !== task.position) {
+          task.position = data.position;
+          changedFields.push("position");
+        }
         if (data.is_stale === false && task.stale) {
           task.stale = false;
           changedFields.push("is_stale");
@@ -550,9 +597,7 @@ export class LocalService {
     previous_status: LocalTask["status"];
     cancelled: true;
   }> {
-    if (this.caller === "agent") {
-      fail("permission_denied", "Pembatalan task hanya lewat CLI manusia.");
-    }
+    this.requireCrudPermission();
     if (!IdSchema.safeParse(taskId).success) {
       fail("invalid_input", "task_id harus UUID yang valid.");
     }
@@ -619,9 +664,7 @@ export class LocalService {
     taskId: string,
     input: z.input<typeof SetDependenciesInput>,
   ): Promise<{ task_id: string; depends_on: string[] }> {
-    if (this.caller === "agent") {
-      fail("permission_denied", "Pembaruan dependensi hanya lewat CLI manusia.");
-    }
+    this.requireCrudPermission();
     if (!IdSchema.safeParse(taskId).success) {
       fail("invalid_input", "task_id harus UUID yang valid.");
     }
@@ -685,7 +728,51 @@ export class LocalService {
     return out;
   }
 
-  async callTool<K extends McpToolName>(name: K, input: unknown): Promise<McpToolOutput<K>> {
+  private async callCrudTool(name: McpCrudToolName, input: unknown): Promise<unknown> {
+    // Each existing operation owns its transaction and checks the same capability.
+    switch (name) {
+      case "update_task": {
+        const { task_id, ...patch } = MCP_TOOLS.update_task.input.parse(input);
+        const task = await this.updateTask(task_id, patch);
+        return {
+          task_id: task.id,
+          title: task.title,
+          status: task.status,
+          target_repo: task.target,
+          role: task.role,
+          persona: task.persona,
+          persona_id:
+            task.persona === null ? null : projectPersonaId(this.config.project_id, task.persona),
+          position: task.position,
+          requires_approval: task.requiresApproval,
+          is_stale: task.stale,
+        } satisfies McpToolOutput<"update_task">;
+      }
+      case "update_epic": {
+        const { epic_id, ...patch } = MCP_TOOLS.update_epic.input.parse(input);
+        return {
+          epic: await this.updateEpic(epic_id, patch),
+        } satisfies McpToolOutput<"update_epic">;
+      }
+      case "set_dependencies": {
+        const { task_id, ...patch } = MCP_TOOLS.set_dependencies.input.parse(input);
+        return this.setTaskDependencies(task_id, patch);
+      }
+      case "cancel_task": {
+        const { task_id } = MCP_TOOLS.cancel_task.input.parse(input);
+        return this.cancelTask(task_id);
+      }
+    }
+  }
+
+  async callTool<K extends McpToolName>(
+    name: K,
+    input: unknown,
+    /** Local CLI only: confirm checkout still exists under the same lock as prune. */
+    beforeClaim?: K extends "claim_task" ? () => Promise<void> : never,
+  ): Promise<McpToolOutput<K>> {
+    const toolName: McpToolName = name as McpToolName;
+    if (isMcpCrudTool(toolName)) this.requireCrudPermission();
     const contract = MCP_TOOLS[name];
     const parsed = contract.input.safeParse(scrubDeep(input, DEFAULT_SCRUB_SKIP_KEYS).value);
     if (!parsed.success) {
@@ -693,6 +780,10 @@ export class LocalService {
         ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
       ];
       fail("invalid_input", `Input ${name} tidak valid: ${paths.join(", ")}.`, { fields: paths });
+    }
+    if (isMcpCrudTool(toolName)) {
+      const result = await this.callCrudTool(toolName, parsed.data);
+      return contract.output.parse(result) as McpToolOutput<K>;
     }
     if (name === "manage_task") {
       requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
@@ -702,6 +793,7 @@ export class LocalService {
       this.config.project_id,
       this.config.repo_name,
       async (project, dirty, db, afterSave) => {
+        if (name === "claim_task") await beforeClaim?.();
         const now = Date.now();
         const tools = new LocalWorkflow(
           project,
@@ -716,7 +808,7 @@ export class LocalService {
         tools.tick(leaseId, name);
         // Registry key correlates parser, handler, and output. TS cannot retain that correlation
         // on a generic indexed access; output validation happens before the transaction commits.
-        const run = tools.handlers[name] as (data: typeof parsed.data) => unknown;
+        const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
         const result = contract.output.parse(await run(parsed.data));
         const events = tools.drainEvents();
         if (events.length > 0) {
@@ -768,7 +860,11 @@ class LocalWorkflow {
     create_tasks: (input) => this.createTasks(input),
     manage_task: (input) => this.manageTask(input),
     list_personas: () => ({
-      personas: this.personas().map((persona) => ({ ...persona, scope: "project" })),
+      personas: this.personas().map((persona) => ({
+        ...persona,
+        id: projectPersonaId(this.config.project_id, persona.alias),
+        scope: "project",
+      })),
     }),
     upsert_persona: (input) => this.upsertPersona(input),
     get_project_board: (input) => this.board(input),
@@ -929,6 +1025,7 @@ class LocalWorkflow {
     if (!this.project.epics.some((epic) => epic.id === input.epic_id))
       fail("not_found", "Epic tidak ditemukan di proyek ini.");
     const ids = new Map(input.tasks.map((task) => [task.ref, randomUUID()]));
+    let position = (this.project.tasks.at(-1)?.position ?? -1) + 1;
     const created = input.tasks.map((item) => {
       const task_id = ids.get(item.ref) ?? fail("invalid_input", "Ref task tidak ditemukan.");
       const dependencies = [
@@ -955,6 +1052,7 @@ class LocalWorkflow {
         target,
         role,
         persona: null,
+        position: position++,
         requiresApproval: item.requires_approval,
         stale: false,
         revision: 0,

@@ -1,13 +1,18 @@
-import { accessSync, constants, realpathSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
+
+const VERSION_SEGMENT = /([\\/])v?\d+\.\d+\.\d+(?=[\\/])/;
+const MANAGER_NODE = /([\\/])node[\\/]\d+[\\/]\d+\.\d+\.\d+(?=[\\/])/;
+const NVM_NODE = /([\\/])versions[\\/]node[\\/]v\d+\.\d+\.\d+(?=[\\/])/;
 
 /**
  * Pilih perintah node untuk entri MCP yang tidak rusak saat Node di-upgrade.
  *
  * `process.execPath` sering berisi folder berversi (mis. ServBay
  * `/Applications/ServBay/package/node/24/24.21.0/bin/node`, nvm, fnm). Path itu hilang
- * begitu Node di-update, dan tidak berlaku di mesin lain. Jika `node` di PATH menunjuk
- * ke binary yang sama, tulis `node` saja; selain itu tetap pakai path absolut.
+ * begitu Node di-update. Utamakan path stabil yang terbukti menunjuk ke executable
+ * yang sama, bahkan jika IDE tidak mewarisi PATH shell. Jika tidak ada, gunakan `node`
+ * hanya bila executable pertama di PATH cocok. Terakhir, pertahankan `execPath`.
  */
 export function stableNodeCommand(
   execPath: string,
@@ -16,35 +21,60 @@ export function stableNodeCommand(
   isExecutable: (p: string) => boolean = defaultIsExecutable,
 ): string {
   const target = safeReal(execPath, resolveReal);
+  if (!target) return execPath;
+  const matches = (candidate: string) =>
+    isAbsolute(candidate) &&
+    !hasVersionedSegment(candidate) &&
+    isExecutable(candidate) &&
+    safeReal(candidate, resolveReal) === target;
+
+  if (execPath !== target && matches(execPath)) return execPath;
+  for (const candidate of new Set([
+    target.replace(MANAGER_NODE, "$1node$1current"),
+    target.replace(NVM_NODE, "$1current"),
+    target.replace(VERSION_SEGMENT, "$1current"),
+  ])) {
+    if (candidate !== target && matches(candidate)) return candidate;
+  }
+
   for (const dir of (pathEnv ?? "").split(delimiter)) {
-    if (!dir) continue;
+    // Empty/relative PATH entries are cwd-dependent, so do not skip ahead to a later executable.
+    if (!isAbsolute(dir)) break;
     for (const name of process.platform === "win32" ? ["node.exe", "node"] : ["node"]) {
       const candidate = join(dir, name);
       if (!isExecutable(candidate)) continue;
-      // Kandidat pertama di PATH adalah yang dijalankan shell/IDE; hanya itu yang dihitung.
-      return safeReal(candidate, resolveReal) === target ? "node" : execPath;
+      if (safeReal(candidate, resolveReal) !== target) return execPath;
+      // An unversioned runtime or PATH alias can use bare node. Version-pinned PATH is not stable.
+      return !hasVersionedSegment(target) || matches(candidate) ? "node" : execPath;
     }
   }
   return execPath;
 }
 
-/** True jika path mengandung segmen versi seperti `24.21.0` atau `v22.11.0`. */
-export function hasVersionedSegment(path: string): boolean {
-  return /[\\/]v?\d+\.\d+\.\d+[\\/]/.test(path);
+export function nodeLauncherWarning(command: string): string | null {
+  return hasVersionedSegment(command)
+    ? `! Entri MCP memakai ${command}, path berversi yang bisa rusak saat Node di-update. ` +
+        "Sediakan symlink Node tanpa versi yang menunjuk ke executable ini, atau pakai --mcp-command."
+    : null;
 }
 
-function safeReal(p: string, resolveReal: (p: string) => string): string {
+/** True jika path mengandung segmen versi seperti `24.21.0` atau `v22.11.0`. */
+export function hasVersionedSegment(path: string): boolean {
+  return VERSION_SEGMENT.test(path);
+}
+
+function safeReal(p: string, resolveReal: (p: string) => string): string | null {
   try {
     return resolveReal(p);
   } catch {
-    return p;
+    return null;
   }
 }
 
 function defaultIsExecutable(p: string): boolean {
   try {
     accessSync(p, constants.X_OK);
-    return true;
+    return statSync(p).isFile();
   } catch {
     return false;
   }

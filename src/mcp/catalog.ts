@@ -1,4 +1,10 @@
-import { MCP_TOOL_NAMES, MCP_TOOLS, type McpToolName } from "@catenext/shared";
+import {
+  isMcpCrudTool,
+  MCP_CRUD_TOOLS,
+  MCP_TOOL_NAMES,
+  MCP_TOOLS,
+  type McpToolName,
+} from "@catenext/shared";
 import { z } from "zod";
 
 export const MCP_ROLES = ["orchestrator", "worker"] as const;
@@ -47,6 +53,10 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
 
 /** Crisp <=12-word 1-line tool descriptions to minimize MCP tools/list token overhead. */
 export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
+  update_task: "Edit task fields without approving or changing status.",
+  update_epic: "Edit an epic title or description.",
+  set_dependencies: "Replace a task's dependencies, with cycle checks.",
+  cancel_task: "Remove a task with no active lease or dependents.",
   release_task: "Release a held task lease so another session can claim it.",
   get_project_board: "Orchestrator project board across repos with epics, tasks, and statuses.",
   search_context: "Search local documents, skill index, tasks, and code by keyword.",
@@ -87,8 +97,15 @@ export interface CompactMcpTool {
   inputSchema: CompactToolInputSchema;
 }
 
-export function toolsForRole(role?: McpRole): McpToolName[] {
-  return role ? [...ROLE_TOOLS[role]] : [...MCP_TOOL_NAMES];
+/** Only trusted launch options grant CRUD; role can narrow but never grant it. */
+export function mcpCrudEnabled(role?: McpRole, allowCrud = false): boolean {
+  return allowCrud === true && role !== "worker";
+}
+
+export function toolsForRole(role?: McpRole, allowCrud = false): McpToolName[] {
+  const enabled = mcpCrudEnabled(role, allowCrud);
+  if (!role) return MCP_TOOL_NAMES.filter((name) => enabled || !isMcpCrudTool(name));
+  return enabled ? [...ROLE_TOOLS[role], ...MCP_CRUD_TOOLS] : [...ROLE_TOOLS[role]];
 }
 
 function stripSchemaNode(value: unknown, isRoot = false): unknown {
@@ -124,8 +141,8 @@ export function zodToCompactJsonSchema(schema: z.ZodType): CompactToolInputSchem
   return compactJsonSchema(raw);
 }
 
-export function buildMcpToolCatalog(role?: McpRole): CompactMcpTool[] {
-  return toolsForRole(role).map((name) => ({
+export function buildMcpToolCatalog(role?: McpRole, allowCrud = false): CompactMcpTool[] {
+  return toolsForRole(role, allowCrud).map((name) => ({
     name,
     description: TOOL_DESCRIPTIONS[name],
     inputSchema: zodToCompactJsonSchema(MCP_TOOLS[name].input),

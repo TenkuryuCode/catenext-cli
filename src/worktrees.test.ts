@@ -1,0 +1,196 @@
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CatenextConfigSchema } from "@catenext/shared";
+import { afterEach, expect, it, vi } from "vitest";
+import { findProjectRoot } from "./config.js";
+import { LocalStore } from "./db/store.js";
+import { taskClaim } from "./fallback.js";
+import { LocalService } from "./local-service.js";
+import { pruneWorktrees } from "./worktrees.js";
+
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const path of tempDirs.splice(0)) await rm(path, { recursive: true, force: true });
+});
+
+function git(cwd: string, ...args: string[]) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+async function fixture() {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "catenext-worktrees-")));
+  tempDirs.push(dir);
+  const root = join(dir, "primary");
+  await mkdir(root);
+  git(root, "init", "-b", "main");
+  await writeFile(join(root, ".gitignore"), ".catenext/\n");
+  git(root, "add", ".gitignore");
+  git(
+    root,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "-m",
+    "fixture",
+  );
+  const config = CatenextConfigSchema.parse({
+    schema_version: 1,
+    project_id: randomUUID(),
+    repo_name: "fixture",
+    layout: "monorepo",
+  });
+  await mkdir(join(root, ".catenext"));
+  await writeFile(join(root, ".catenext/config.yaml"), JSON.stringify(config));
+  const service = new LocalService(root, config);
+  const { epic } = await service.callTool("create_epic", { title: "Worktrees" });
+  async function newTask(ref: string) {
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [{ ref, title: ref, prompt_instruction: "Synthetic task" }],
+    });
+    const id = created[0]?.task_id;
+    if (!id) throw new Error("Missing fixture task");
+    await service.callTool("manage_task", { task_id: id, action: "approve_plan" });
+    return id;
+  }
+  const options = { root, cwd: root, config };
+  function opts(name: string) {
+    return {
+      cwd: root,
+      project: options,
+      createWorktree: true,
+      branch: `feat/${name}`,
+      path: join(dir, name),
+      json: true,
+    };
+  }
+  return { dir, root, service, newTask, opts, options };
+}
+
+it.each(["change", "remove"])(
+  "rejects claim if checkout changes before the lease-lock validation: %s",
+  async (action) => {
+    const { root, service, newTask, opts } = await fixture();
+    const id = await newTask("claim");
+    const flags = opts("claim");
+    const original = service.callTool.bind(service);
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    const spy = vi
+      .spyOn(service, "callTool")
+      .mockImplementation(async (name, input, beforeClaim) => {
+        if (name !== "claim_task" || !beforeClaim) return original(name, input, beforeClaim);
+        const validate = async () => {
+          expect((await lstat(`${service.stateFile}.lock`)).isFile()).toBe(true);
+          if (action === "change") git(flags.path, "switch", "-c", "feat/replacement");
+          else git(root, "worktree", "remove", "--", flags.path);
+          await beforeClaim();
+        };
+        return original(name, input, validate);
+      });
+    await expect(taskClaim(service, id, flags)).rejects.toThrow(/telah berubah atau hilang/);
+    spy.mockRestore();
+    expect(warn.mock.calls.flat().join(" ")).not.toContain("Checkout tetap tersedia");
+    expect(await service.callTool("get_ready_tasks", {})).toMatchObject({ tasks: [{ id }] });
+    expect(
+      (await service.readTaskEvents({ taskId: id })).some((row) => row.event === "claim"),
+    ).toBe(false);
+    expect(git(root, "branch", "--show-current")).toBe("main");
+    expect(git(root, "show-ref", "--verify", `refs/heads/${flags.branch}`)).toContain(flags.branch);
+  },
+);
+
+it("prune protects an active worktree and previews an orphan before applying", async () => {
+  const { root, service, newTask, opts, options } = await fixture();
+  const id = await newTask("active");
+  const active = opts("active");
+  const dirty = opts("dirty");
+  const orphan = opts("orphan");
+  const manual = opts("manual");
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  await taskClaim(service, id, active);
+  expect(log.mock.calls.at(-1)?.[0]).toContain(active.path);
+  expect(await findProjectRoot(active.path, { managedWorktree: true })).toBe(root);
+  // A rejected claim leaves its checkout for explicit recovery; it never takes a second lease.
+  await expect(taskClaim(service, id, orphan)).rejects.toMatchObject({ code: "already_claimed" });
+  await expect(taskClaim(service, id, dirty)).rejects.toMatchObject({ code: "already_claimed" });
+  await writeFile(join(dirty.path, "untracked.txt"), "preserve");
+  git(root, "worktree", "add", "-b", manual.branch, "--", manual.path, "main");
+
+  // Release only an independently claimed task: rejected checkouts for an active task stay protected.
+  const orphanId = await newTask("released");
+  const removable = opts("released");
+  await taskClaim(service, orphanId, removable);
+  const output = log.mock.calls.at(-1)?.[0];
+  if (typeof output !== "string") throw new Error("Missing claim JSON");
+  const lease = JSON.parse(output) as { lease_id: string };
+  await service.callTool("release_task", { task_id: orphanId, lease_id: lease.lease_id });
+
+  const preview = await pruneWorktrees(options);
+  expect(preview).toMatchObject({ apply: false, removed: [], skipped: [] });
+  expect(preview.worktrees).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ path: root, status: "primary", eligible: false }),
+      expect.objectContaining({ path: active.path, status: "active", eligible: false }),
+      expect.objectContaining({ path: dirty.path, dirty: true, eligible: false }),
+      expect.objectContaining({ path: manual.path, status: "unmanaged", eligible: false }),
+      expect.objectContaining({ path: removable.path, status: "orphaned", eligible: true }),
+    ]),
+  );
+  expect((await lstat(removable.path)).isDirectory()).toBe(true);
+  const applied = await pruneWorktrees(options, true);
+  expect(applied).toMatchObject({ removed: [removable.path], skipped: [] });
+  await expect(lstat(removable.path)).rejects.toMatchObject({ code: "ENOENT" });
+  for (const path of [root, active.path, orphan.path, dirty.path, manual.path]) {
+    expect((await lstat(path)).isDirectory()).toBe(true);
+  }
+  expect(git(root, "show-ref", "--verify", `refs/heads/${removable.branch}`)).toContain(
+    removable.branch,
+  );
+});
+
+it("rechecks lease state after preview while waiting for the writer lock", async () => {
+  const { root, service, newTask, opts, options } = await fixture();
+  const draft = opts("race");
+  const id = await newTask("race");
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await taskClaim(service, id, draft);
+  const output = log.mock.calls.at(-1)?.[0];
+  if (typeof output !== "string") throw new Error("Missing claim JSON");
+  const lease = JSON.parse(output) as { lease_id: string };
+  await service.callTool("release_task", { task_id: id, lease_id: lease.lease_id });
+
+  const inspect = LocalStore.prototype.inspect;
+  let renewed = false;
+  vi.spyOn(LocalStore.prototype, "inspect").mockImplementation(async function (
+    this: LocalStore,
+    run,
+    flags,
+  ) {
+    if (flags?.lock && !renewed) {
+      renewed = true;
+      await taskClaim(service, id, { cwd: draft.path, worktree: true, json: true });
+    }
+    return inspect.call(this, run, flags);
+  });
+  const result = await pruneWorktrees(options, true);
+  expect(renewed).toBe(true);
+  expect(result.worktrees).toContainEqual(
+    expect.objectContaining({ path: draft.path, eligible: true }),
+  );
+  expect(result).toMatchObject({ removed: [], skipped: [draft.path] });
+  expect(git(root, "worktree", "list", "--porcelain")).toContain(draft.path);
+});

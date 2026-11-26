@@ -297,12 +297,34 @@ worktree, mengintegrasikan bila perlu, lalu bertanya: **PR** · **merge ke main*
 **next**. Subagent tidak boleh merge `main` sendiri.
 
 ```bash
+# buat checkout baru lalu claim, atau claim di checkout yang sudah ada
+catenext claim <task_id> --as bambang --create-worktree --branch feat/api --path ../api-lane
 catenext claim <task_id> --as bambang --worktree
+catenext worktree list                 # inventori Git + lease (read-only)
+catenext worktree prune                # pratinjau saja (default)
+catenext worktree prune --apply        # hapus checkout managed yang eligible; branch tetap
 catenext done <task_id> --lease <lease_id> --notes "…" --verify "pnpm test" \
   --pr https://github.com/owner/repo/pull/42 --base main
 ```
 
+`prune` selalu pratinjau dulu; checkout primary, aktif, kotor, atau unmanaged tidak dihapus.
 URL PR opsional — hanya referensi lokal; review lokal tidak membuktikan merge remote.
+
+## Doctor dan MCP CRUD
+
+```bash
+catenext doctor            # diagnostik read-only (SQLite schema v4, MCP, registrasi Git)
+catenext doctor --fix      # perbaikan aman (mode/izin file state) — tidak pernah prune worktree
+catenext mcp               # default: tool CRUD disembunyikan + ditolak
+catenext mcp --allow-crud  # opt-in instance lokal terpercaya (tidak untuk --role worker)
+```
+
+- Doctor melaporkan registrasi Git yang `prunable`, terpisah dari eligibility `worktree prune`.
+- Tool MCP `update_task` / `update_epic` / `set_dependencies` / `cancel_task` hanya muncul bila
+  diluncurkan dengan `--allow-crud`. Persetujuan tetap CLI manusia (`task approve` /
+  `review approve`).
+- `init`/`sync` memilih launcher Node stabil (symlink ServBay/nvm `current` atau `node` di PATH)
+  agar path berversi tidak merusak entri MCP IDE; override dengan `--mcp-command` bila perlu.
 
 ## Revisi tanpa task baru
 
@@ -373,19 +395,21 @@ Backup SQLite terpisah jika perlu. Data Cloud lama **tidak** dimigrasi otomatis.
 | `brief` | `session_brief` | Ringkasan sesi + pending approval |
 | `board` | `get_project_board` | Papan lintas repo |
 | `root list\|add\|remove` | `manage_roots` | Workspace root milik persona |
-| `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task |
+| `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task (`claim --worktree` / `--create-worktree`) |
+| `worktree list\|prune` | - | Inventori lease; prune pratinjau-by-default (`--apply` untuk hapus) |
 | `block` / `release` | `report_blocker` / `release_task` | Blokir / lepas lease |
 | `task approve` / `review approve` | - (manusia) | Setujui rencana / handoff |
 | `revise` / `assign` | `manage_task` | Revisi / ganti penanggung jawab |
 | `persona list\|set` | `list_personas` / `upsert_persona` | Persona proyek |
 | `doc …` | `get_document` / `save_document` | Dokumen lokal |
-| `epic` / `task create\|update\|cancel\|deps` | `list_epics` / `create_epic` / `create_tasks` | Rencana & CRUD lokal (DRAFT) |
+| `epic` / `task create\|update\|cancel\|deps` | `list_epics` / `create_epic` / `create_tasks` (+ CRUD opt-in) | Rencana & CRUD lokal (DRAFT) |
 | `review …` | `review_pull_request` | Antrean review lokal |
 | `skill load` | `load_skill` / `save_repo_skill` | Skill repo |
 | `index` / `search` | `graph_neighbors` / `symbol_search` / `search_context` | Graf & pencarian lokal |
 | `log` | - | Audit log event task (`task_events`) |
 | `permission list\|set\|grant\|revoke` | - | Matriks permission lokal |
-| `mcp` | - | Server MCP stdio |
+| `doctor` | - | Diagnostik lokal read-only (`--fix` aman, tidak prune) |
+| `mcp` | - | Server MCP stdio (`--allow-crud` opt-in; worker ditolak) |
 | - | `interview_setup` | Kartu opsi setup untuk interview |
 
 Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.

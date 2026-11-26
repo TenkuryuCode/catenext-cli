@@ -68,6 +68,7 @@ const task = z.strictObject({
   target: RepoNameSchema.nullable(),
   role: RoleSchema.nullable(),
   persona: AgentAliasSchema.nullable(),
+  position: z.number().finite(),
   requiresApproval: z.boolean(),
   lease: taskLease.optional(),
   branch: z

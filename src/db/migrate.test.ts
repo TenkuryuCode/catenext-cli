@@ -236,7 +236,7 @@ describe("SQLite schema migrations", () => {
       expect(colsBefore.some((c) => c.name === "integrated_commit_json")).toBe(false);
 
       const result1 = runSchemaMigrations(db);
-      expect(result1).toEqual({ fromVersion: 1, toVersion: SCHEMA_VERSION, applied: [2, 3] });
+      expect(result1).toEqual({ fromVersion: 1, toVersion: SCHEMA_VERSION, applied: [2, 3, 4] });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
       expect(colsAfter.some((c) => c.name === "integrated_commit_json")).toBe(true);
@@ -292,7 +292,7 @@ describe("SQLite schema migrations", () => {
       db.exec("DROP TABLE IF EXISTS task_events");
       expect(getSchemaVersion(db)).toBe(2);
 
-      const res = runSchemaMigrations(db);
+      const res = runSchemaMigrations(db, { targetVersion: 3 });
       expect(res).toEqual({ fromVersion: 2, toVersion: 3, applied: [3] });
       expect(getSchemaVersion(db)).toBe(3);
 
@@ -309,8 +309,49 @@ describe("SQLite schema migrations", () => {
         "detail_json",
         "created_at",
       ]);
-      expect(loadProject(db, projectId).tasks.map((t) => t.id)).toEqual([taskId]);
-      expect(runSchemaMigrations(db)).toEqual({ fromVersion: 3, toVersion: 3, applied: [] });
+      expect(db.prepare("SELECT id FROM tasks WHERE project_id = ?").get(projectId)?.id).toBe(
+        taskId,
+      );
+      expect(runSchemaMigrations(db, { targetVersion: 3 })).toEqual({
+        fromVersion: 3,
+        toVersion: 3,
+        applied: [],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("gives existing v3 tasks project-local positions without changing row order", () => {
+    const dbPath = join(dir, "positions-v3.sqlite");
+    const first = createV1Database(dbPath);
+    const next = [randomUUID(), randomUUID()];
+    const otherProject = randomUUID();
+    const db = new DatabaseSync(dbPath);
+    try {
+      runSchemaMigrations(db, { targetVersion: 3 });
+      const insertTask = db.prepare(`INSERT INTO tasks
+        (id, project_id, epic_id, title, instruction, status) VALUES (?, ?, ?, ?, ?, 'TODO')`);
+      db.prepare("INSERT INTO projects (id, created_at) VALUES (?, ?)").run(
+        otherProject,
+        new Date().toISOString(),
+      );
+      insertTask.run(next[0] ?? "", first.projectId, first.epicId, "Z", "Synthetic");
+      insertTask.run(first.taskId, otherProject, randomUUID(), "Other", "Synthetic");
+      insertTask.run(next[1] ?? "", first.projectId, first.epicId, "A", "Synthetic");
+      expect(
+        db
+          .prepare("PRAGMA table_info(tasks)")
+          .all()
+          .some(({ name }) => name === "position"),
+      ).toBe(false);
+      expect(runSchemaMigrations(db)).toEqual({ fromVersion: 3, toVersion: 4, applied: [4] });
+      const tasks = loadProject(db, first.projectId).tasks;
+      expect(tasks.map(({ id, position }) => [id, position])).toEqual(
+        [first.taskId, ...next].map((id, position) => [id, position]),
+      );
+      expect(loadProject(db, otherProject).tasks[0]?.position).toBe(0);
+      expect(runSchemaMigrations(db).applied).toEqual([]);
     } finally {
       db.close();
     }

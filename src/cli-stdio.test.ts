@@ -1,6 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
+  chmod,
+  copyFile,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
@@ -10,10 +13,16 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MCP_TOOLS, type McpToolName, type McpToolOutput } from "@catenext/shared";
+import {
+  ClaimTaskInput,
+  MCP_CRUD_TOOLS,
+  MCP_TOOLS,
+  type McpToolName,
+  type McpToolOutput,
+} from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { build } from "esbuild";
@@ -21,6 +30,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { z } from "zod";
 
 let scratch: string;
+let fixtureDir: string;
 let root: string;
 let entry: string;
 let env: Record<string, string>;
@@ -38,7 +48,7 @@ function resolveSharedEntry(): string {
 }
 
 beforeAll(async () => {
-  scratch = await mkdtemp(join(tmpdir(), "catenext-cli-stdio-"));
+  scratch = await realpath(await mkdtemp(join(tmpdir(), "catenext-cli-stdio-")));
   // Simulate an npx cache to catch regressions that launch npx from generated MCP entries.
   const bundleDir = join(scratch, "_npx", "launcher");
   await mkdir(bundleDir, { recursive: true });
@@ -63,13 +73,15 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  root = await mkdtemp(join(scratch, "project-"));
-  const home = join(root, "home");
-  await mkdir(home);
+  fixtureDir = await mkdtemp(join(scratch, "test-"));
+  root = join(fixtureDir, "project");
+  const home = join(fixtureDir, "home");
+  await Promise.all([mkdir(root), mkdir(home)]);
   env = {
     PATH: process.env.PATH ?? "",
     HOME: home,
     USERPROFILE: home,
+    GIT_CONFIG_GLOBAL: devNull,
     GIT_CONFIG_NOSYSTEM: "1",
     npm_config_offline: "true",
     ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
@@ -77,27 +89,31 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (root) await rm(root, { recursive: true, force: true });
+  if (fixtureDir) await rm(fixtureDir, { recursive: true, force: true });
 });
 
 afterAll(async () => {
   if (scratch) await rm(scratch, { recursive: true, force: true });
 });
 
-function runCli(args: string[], input?: string) {
-  const result = spawnSync(process.execPath, [entry, ...args], {
-    cwd: root,
+function runCli(
+  args: string[],
+  input?: string,
+  { cwd = root, command = process.execPath, timeout = 15_000 } = {},
+) {
+  const result = spawnSync(command, [entry, ...args], {
+    cwd,
     env,
     encoding: "utf8",
     input,
-    timeout: 5000,
+    timeout,
   });
   if (result.error) throw result.error;
   return result;
 }
 
-function cli(args: string[], input?: string): string {
-  const result = runCli(args, input);
+function cli(args: string[], input?: string, options?: Parameters<typeof runCli>[2]): string {
+  const result = runCli(args, input, options);
   if (result.status !== 0) {
     throw new Error(
       `catenext ${args.join(" ")} exited ${result.status}:\n${result.stdout}\n${result.stderr}`,
@@ -106,9 +122,14 @@ function cli(args: string[], input?: string): string {
   return result.stdout;
 }
 
-function cliJson<N extends McpToolName>(name: N, args: string[], input?: string): McpToolOutput<N> {
+function cliJson<N extends McpToolName>(
+  name: N,
+  args: string[],
+  input?: string,
+  options?: Parameters<typeof runCli>[2],
+): McpToolOutput<N> {
   return MCP_TOOLS[name].output.parse(
-    JSON.parse(cli([...args, "--json"], input)),
+    JSON.parse(cli([...args, "--json"], input, options)),
   ) as McpToolOutput<N>;
 }
 
@@ -136,6 +157,30 @@ async function mcp<N extends McpToolName>(
   return MCP_TOOLS[name].output.parse(JSON.parse(first.data.text)) as McpToolOutput<N>;
 }
 
+async function withMcp(
+  flags: string[],
+  run: (client: Client) => Promise<void>,
+  launch?: Awaited<ReturnType<typeof readClaudeLaunch>>,
+) {
+  const client = new Client({ name: "catenext-integration-fixture", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: launch?.command ?? process.execPath,
+    args: launch
+      ? launch.args.map((arg) => arg.replace("$" + "{CLAUDE_PROJECT_DIR}", root))
+      : [entry, "mcp", "--root", root, ...flags],
+    cwd: env.HOME,
+    env,
+    stderr: "pipe",
+  });
+  try {
+    await client.connect(transport);
+    await run(client);
+  } finally {
+    await client.close();
+    await transport.close();
+  }
+}
+
 const git = (...args: string[]) =>
   execFileSync("git", args, {
     cwd: root,
@@ -143,6 +188,87 @@ const git = (...args: string[]) =>
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+
+function initWorktreeProject() {
+  git("init", "-b", "main");
+  git(
+    "-c",
+    "user.name=Catenext Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "Worktree fixture",
+  );
+  cli(["init", "--platform", "claude-code"]);
+  const { epic } = cliJson("create_epic", ["epic", "create", "Worktree fixture"]);
+  return (title: string) => {
+    const { created } = cliJson("create_tasks", [
+      "task",
+      "create",
+      "--epic",
+      epic.id,
+      "--title",
+      title,
+      "--prompt",
+      "Synthetic task",
+    ]);
+    const task = created[0];
+    if (!task) throw new Error("Missing worktree fixture task");
+    cliJson("manage_task", ["task", "approve", task.task_id]);
+    return task.task_id;
+  };
+}
+
+function claimNew(id: string, name: string) {
+  const worktree = ClaimTaskInput.shape.worktree.unwrap().required();
+  const schema = MCP_TOOLS.claim_task.output.extend({ worktree });
+  return schema.parse(
+    JSON.parse(
+      cli([
+        "claim",
+        id,
+        "--create-worktree",
+        "--branch",
+        `feat/${name}`,
+        "--path",
+        `../${name}`,
+        "--json",
+      ]),
+    ),
+  );
+}
+
+const worktreeList = z.object({
+  worktrees: z.array(
+    z.object({
+      path: z.string(),
+      branch: z.string().nullable(),
+      status: z.string(),
+      eligible: z.boolean(),
+      managed: z.boolean(),
+      current: z.boolean(),
+      prunable: z.boolean(),
+    }),
+  ),
+});
+const pruneReport = worktreeList.extend({
+  apply: z.boolean(),
+  removed: z.array(z.string()),
+  skipped: z.array(z.string()),
+});
+const doctorReport = z.object({
+  ok: z.boolean(),
+  checks: z.array(z.object({ id: z.string(), status: z.string(), message: z.string() })),
+});
+
+function doctor(...flags: string[]) {
+  const result = runCli(["doctor", "--json", ...flags]);
+  const report = doctorReport.parse(JSON.parse(result.stdout));
+  expect(result.status).toBe(report.ok ? 0 : 1);
+  return { report, stdout: result.stdout };
+}
 
 describe("CLI dan MCP stdio lokal", () => {
   it("berbagi state antar proses tanpa kredensial, remote Git, atau PR", async () => {
@@ -304,6 +430,224 @@ describe("CLI dan MCP stdio lokal", () => {
     }
   }, 20_000);
 
+  it("enables CRUD only on opted-in non-worker launches and keeps approvals human-only", async () => {
+    git("init", "-b", "work");
+    cli(["init", "--platform", "claude-code"]);
+
+    const taskId = "11111111-2222-4333-8444-555555555555";
+    for (const flags of [[], ["--role", "orchestrator"], ["--role", "worker", "--allow-crud"]]) {
+      await withMcp(flags, async (client) => {
+        const { tools } = await client.listTools();
+        for (const name of MCP_CRUD_TOOLS) {
+          expect(tools.some((tool) => tool.name === name)).toBe(false);
+          await expect(
+            client.callTool({
+              name,
+              arguments: {
+                task_id: taskId,
+                epic_id: taskId,
+                title: "Denied edit",
+                depends_on: [],
+                allowCrud: true,
+                caller: "human",
+                role: "orchestrator",
+              },
+            }),
+          ).rejects.toThrow(`Tool ${name} not found`);
+        }
+      });
+    }
+
+    await withMcp(["--allow-crud"], async (client) => {
+      expect((await client.listTools()).tools.map(({ name }) => name)).toEqual(
+        expect.arrayContaining([...MCP_CRUD_TOOLS]),
+      );
+    });
+    await withMcp(["--role", "orchestrator", "--allow-crud"], async (client) => {
+      expect((await client.listTools()).tools.map(({ name }) => name)).toEqual(
+        expect.arrayContaining([...MCP_CRUD_TOOLS]),
+      );
+      const { epic } = await mcp(client, "create_epic", { title: "Fixture epic" });
+      const { created } = await mcp(client, "create_tasks", {
+        epic_id: epic.id,
+        tasks: [
+          { ref: "a", title: "Fixture A", prompt_instruction: "Build fixture A" },
+          { ref: "b", title: "Fixture B", prompt_instruction: "Build fixture B" },
+        ],
+      });
+      const [a, b] = created;
+      if (!a || !b) throw new Error("Fixture tasks missing");
+      const updated = await mcp(client, "update_epic", { epic_id: epic.id, title: "Updated epic" });
+      expect(updated.epic.title).toBe("Updated epic");
+      expect(
+        await mcp(client, "update_task", {
+          task_id: a.task_id,
+          title: "Updated task",
+          requires_approval: false,
+          status: "DONE",
+        }),
+      ).toMatchObject({ task_id: a.task_id, title: "Updated task", status: "DRAFT" });
+      expect(
+        await mcp(client, "set_dependencies", { task_id: b.task_id, depends_on: [a.task_id] }),
+      ).toEqual({
+        task_id: b.task_id,
+        depends_on: [a.task_id],
+      });
+      await expect(
+        mcp(client, "set_dependencies", { task_id: a.task_id, depends_on: [b.task_id] }),
+      ).rejects.toThrow(/melingkar/);
+      await expect(mcp(client, "cancel_task", { task_id: a.task_id })).rejects.toThrow(
+        /dependensi/,
+      );
+      for (const action of ["approve_plan", "approve"]) {
+        await expect(
+          mcp(client, "manage_task", { task_id: a.task_id, action, caller: "human" }),
+        ).rejects.toThrow(/catenext (task|review) approve/);
+      }
+      expect(await mcp(client, "cancel_task", { task_id: b.task_id })).toMatchObject({
+        task_id: b.task_id,
+        cancelled: true,
+      });
+    });
+
+    const { events } = z
+      .object({ events: z.array(z.object({ event: z.string(), actor: z.string() })) })
+      .parse(JSON.parse(cli(["log", "--actor", "agent", "--json"])));
+    expect(events).toEqual(
+      expect.arrayContaining(
+        ["update", "set_dependencies", "cancel"].map((event) => ({ event, actor: "agent" })),
+      ),
+    );
+  }, 15_000);
+
+  it("covers claim --create-worktree, worktree list|prune preview, and doctor read-only glue", async () => {
+    const makeTask = initWorktreeProject();
+    const activeId = makeTask("active lane");
+    const orphanId = makeTask("orphan lane");
+
+    const active = claimNew(activeId, "active-lane");
+    expect(active.worktree.branch).toBe("feat/active-lane");
+    expect((await lstat(active.worktree.worktree_path)).isDirectory()).toBe(true);
+
+    const listed = worktreeList.parse(JSON.parse(cli(["worktree", "list", "--json"])));
+    expect(listed.worktrees).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: await realpath(root), status: "primary", eligible: false }),
+        expect.objectContaining({
+          path: active.worktree.worktree_path,
+          branch: "feat/active-lane",
+          status: "active",
+          managed: true,
+          eligible: false,
+        }),
+      ]),
+    );
+
+    const orphan = claimNew(orphanId, "orphan-lane");
+    cli(["release", orphanId, "--lease", orphan.lease_id]);
+
+    const preview = pruneReport.parse(JSON.parse(cli(["worktree", "prune", "--json"])));
+    expect(preview).toMatchObject({ apply: false, removed: [], skipped: [] });
+    expect(preview.worktrees).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: active.worktree.worktree_path,
+          status: "active",
+          eligible: false,
+        }),
+        expect.objectContaining({
+          path: orphan.worktree.worktree_path,
+          status: "orphaned",
+          eligible: true,
+        }),
+      ]),
+    );
+    expect((await lstat(orphan.worktree.worktree_path)).isDirectory()).toBe(true);
+
+    const textPreview = cli(["worktree", "prune"]);
+    expect(textPreview).toContain("Pratinjau saja");
+    expect(textPreview).toContain("--apply");
+
+    // Reclaim from the dedicated checkout with --worktree (no second create).
+    const reclaimed = MCP_TOOLS.claim_task.output.parse(
+      JSON.parse(
+        cli(["claim", orphanId, "--worktree", "--json"], undefined, {
+          cwd: orphan.worktree.worktree_path,
+        }),
+      ),
+    );
+    expect(reclaimed.lease_id).not.toBe(orphan.lease_id);
+    cli(["release", orphanId, "--lease", reclaimed.lease_id]);
+
+    const applied = pruneReport.parse(JSON.parse(cli(["worktree", "prune", "--apply", "--json"])));
+    expect(applied).toMatchObject({
+      apply: true,
+      removed: [orphan.worktree.worktree_path],
+      skipped: [],
+    });
+    await expect(lstat(orphan.worktree.worktree_path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(active.worktree.worktree_path)).isDirectory()).toBe(true);
+    expect((await lstat(root)).isDirectory()).toBe(true);
+
+    const healthy = doctor();
+    expect(healthy.report.checks).toContainEqual(
+      expect.objectContaining({
+        id: "git.worktrees",
+        status: "ok",
+        message: expect.stringContaining("no prunable"),
+      }),
+    );
+
+    const ghost = join(fixtureDir, "ghost-checkout");
+    git("worktree", "add", "-qb", "ghost-lane", ghost);
+    await rm(ghost, { recursive: true, force: true });
+    const warned = doctor("--fix");
+    expect(warned.report.checks).toContainEqual(
+      expect.objectContaining({
+        id: "git.worktrees",
+        status: "warning",
+        message: expect.stringMatching(/1 prunable worktree registration/),
+      }),
+    );
+    expect(warned.stdout).toContain("doctor never prunes");
+    expect(git("worktree", "list", "--porcelain")).toContain("ghost-lane");
+    expect((await lstat(active.worktree.worktree_path)).isDirectory()).toBe(true);
+  }, 60_000);
+
+  it("writes stable ServBay/nvm Node launchers into MCP config", async () => {
+    async function installVersionedNode(versioned: string, current: string) {
+      await mkdir(dirname(versioned), { recursive: true });
+      await mkdir(dirname(current), { recursive: true });
+      await copyFile(process.execPath, versioned);
+      await chmod(versioned, 0o755);
+      await symlink(versioned, current);
+    }
+
+    const runtime = join(fixtureDir, "runtime");
+    const servbayVersioned = join(runtime, "ServBay/package/node/24/24.21.0/bin/node");
+    const servbayCurrent = join(runtime, "ServBay/package/node/current/bin/node");
+    const nvmVersioned = join(runtime, "home/.nvm/versions/node/v22.11.0/bin/node");
+    const nvmCurrent = join(runtime, "home/.nvm/current/bin/node");
+    await installVersionedNode(servbayVersioned, servbayCurrent);
+    await installVersionedNode(nvmVersioned, nvmCurrent);
+
+    // Hide PATH executables so init must prefer the unversioned ServBay current link.
+    const emptyBin = join(runtime, "empty-bin");
+    await mkdir(emptyBin, { recursive: true });
+    env = { ...env, PATH: emptyBin };
+    cli(["init", "--platform", "claude-code"], undefined, { command: servbayVersioned });
+    const servbayLaunch = await readClaudeLaunch();
+    expect(servbayLaunch.command).toBe(servbayCurrent);
+    expect(servbayLaunch.command).not.toContain("24.21.0");
+    expect(servbayLaunch.args[0]).toBe(await realpath(entry));
+
+    await rm(join(root, ".mcp.json"));
+    cli(["init", "--platform", "claude-code", "--yes"], undefined, { command: nvmVersioned });
+    const nvmLaunch = await readClaudeLaunch();
+    expect(nvmLaunch.command).toBe(nvmCurrent);
+    expect(nvmLaunch.command).not.toMatch(/v22\.11\.0/);
+  }, 30_000);
+
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {
       const result = runCli([command, "--platform", "unknown-platform"]);
@@ -311,7 +655,7 @@ describe("CLI dan MCP stdio lokal", () => {
       expect(result.stderr).toContain("Platform tidak didukung");
     }
     cli(["init", "--platform", "claude-code,codex", "--platform", "cursor", "--dry-run"]);
-    expect(await readdir(root)).toEqual(["home"]);
+    expect(await readdir(root)).toEqual([]);
     cli(["init", "--platform", "claude-code,codex", "--platform", "cursor"]);
     await expect(readFile(join(root, ".codex/config.toml"), "utf8")).resolves.toContain("catenext");
     const cursor = await readFile(join(root, ".cursor/mcp.json"), "utf8");

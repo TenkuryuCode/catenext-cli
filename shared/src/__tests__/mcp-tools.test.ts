@@ -16,8 +16,9 @@ const EXISTING = "0e1d2c3b-4a59-4687-9a5b-4c3d2e1f0a9b";
 
 describe("registry tool MCP", () => {
   it("mengekspos tool yang didaftarkan server", () => {
-    expect(MCP_TOOL_NAMES.sort()).toEqual(
+    expect([...MCP_TOOL_NAMES].sort()).toEqual(
       [
+        "cancel_task",
         "claim_task",
         "complete_handoff",
         "create_epic",
@@ -40,7 +41,10 @@ describe("registry tool MCP", () => {
         "save_repo_skill",
         "search_context",
         "session_brief",
+        "set_dependencies",
         "symbol_search",
+        "update_task",
+        "update_epic",
         "upsert_persona",
       ].sort(),
     );

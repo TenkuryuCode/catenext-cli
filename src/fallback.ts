@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   briefText,
+  type CatenextConfig,
   ClaimTaskInput,
   CompleteHandoffInput,
   GetReadyTasksInput,
@@ -22,6 +23,7 @@ import type { LocalService } from "./local-service.js";
 import { type LocalPermission, PERMISSION_ACTIONS } from "./local-state.js";
 import { PlanningInputError, prepare, readJsonInput } from "./planning.js";
 import { scrubText } from "./scrubber.js";
+import { createClaimWorktree, readManagedWorktree, WorktreeError } from "./worktrees.js";
 
 /**
  * Fallback CLI untuk agen tanpa MCP (blueprint §4.3): `catenext next/claim/done/block`.
@@ -197,24 +199,90 @@ export function renderClaim(res: McpToolOutput<"claim_task">): string {
   return out.join("\n");
 }
 
-export async function taskClaim(
+export interface ClaimOptions {
+  as?: string;
+  json?: boolean;
+  worktree?: boolean;
+  createWorktree?: boolean;
+  branch?: string;
+  base?: string;
+  path?: string;
+  cwd?: string;
+  project?: { root: string; config: Pick<CatenextConfig, "project_id" | "repo_name"> };
+}
+
+async function claimNewWorktree(
   service: LocalService,
   taskId: string,
-  opts: { as?: string; json?: boolean; worktree?: boolean; base?: string; cwd?: string },
+  cwd: string,
+  opts: ClaimOptions,
 ) {
+  if (!opts.project)
+    throw new PlanningInputError("Config proyek diperlukan untuk --create-worktree.");
+  const { root, config } = opts.project;
+  // Validate task/persona syntax before touching Git. Only LocalService authorizes actual claims.
+  const claim = prepare(ClaimTaskInput, { task_id: taskId, agent_alias: opts.as }, [
+    "task_id",
+    "agent_alias",
+  ]);
+  const checkout = await createClaimWorktree(root, cwd, config, claim.task_id, randomUUID(), opts);
+  const { branch, base_branch, worktree_path, session_id } = checkout.marker;
+  const worktree = { branch, base_branch, worktree_path, session_id };
+  const mark = async () => {
+    try {
+      await checkout.mark();
+      return true;
+    } catch {
+      console.error(
+        "! Metadata lokal worktree gagal disimpan. CLI tidak dapat mewarisi config utama dari checkout ini.",
+      );
+      return false;
+    }
+  };
+  const res = await service
+    .callTool("claim_task", { ...claim, worktree }, checkout.validate)
+    .catch(async (error: unknown) => {
+      // Failed checkout identity validation must not turn a changed checkout into a prune target.
+      if (error instanceof WorktreeError) throw error;
+      // Keep the branch and checkout; it might already have changes or a claim may have committed.
+      if (await mark()) {
+        console.error(
+          `! Checkout tetap tersedia: ${JSON.stringify(worktree_path)} (${branch}). Claim ulang dengan --worktree setelah masalah diperbaiki.`,
+        );
+      }
+      throw error;
+    });
+  await mark();
+  if (opts.json) return console.log(JSON.stringify({ ...res, worktree }, null, 2));
+  console.log(renderClaim(res));
+  console.log(
+    `\nCheckout tersedia: ${JSON.stringify(worktree_path)} (${branch}, base=${base_branch}). Pindah ke folder ini sebelum bekerja.`,
+  );
+}
+
+export async function taskClaim(service: LocalService, taskId: string, opts: ClaimOptions) {
+  const cwd = opts.cwd ?? process.cwd();
+  if (opts.createWorktree) return claimNewWorktree(service, taskId, cwd, opts);
+  if (opts.branch !== undefined || opts.path !== undefined) {
+    throw new PlanningInputError("--branch dan --path hanya berlaku bersama --create-worktree.");
+  }
   if (opts.base && !opts.worktree) {
     throw new PlanningInputError("--base hanya berlaku bersama --worktree.");
   }
-  const cwd = opts.cwd ?? process.cwd();
   const branch = opts.worktree ? await git(["symbolic-ref", "--short", "HEAD"], cwd) : null;
   if (opts.worktree && !branch)
     throw new PlanningInputError("Checkout branch kerja sebelum memakai --worktree.");
   const worktreeRoot = opts.worktree
     ? ((await git(["rev-parse", "--show-toplevel"], cwd)) ?? cwd)
     : undefined;
-  const sessionId = worktreeRoot ? await readOrCreateCliSessionId(worktreeRoot) : undefined;
+  const managed = worktreeRoot ? (await readManagedWorktree(worktreeRoot))?.marker : undefined;
+  const sessionId =
+    managed?.session_id ??
+    (worktreeRoot ? await readOrCreateCliSessionId(worktreeRoot) : undefined);
   const baseBranch =
-    opts.worktree && branch ? (opts.base ?? (await detectBaseBranch(cwd, branch))) : undefined;
+    opts.worktree && branch
+      ? (opts.base ?? managed?.base_branch ?? (await detectBaseBranch(cwd, branch)))
+      : undefined;
   const payload = prepare(
     ClaimTaskInput,
     {
@@ -233,7 +301,18 @@ export async function taskClaim(
     },
     ["task_id", "session_id", "agent_alias", "branch", "worktree_path", "base_branch"],
   );
-  const res = await service.callTool("claim_task", payload);
+  const validate =
+    managed && worktreeRoot
+      ? async () => {
+          const current = (await readManagedWorktree(worktreeRoot))?.marker;
+          if (current?.session_id !== managed.session_id || current.branch !== branch) {
+            throw new WorktreeError(
+              "Checkout Catenext telah berubah atau hilang; task tidak diklaim.",
+            );
+          }
+        }
+      : undefined;
+  const res = await service.callTool("claim_task", payload, validate);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log(renderClaim(res));
 }

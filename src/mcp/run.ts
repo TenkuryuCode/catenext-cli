@@ -1,6 +1,6 @@
 import { ConfigError, findProjectRoot, readConfig } from "../config.js";
 import { LocalService } from "../local-service.js";
-import type { McpRole } from "./catalog.js";
+import { type McpRole, mcpCrudEnabled } from "./catalog.js";
 import { createCatenextMcpServer, type ServerContext } from "./server.js";
 import { StdioServerTransport } from "./stdio.js";
 
@@ -16,7 +16,13 @@ export function resolveStart(root: string | undefined, cwd: string): string | nu
 }
 
 /** stdout khusus protokol MCP. Muat config secara lazy agar tool memberi petunjuk bila belum init. */
-export async function runMcpServer(opts: { root?: string; role?: McpRole; version: string }) {
+export async function runMcpServer(opts: {
+  root?: string;
+  role?: McpRole;
+  version: string;
+  allowCrud?: boolean;
+}) {
+  const allowCrud = mcpCrudEnabled(opts.role, opts.allowCrud);
   let cached: Promise<ServerContext> | undefined;
 
   const load = async (): Promise<ServerContext> => {
@@ -37,7 +43,7 @@ export async function runMcpServer(opts: { root?: string; role?: McpRole; versio
       }
       const config = await readConfig(root);
       // MCP selalu agen: approve/approve_plan ditolak di LocalService.
-      const service = new LocalService(root, config, "agent");
+      const service = new LocalService(root, config, "agent", { allowCrud });
       process.stderr.write(
         `[catenext] repo "${config.repo_name}" (project ${config.project_id}) dari ${root}\n`,
       );
@@ -51,6 +57,7 @@ export async function runMcpServer(opts: { root?: string; role?: McpRole; versio
   const server = createCatenextMcpServer({
     version: opts.version,
     role: opts.role,
+    allowCrud,
     context: async () => {
       cached ??= load();
       const pending = cached;

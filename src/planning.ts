@@ -26,8 +26,8 @@ export class PlanningInputError extends Error {
   }
 }
 
-export async function requireRoot(): Promise<string> {
-  const root = await findProjectRoot();
+export async function requireRoot(managedWorktree = false): Promise<string> {
+  const root = await findProjectRoot(undefined, { managedWorktree });
   if (!root) {
     throw new ConfigError(
       "Tidak ada .catenext/config.yaml di folder ini atau induknya. Jalankan `catenext init` dulu.",
@@ -37,7 +37,7 @@ export async function requireRoot(): Promise<string> {
 }
 
 export async function cliService(root?: string): Promise<LocalService> {
-  const repoRoot = root ?? (await requireRoot());
+  const repoRoot = root ?? (await requireRoot(true));
   return new LocalService(repoRoot, await readConfig(repoRoot));
 }
 

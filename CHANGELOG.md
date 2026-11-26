@@ -10,6 +10,18 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.10.0] - 2026-11-27
+
+### Ditambahkan
+- Managed worktrees: `claim --create-worktree` / `--worktree`, `worktree list`, dan `worktree prune` (preview default; `--apply` hanya menghapus checkout managed yang eligible — bukan primary/active/dirty/unmanaged, dan tidak menghapus branch).
+- `catenext doctor` (read-only; `--fix` hanya perbaikan aman mode/izin file state; tidak pernah prune worktree).
+- Stable Node launcher: `init`/`sync` memilih ServBay/nvm `current` atau `node` di PATH daripada `process.execPath` yang berversi; override dengan `--mcp-command`.
+- MCP planning CRUD (`update_task`, `update_epic`, `set_dependencies`, `cancel_task`) tersembunyi/ditolak kecuali proses diluncurkan dengan `--allow-crud` eksplisit (role worker tetap ditolak); approval tetap CLI-human-only.
+- SQLite schema v4: persistensi `position` task serta resolusi persona ID namespace proyek.
+
+### Diubah
+- Doctor memakai inventori registrasi Git worktree (bukan lifecycle inventory penuh) agar tetap read-only dan independen dari ketersediaan SQLite.
+
 ## [0.9.0] - 2026-11-27
 
 ### Ditambahkan

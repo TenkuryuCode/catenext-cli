@@ -21,7 +21,7 @@ export const SUBAGENT_DIRS: Partial<Record<PlatformId, string>> = {
 /** @deprecated use SUBAGENT_DIRS["claude-code"] */
 export const SUBAGENTS_DIR = join(".claude", "agents");
 
-type PersonaItem = McpToolOutput<"list_personas">["personas"][number];
+type PersonaItem = Omit<McpToolOutput<"list_personas">["personas"][number], "id">;
 
 export type AgentRenderContext = {
   stack: string[];

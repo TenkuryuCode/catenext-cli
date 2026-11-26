@@ -1,6 +1,6 @@
-/** SQLite DDL for local Catenext orchestration (schema version 3). */
+/** SQLite DDL for local Catenext orchestration (schema version 4). */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_json TEXT,
   blocker_json TEXT,
   integrated_commit_json TEXT,
+  position REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (project_id, id)
 );
 

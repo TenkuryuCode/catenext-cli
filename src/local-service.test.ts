@@ -1270,6 +1270,16 @@ describe("LocalService state persistence", () => {
 
     // Agent caller is denied CRUD mutations
     const agent = new LocalService(root, config, "agent");
+    for (const [name, args] of [
+      ["update_epic", { epic_id: epic.id, title: "X" }],
+      ["update_task", { task_id: id("a"), title: "X" }],
+      ["cancel_task", { task_id: id("a") }],
+      ["set_dependencies", { task_id: id("a"), depends_on: [] }],
+    ] as const) {
+      await expect(
+        agent.callTool(name, { ...args, allowCrud: true, caller: "human" }),
+      ).rejects.toMatchObject({ code: "permission_denied" });
+    }
     await expect(agent.updateEpic(epic.id, { title: "X" })).rejects.toMatchObject({
       code: "permission_denied",
     });
@@ -1281,6 +1291,95 @@ describe("LocalService state persistence", () => {
     });
     await expect(agent.setTaskDependencies(id("a"), { depends_on: [] })).rejects.toMatchObject({
       code: "permission_denied",
+    });
+  });
+
+  it("persists positions through reopening and uses insertion order for ties", async () => {
+    const { epic, id } = await draft([plan("a"), plan("b"), plan("c")]);
+    const agent = new LocalService(root, config, "agent", { allowCrud: true });
+    expect(
+      await agent.callTool("update_task", { task_id: id("c"), position: -0.25 }),
+    ).toMatchObject({ position: -0.25 });
+    expect(await service.updateTask(id("b"), { position: 0 })).toMatchObject({ position: 0 });
+    const reopened = new LocalService(root, config);
+    const board = await reopened.callTool("get_project_board", {});
+    expect(board.tasks.map((task) => task.id)).toEqual([id("c"), id("a"), id("b")]);
+    expect(await reopened.updateTask(id("c"), {})).toMatchObject({ position: -0.25 });
+    const { created } = await reopened.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [plan("d")],
+    });
+    const appended = await reopened.callTool("get_project_board", {});
+    expect(appended.tasks.map((task) => task.id)).toEqual([
+      id("c"),
+      id("a"),
+      id("b"),
+      created[0]?.task_id,
+    ]);
+    expect(await reopened.readTaskEvents({ taskId: id("c") })).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: "update",
+          actor: "agent",
+          detail: { fields: ["position"] },
+        }),
+      ]),
+    );
+  });
+
+  it("resolves discoverable persona IDs only in their project and validates alias, repo and null", async () => {
+    const be = { alias: "be", role: "backend", repos: ["be"] };
+    await service.callTool("upsert_persona", be);
+    await service.callTool("upsert_persona", { alias: "fe", role: "frontend", repos: ["fe"] });
+    const other = await repo("be", randomUUID());
+    await other.callTool("upsert_persona", be);
+    const { personas } = await service.callTool("list_personas", {});
+    const ownId = personas.find((persona) => persona.alias === "be")?.id;
+    const feId = personas.find((persona) => persona.alias === "fe")?.id;
+    const foreignId = (await other.callTool("list_personas", {})).personas.find(
+      (persona) => persona.alias === "be",
+    )?.id;
+    if (!ownId || !feId || !foreignId) throw new Error("Persona IDs missing from test fixture");
+    expect(ownId).not.toBe(foreignId);
+    expect(ownId).toMatch(/^[0-9a-f-]{14}5[0-9a-f-]{21}$/);
+    const { id } = await draft([plan("a", { target_repo: "be" })]);
+    const task = id("a");
+    const agent = new LocalService(root, config, "agent", { allowCrud: true });
+    expect(
+      await agent.callTool("update_task", { task_id: task, persona_id: ownId.toUpperCase() }),
+    ).toMatchObject({ persona: "be", persona_id: ownId, role: "backend" });
+    expect(
+      await agent.callTool("update_task", { task_id: task, persona: "be", persona_id: ownId }),
+    ).toMatchObject({ persona: "be" });
+    for (const persona_id of [foreignId, randomUUID()]) {
+      await expect(service.updateTask(task, { persona_id })).rejects.toMatchObject({
+        code: "persona_not_found",
+      });
+    }
+    await expect(
+      service.updateTask(task, { persona: "fe", persona_id: ownId }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      service.updateTask(task, { persona: null, persona_id: ownId }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(service.updateTask(task, { persona_id: feId })).rejects.toMatchObject({
+      code: "persona_repo_mismatch",
+    });
+    const reopened = new LocalService(root, config);
+    expect((await reopened.callTool("list_personas", {})).personas).toEqual(personas);
+    expect(await reopened.updateTask(task, {})).toMatchObject({ persona: "be" });
+    expect(await agent.callTool("update_task", { task_id: task, persona_id: null })).toMatchObject({
+      persona: null,
+      persona_id: null,
+      role: "backend",
+    });
+    await reopened.updateTask(task, { persona_id: ownId });
+    expect(await reopened.updateTask(task, { persona: null })).toMatchObject({
+      persona: null,
+      role: "backend",
+    });
+    expect(await reopened.updateTask(task, { persona: null, persona_id: null })).toMatchObject({
+      persona: null,
     });
   });
 

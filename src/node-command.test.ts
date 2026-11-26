@@ -1,5 +1,21 @@
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { hasVersionedSegment, npxLaunch, stableNodeCommand } from "./node-command.js";
+import {
+  hasVersionedSegment,
+  nodeLauncherWarning,
+  npxLaunch,
+  stableNodeCommand,
+} from "./node-command.js";
 
 const SERVBAY = "/Applications/ServBay/package/node/24/24.21.0/bin/node";
 
@@ -15,6 +31,56 @@ describe("stableNodeCommand", () => {
   it("tetap path absolut jika node di PATH adalah binary lain", () => {
     const exec = (p: string) => p === "/usr/local/bin/node";
     expect(stableNodeCommand(SERVBAY, "/usr/local/bin", (p) => p, exec)).toBe(SERVBAY);
+  });
+
+  it("uses a verified ServBay current link without relying on PATH", () => {
+    const current = "/Applications/ServBay/package/node/current/bin/node";
+    const old = "/usr/local/bin/node";
+    const real = (p: string) => (p === current ? SERVBAY : p);
+    expect(
+      stableNodeCommand(SERVBAY, "/usr/local/bin", real, (p) => [current, old].includes(p)),
+    ).toBe(current);
+    expect(
+      stableNodeCommand(
+        SERVBAY,
+        undefined,
+        (p) => p,
+        (p) => p === current,
+      ),
+    ).toBe(SERVBAY);
+    expect(stableNodeCommand(SERVBAY, undefined, real, () => false)).toBe(SERVBAY);
+  });
+
+  it("does not hide a pinned nvm executable or skip the first PATH executable", () => {
+    const nvm = "/home/test/.nvm/versions/node/v22.11.0/bin/node";
+    const exec = (p: string) => [nvm, "/usr/bin/node", "/home/test/bin/node"].includes(p);
+    const real = (p: string) => (p === "/home/test/bin/node" ? nvm : p);
+    expect(stableNodeCommand(nvm, dirname(nvm), real, exec)).toBe(nvm);
+    expect(stableNodeCommand(nvm, "/usr/bin:/home/test/bin", real, exec)).toBe(nvm);
+    expect(stableNodeCommand(nvm, "/home/test/bin", real, exec)).toBe("node");
+    expect(nodeLauncherWarning(nvm)).toContain("--mcp-command");
+    expect(nodeLauncherWarning("/home/test/.nvm/current/bin/node")).toBeNull();
+    expect(nodeLauncherWarning("node")).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("verifies executable files and real symlinks", () => {
+    const dir = mkdtempSync(join(realpathSync(tmpdir()), "catenext-node-"));
+    try {
+      const target = join(dir, "versions/node/v22.11.0/bin/node");
+      const currentDir = join(dir, "current");
+      const current = join(currentDir, "bin/node");
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      symlinkSync(dirname(dirname(target)), currentDir, "dir");
+      expect(stableNodeCommand(target, undefined)).toBe(current);
+      chmodSync(target, 0o644);
+      expect(stableNodeCommand(target, undefined)).toBe(target);
+      rmSync(target);
+      mkdirSync(target);
+      expect(stableNodeCommand(target, undefined)).toBe(target);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
   });
 
   it("tetap path absolut jika node tidak ada di PATH", () => {

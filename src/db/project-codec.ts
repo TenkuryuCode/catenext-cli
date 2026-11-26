@@ -36,6 +36,7 @@ function hydrateTaskRow(row: Record<string, unknown>, dependencies: string[]): L
     target: (row.target as string | null) ?? null,
     role: (row.role as string | null) ?? null,
     persona: (row.persona as string | null) ?? null,
+    position: Number(row.position),
     requiresApproval: Boolean(row.requires_approval),
     revision: Number(row.revision),
     stale: Boolean(row.stale),
@@ -163,8 +164,8 @@ export function loadProjectState(
       `SELECT id, epic_id, title, instruction, status, target, role, persona,
               requires_approval, revision, stale, feedback,
               lease_json, branch_json, handoff_json, review_json, blocker_json,
-              integrated_commit_json
-       FROM tasks WHERE project_id = ? ORDER BY rowid`,
+              integrated_commit_json, position
+       FROM tasks WHERE project_id = ? ORDER BY position, rowid`,
     )
     .all(projectId) as Record<string, unknown>[];
 
@@ -226,7 +227,7 @@ export function loadTask(
       `SELECT id, epic_id, title, instruction, status, target, role, persona,
               requires_approval, revision, stale, feedback,
               lease_json, branch_json, handoff_json, review_json, blocker_json,
-              integrated_commit_json
+              integrated_commit_json, position
        FROM tasks WHERE project_id = ? AND id = ?`,
     )
     .get(projectId, taskId) as Record<string, unknown> | undefined;
@@ -246,8 +247,8 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
     `INSERT INTO tasks
       (id, project_id, epic_id, title, instruction, status, target, role, persona,
        requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_id, id) DO UPDATE SET
        epic_id = excluded.epic_id,
        title = excluded.title,
@@ -265,7 +266,8 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
        handoff_json = excluded.handoff_json,
        review_json = excluded.review_json,
        blocker_json = excluded.blocker_json,
-       integrated_commit_json = excluded.integrated_commit_json`,
+       integrated_commit_json = excluded.integrated_commit_json,
+       position = excluded.position`,
   ).run(
     task.id,
     projectId,
@@ -286,6 +288,7 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
     serialized.reviewJson,
     serialized.blockerJson,
     serialized.integratedCommitJson,
+    serialized.position,
   );
 
   const existingDeps = new Set(
@@ -391,11 +394,13 @@ type SerializedTask = {
   reviewJson: string | null;
   blockerJson: string | null;
   integratedCommitJson: string | null;
+  position: number;
 };
 
 function serializeTask(task: LocalTask): SerializedTask {
   return {
     epicId: task.epicId,
+    position: task.position,
     title: task.title,
     instruction: task.instruction,
     status: task.status,
@@ -418,6 +423,7 @@ function serializeTask(task: LocalTask): SerializedTask {
 function serializedTaskEqual(a: SerializedTask, b: SerializedTask): boolean {
   return (
     a.epicId === b.epicId &&
+    a.position === b.position &&
     a.title === b.title &&
     a.instruction === b.instruction &&
     a.status === b.status &&
@@ -646,8 +652,8 @@ export function saveProjectDiff(
         `INSERT INTO tasks
           (id, project_id, epic_id, title, instruction, status, target, role, persona,
            requires_approval, revision, stale, feedback,
-           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       insTask.run(
         task.id,
@@ -669,6 +675,7 @@ export function saveProjectDiff(
         nextSer.reviewJson,
         nextSer.blockerJson,
         nextSer.integratedCommitJson,
+        nextSer.position,
       );
       for (const dep of new Set(task.dependencies)) {
         insDep ??= db.prepare(
@@ -684,7 +691,7 @@ export function saveProjectDiff(
              epic_id = ?, title = ?, instruction = ?, status = ?, target = ?, role = ?, persona = ?,
              requires_approval = ?, revision = ?, stale = ?, feedback = ?,
              lease_json = ?, branch_json = ?, handoff_json = ?, review_json = ?, blocker_json = ?,
-             integrated_commit_json = ?
+             integrated_commit_json = ?, position = ?
            WHERE project_id = ? AND id = ?`,
         );
         updTask.run(
@@ -705,6 +712,7 @@ export function saveProjectDiff(
           nextSer.reviewJson,
           nextSer.blockerJson,
           nextSer.integratedCommitJson,
+          nextSer.position,
           projectId,
           task.id,
         );
@@ -879,8 +887,8 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
     `INSERT INTO tasks
       (id, project_id, epic_id, title, instruction, status, target, role, persona,
        requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertDep = db.prepare(
     "INSERT INTO task_deps (project_id, task_id, depends_on) VALUES (?, ?, ?)",
@@ -907,6 +915,7 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
       ser.reviewJson,
       ser.blockerJson,
       ser.integratedCommitJson,
+      ser.position,
     );
     for (const dep of task.dependencies) insertDep.run(projectId, task.id, dep);
   }

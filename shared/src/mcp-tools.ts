@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ReleaseTaskInput } from "./api.js";
+import { ReleaseTaskInput, SetDependenciesInput, UpdateEpicInput, UpdateTaskInput } from "./api.js";
 import {
   GraphNeighborsInput,
   GraphNeighborsOutput,
@@ -438,12 +438,55 @@ export const CreateEpicToolOutput = z.object({
   epic: EpicSummarySchema,
 });
 
+// --- opt-in planning CRUD ---------------------------------------------------
+
+export const MCP_CRUD_TOOLS = [
+  "update_task",
+  "update_epic",
+  "set_dependencies",
+  "cancel_task",
+] as const;
+export type McpCrudToolName = (typeof MCP_CRUD_TOOLS)[number];
+
+export function isMcpCrudTool(name: string): name is McpCrudToolName {
+  return MCP_CRUD_TOOLS.some((toolName) => toolName === name);
+}
+
+export const UpdateTaskToolInput = UpdateTaskInput.extend({ task_id: IdSchema });
+export const UpdateTaskToolOutput = z.object({
+  task_id: IdSchema,
+  title: z.string(),
+  status: TaskStatusSchema,
+  target_repo: RepoNameSchema.nullable(),
+  role: RoleSchema.nullable(),
+  persona: AgentAliasSchema.nullable(),
+  persona_id: IdSchema.nullable(),
+  position: z.number().finite(),
+  requires_approval: z.boolean(),
+  is_stale: z.boolean(),
+});
+export const UpdateEpicToolInput = UpdateEpicInput.omit({ template_used: true }).extend({
+  epic_id: IdSchema,
+});
+export const UpdateEpicToolOutput = CreateEpicToolOutput;
+export const SetDependenciesToolInput = SetDependenciesInput.extend({ task_id: IdSchema });
+export const SetDependenciesToolOutput = SetDependenciesToolInput;
+export const CancelTaskToolInput = z.object({ task_id: IdSchema });
+export const CancelTaskToolOutput = z.object({
+  task_id: IdSchema,
+  title: z.string(),
+  previous_status: TaskStatusSchema,
+  cancelled: z.literal(true),
+});
+
 // --- list_personas / upsert_persona -----------------------------------------
 
 export const ListPersonasInput = z.object({});
 export const ListPersonasOutput = z.object({
   personas: z.array(
     PersonaSchema.extend({
+      /** Stable UUID for this alias within this project. */
+      id: IdSchema,
       /** Persona tersimpan per proyek. */
       scope: z.literal("project"),
     }),
@@ -555,6 +598,26 @@ export const MCP_TOOLS = {
     "Buat epic baru di proyek ini (mis. 'Fitur login'), lalu pecah dengan create_tasks.",
     CreateEpicToolInput,
     CreateEpicToolOutput,
+  ),
+  update_task: tool(
+    "Edit task fields. Requires opt-in MCP CRUD; cannot approve tasks.",
+    UpdateTaskToolInput,
+    UpdateTaskToolOutput,
+  ),
+  update_epic: tool(
+    "Edit epic title or description. Requires opt-in MCP CRUD.",
+    UpdateEpicToolInput,
+    UpdateEpicToolOutput,
+  ),
+  set_dependencies: tool(
+    "Replace task dependencies. Requires opt-in MCP CRUD.",
+    SetDependenciesToolInput,
+    SetDependenciesToolOutput,
+  ),
+  cancel_task: tool(
+    "Remove a task without active lease or dependents. Requires opt-in MCP CRUD.",
+    CancelTaskToolInput,
+    CancelTaskToolOutput,
   ),
   list_personas: tool(
     "Daftar persona agen (alias, role, aturan) yang berlaku untuk proyek ini.",

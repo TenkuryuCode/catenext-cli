@@ -53,6 +53,8 @@ export interface ServerOptions {
   log?: (message: string) => void;
   /** Filter tool MCP berdasarkan peran: orchestrator atau worker (default: semua tool). */
   role?: McpRole;
+  /** Trusted local launch flag; never accepted as a tool argument. */
+  allowCrud?: boolean;
 }
 
 export interface CallToolResult {
@@ -92,7 +94,7 @@ function isRequestId(value: unknown): value is JsonRpcId {
 
 export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer {
   const log = opts.log ?? ((m: string) => process.stderr.write(`[catenext] ${m}\n`));
-  const tools = buildMcpToolCatalog(opts.role);
+  const tools = buildMcpToolCatalog(opts.role, opts.allowCrud);
   const allowedTools = new Set<string>(tools.map((tool) => tool.name));
   let activeTransport: McpTransport | undefined;
 

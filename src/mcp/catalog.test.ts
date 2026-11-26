@@ -1,4 +1,10 @@
-import { estimateTokens, MCP_TOOL_NAMES, MCP_TOOLS } from "@catenext/shared";
+import {
+  estimateTokens,
+  isMcpCrudTool,
+  MCP_CRUD_TOOLS,
+  MCP_TOOL_NAMES,
+  MCP_TOOLS,
+} from "@catenext/shared";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -69,7 +75,7 @@ describe("MCP tool catalog compaction & role filtering", () => {
   });
 
   it("filters tool lists by role and preserves full 24-tool set by default", () => {
-    expect(toolsForRole()).toEqual([...MCP_TOOL_NAMES]);
+    expect(toolsForRole()).toEqual(MCP_TOOL_NAMES.filter((name) => !isMcpCrudTool(name)));
     expect(toolsForRole()).toHaveLength(24);
 
     const orch = toolsForRole("orchestrator");
@@ -91,5 +97,8 @@ describe("MCP tool catalog compaction & role filtering", () => {
 
     expect(buildMcpToolCatalog("worker").length).toBe(worker.length);
     expect(buildMcpToolCatalog("orchestrator").length).toBe(orch.length);
+    expect(toolsForRole(undefined, true)).toEqual([...MCP_TOOL_NAMES]);
+    expect(toolsForRole("orchestrator", true)).toEqual([...orch, ...MCP_CRUD_TOOLS]);
+    expect(toolsForRole("worker", true)).toEqual(worker);
   });
 });

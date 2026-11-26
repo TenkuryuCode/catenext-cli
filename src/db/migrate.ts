@@ -157,6 +157,24 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    description: "Preserve existing task order in explicit task positions",
+    up(db) {
+      const columns = db.prepare("PRAGMA table_info(tasks)").all();
+      if (!columns.some(({ name }) => name === "position")) {
+        db.exec("ALTER TABLE tasks ADD COLUMN position REAL NOT NULL DEFAULT 0");
+      }
+      db.exec(`
+        WITH task_order AS MATERIALIZED (
+          SELECT rowid AS task_row, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY rowid) - 1 AS initial_position
+          FROM tasks
+        )
+        UPDATE tasks SET position = task_order.initial_position
+        FROM task_order WHERE tasks.rowid = task_order.task_row;
+      `);
+    },
+  },
 ];
 
 function hasCode(error: unknown, code: string): boolean {
@@ -333,7 +351,11 @@ export async function migrateJsonStateIfNeeded(db: DatabaseSync, dbPath: string)
         repos: [...persona.repos],
         rules: [...persona.rules],
       }));
-      project.tasks = data.tasks.map((task) => ({ ...task, dependencies: [...task.dependencies] }));
+      project.tasks = data.tasks.map((task, position) => ({
+        ...task,
+        position,
+        dependencies: [...task.dependencies],
+      }));
       project.documents = data.documents.map((doc) => ({ ...doc }));
       saveProject(db, projectId, project);
     }

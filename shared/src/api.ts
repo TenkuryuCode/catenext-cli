@@ -103,9 +103,15 @@ export const UpdateTaskInput = z.object({
   target_repo: RepoNameSchema.nullable().optional(),
   role: RoleSchema.nullable().optional(),
   persona: AgentAliasSchema.nullable().optional(),
-  persona_id: IdSchema.nullable().optional(),
+  persona_id: IdSchema.nullable()
+    .optional()
+    .describe("Project persona UUID from list_personas; null clears assignment."),
   requires_approval: z.boolean().optional(),
-  position: z.number().finite().optional(),
+  position: z
+    .number()
+    .finite()
+    .optional()
+    .describe("Display order within the project, ascending; ties keep insertion order."),
   is_stale: z.literal(false).optional(),
 });
 

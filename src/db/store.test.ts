@@ -49,6 +49,7 @@ function makeTask(id: string, epicId: string, title: string, deps: string[] = []
     target: "catenext",
     role: "backend",
     persona: null,
+    position: 0,
     requiresApproval: true,
     revision: 0,
     stale: false,

@@ -13,7 +13,9 @@ import {
 } from "@catenext/shared";
 import { Command, InvalidArgumentError } from "commander";
 import { ConfigError, configuredPlatforms, findProjectRoot, readConfig } from "./config.js";
+import { formatDoctorReport, runDoctor } from "./doctor.js";
 import {
+  type ClaimOptions,
   permissionGrant,
   permissionList,
   permissionRevoke,
@@ -34,7 +36,7 @@ import { PERMISSION_ACTIONS } from "./local-state.js";
 import { applyFileEdits, planRemove, planSync, summarize } from "./maintenance.js";
 import { MCP_ROLES, McpRoleSchema } from "./mcp/catalog.js";
 import { runMcpServer } from "./mcp/run.js";
-import { hasVersionedSegment, stableNodeCommand } from "./node-command.js";
+import { nodeLauncherWarning, stableNodeCommand } from "./node-command.js";
 import {
   boardShow,
   cliService,
@@ -59,6 +61,12 @@ import {
 import { listSkills, loadSkill, SkillError } from "./skills.js";
 import { planSubagents } from "./subagents.js";
 import { formatChecks, verifySetup } from "./verify.js";
+import {
+  pruneWorktrees,
+  readWorktreeInventory,
+  type WorktreeEntry,
+  WorktreeError,
+} from "./worktrees.js";
 
 /** Diisi build.mjs dari package.json; "dev" saat dijalankan lewat tsc/tsx. */
 const VERSION = process.env.CATENEXT_BUILD_VERSION || "0.0.0-dev";
@@ -79,7 +87,8 @@ async function friendly(fn: () => Promise<void>) {
       err instanceof ConfigError ||
       err instanceof McpConfigError ||
       err instanceof SkillError ||
-      err instanceof PlanningInputError
+      err instanceof PlanningInputError ||
+      err instanceof WorktreeError
     ) {
       console.error(`✗ ${err.message}`);
       process.exitCode = 1;
@@ -110,12 +119,8 @@ function defaultMcpCommand(): { command: string; args: string[] } {
     );
   }
   const command = stableNodeCommand(process.execPath, process.env.PATH);
-  if (command !== "node" && hasVersionedSegment(command)) {
-    console.error(
-      `! Entri MCP memakai ${command}, path berversi yang akan rusak saat Node di-update. ` +
-        "Tambahkan node ke PATH lalu jalankan ulang, atau pakai --mcp-command.",
-    );
-  }
+  const warning = nodeLauncherWarning(command);
+  if (warning) console.error(warning);
   return { command, args: [entry] };
 }
 
@@ -662,11 +667,80 @@ program
   .argument("<task_id>")
   .option("--as <alias>", "Bekerja sebagai persona ini; task milik persona lain ditolak")
   .option("--worktree", "Reservasi branch checkout + lease sesi (wajib di proyek layout monorepo)")
-  .option("--base <branch>", "Base branch untuk metadata worktree (opsional bersama --worktree)")
+  .option("--create-worktree", "Buat branch dan checkout baru, lalu claim dalam mode worktree")
+  .option("--branch <branch>", "Branch baru untuk --create-worktree (default: catenext/<task_id>)")
+  .option(
+    "--path <path>",
+    "Path checkout baru untuk --create-worktree (relatif terhadap root utama)",
+  )
+  .option("--base <branch>", "Base branch untuk --worktree atau --create-worktree")
   .option("--json", "Keluaran JSON")
-  .action(
-    (taskId: string, opts: { as?: string; json?: boolean; worktree?: boolean; base?: string }) =>
-      friendly(async () => taskClaim(await cliService(), taskId, opts)),
+  .action((taskId: string, opts: ClaimOptions) =>
+    friendly(async () => {
+      if (!opts.createWorktree) return taskClaim(await cliService(), taskId, opts);
+      const root = await requireRoot(true);
+      const config = await readConfig(root);
+      return taskClaim(await cliService(root), taskId, { ...opts, project: { root, config } });
+    }),
+  );
+
+const worktree = program
+  .command("worktree")
+  .description("Periksa dan bersihkan checkout kerja lokal");
+
+function printWorktrees(entries: WorktreeEntry[]) {
+  for (const entry of entries) {
+    const flags = [
+      entry.current && "current",
+      entry.managed && "managed",
+      entry.locked && "locked",
+      entry.prunable && "missing/prunable",
+      entry.dirty && "dirty",
+      entry.eligible && "eligible",
+    ].filter(Boolean);
+    console.log(
+      `${entry.status}  ${JSON.stringify(entry.path)}  ${JSON.stringify(entry.branch)}${flags.length ? `  [${flags.join(", ")}]` : ""}`,
+    );
+  }
+}
+
+worktree
+  .command("list")
+  .description("Lihat worktree Git beserta status lease SQLite (tanpa perubahan)")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot(true);
+      const worktrees = await readWorktreeInventory({ root, config: await readConfig(root) });
+      if (opts.json) console.log(JSON.stringify({ worktrees }, null, 2));
+      else printWorktrees(worktrees);
+    }),
+  );
+
+worktree
+  .command("prune")
+  .description("Pratinjau penghapusan worktree Catenext yang bersih dan tidak aktif")
+  .option("--apply", "Hapus checkout yang memenuhi syarat; branch tidak dihapus")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { apply?: boolean; json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot(true);
+      const result = await pruneWorktrees(
+        { root, config: await readConfig(root) },
+        Boolean(opts.apply),
+      );
+      if (opts.json) console.log(JSON.stringify(result, null, 2));
+      else {
+        printWorktrees(result.worktrees);
+        if (!opts.apply)
+          console.log(
+            "Pratinjau saja. Gunakan --apply untuk menghapus checkout berlabel eligible.",
+          );
+        for (const path of result.removed) console.log(`Dihapus: ${JSON.stringify(path)}`);
+        for (const path of result.skipped) console.error(`Tidak dihapus: ${JSON.stringify(path)}`);
+      }
+      if (result.skipped.length) process.exitCode = 1;
+    }),
   );
 
 program
@@ -1009,8 +1083,23 @@ program
   );
 
 program
+  .command("doctor")
+  .description("Diagnose local Catenext setup without changing project files")
+  .option("--json", "Print a machine-readable report")
+  .option("--fix", "Tighten mode on the owned, regular SQLite state file")
+  .action(async (opts: { json?: boolean; fix?: boolean }) => {
+    const report = await runDoctor({ ...opts, version: VERSION });
+    console.log(opts.json ? JSON.stringify(report) : formatDoctorReport(report));
+    if (!report.ok) process.exitCode = 1;
+  });
+
+program
   .command("mcp")
   .description("Jalankan server MCP lokal (stdio)")
+  .option(
+    "--allow-crud",
+    "Trust every client of this MCP instance to edit or cancel tasks and edit epics (not available for workers)",
+  )
   .option("--root <path>", "Root repo (default: cari .catenext/config.yaml dari folder saat ini)")
   .option("--role <role>", `Filter tool MCP per peran (${MCP_ROLES.join(" | ")})`, (v: string) => {
     const parsed = McpRoleSchema.safeParse(v.trim());
@@ -1021,8 +1110,8 @@ program
     }
     return parsed.data;
   })
-  .action((opts: { root?: string; role?: "orchestrator" | "worker" }) =>
-    runMcpServer({ root: opts.root, role: opts.role, version: VERSION }),
+  .action((opts: { root?: string; role?: "orchestrator" | "worker"; allowCrud?: boolean }) =>
+    runMcpServer({ root: opts.root, role: opts.role, allowCrud: opts.allowCrud, version: VERSION }),
   );
 
 program
