@@ -5,7 +5,7 @@
 <h1 align="center">Catenext CLI</h1>
 
 <p align="center">
-  Satu antrean lokal untuk agen AI coding — claim, handoff, dan task berikutnya tanpa Cloud.
+  Antrean lokal untuk agen AI coding — claim, handoff, task berikutnya. Tanpa Cloud.
 </p>
 
 <p align="center">
@@ -14,10 +14,9 @@
   <a href="https://nodejs.org/"><img alt="node" src="https://img.shields.io/node/v/catenext?color=0D9488" /></a>
 </p>
 
-Satu antrean lokal untuk agen AI coding Anda. Catenext mengunci task agar dua agen tidak
-mengerjakan hal yang sama, meneruskan handoff ke agen berikutnya, dan membuka task baru hanya
-setelah dependensinya selesai. Semua state ada di komputer Anda (SQLite) — tanpa akun Cloud,
-tanpa login, tanpa dashboard.
+Catenext mengunci task agar dua agen tidak bentrok, meneruskan handoff ke agen berikutnya,
+dan membuka task baru hanya setelah dependensinya selesai. Semua state ada di komputer Anda
+(SQLite) — tanpa akun, tanpa login, tanpa dashboard.
 
 Paket ini berisi CLI `catenext` dan server MCP stdio untuk Claude Code, Cursor, Codex,
 Antigravity, OpenCode, dan agen lain.
@@ -26,20 +25,25 @@ Antigravity, OpenCode, dan agen lain.
 [Changelog](CHANGELOG.md) ·
 [Laporkan masalah](https://github.com/TenkuryuCode/catenext-cli/issues)
 
-## Mulai dalam 10 menit
+<p align="center">
+  <img src="docs/assets/catenext-agent-flow.jpg" alt="Alur Catenext: manusia, orchestrator, persona di worktree terpisah, SQLite lokal" width="720" />
+</p>
 
-Butuh Node.js **22.12** atau lebih baru.
+<p align="center"><em>Manusia → orchestrator → persona (bisa ditambah) di worktree sendiri → SQLite lokal.</em></p>
+
+## Mulai cepat
+
+Butuh Node.js **22.12+**.
 
 ```bash
 npm install -g catenext
 cd ~/code/proyek-anda
-catenext init --platform cursor --dry-run   # lihat perubahan dulu
-catenext init --platform cursor             # interview singkat (atau --yes untuk default)
+catenext init --platform cursor          # tip: tambah --dry-run dulu, atau --yes untuk default
 catenext verify --platform cursor
 ```
 
-Mulai ulang IDE/CLI, lalu percayai server MCP `catenext` jika diminta.
-`catenext mcp` adalah proses stdio yang diluncurkan klien — bukan server HTTP.
+Restart IDE/CLI, lalu percayai server MCP `catenext` jika diminta.
+`catenext mcp` adalah proses **stdio** (bukan HTTP).
 
 | Klien | `--platform` | Konfigurasi |
 | --- | --- | --- |
@@ -47,67 +51,49 @@ Mulai ulang IDE/CLI, lalu percayai server MCP `catenext` jika diminta.
 | Cursor | `cursor` | `.cursor/mcp.json` + `.cursor/CATENEXT.md` |
 | Codex | `codex` | `.codex/config.toml` + `.codex/CATENEXT.md` |
 | Antigravity | `antigravity` | `.agents/mcp_config.json` + `.agents/CATENEXT.md` |
-| OpenCode | `opencode` | sesuai setup OpenCode + `.opencode/CATENEXT.md` |
+| OpenCode | `opencode` | setup OpenCode + `.opencode/CATENEXT.md` |
 
-`init` menulis `.catenext/config.yaml`, entri MCP, `.gitignore`, **`CATENEXT.md`** (master
-prompt), pointer platform, blok di `AGENTS.md`, dan seed persona **yang cocok dengan
-stack/repo** (mis. hanya `fe`+`reviewer` untuk Next.js). Role lain ditambah nanti:
+`init` menulis config, entri MCP, `.gitignore`, **`CATENEXT.md`**, pointer platform, blok
+`AGENTS.md`, dan seed persona **yang cocok** dengan stack/repo. Tambah role lain kapan saja:
 `catenext persona set <alias> --role <role>` lalu `catenext sync`.
-`catenext remove` membersihkan setup (bukan file state SQLite, kecuali Anda hapus sendiri).
-
-```bash
-catenext sync --platform cursor --dry-run
-catenext sync --platform cursor --force
-```
+`catenext remove` membersihkan setup (file SQLite tetap, kecuali Anda hapus sendiri).
 
 ## Memperbarui Catenext
 
-CLI di npm dan file setup di repo adalah dua langkah terpisah.
-
-**1. Paket CLI (global atau npx)**
+**1. Paket CLI**
 
 ```bash
-# cek versi terpasang
 catenext --version
-
-# perbarui global
 npm install -g catenext@latest
-
-# atau sekali jalan tanpa global
-npx -y catenext@latest --version
 ```
 
-Lihat perubahan: [CHANGELOG.md](CHANGELOG.md) ·
-[rilis npm](https://www.npmjs.com/package/catenext).
-
-**2. Setup di setiap repo proyek** (setelah CLI baru)
+**2. Setup di setiap repo** (setelah CLI baru)
 
 ```bash
-cd ~/code/proyek-anda
-catenext sync --platform cursor --dry-run   # lihat dulu
-catenext sync --platform cursor --force     # perbarui MCP, CATENEXT.md, stub agen, skill
+catenext sync --platform cursor --force
 catenext verify --platform cursor
 ```
 
-Lalu **mulai ulang IDE/CLI** agar proses MCP memuat biner baru.
+Lalu **restart IDE**. Lihat [CHANGELOG.md](CHANGELOG.md).
 
-| Yang ikut `sync` | Yang tidak disentuh |
+| Ikut `sync` | Tidak disentuh |
 | --- | --- |
-| Entri MCP, pointer platform, blok `AGENTS.md`, `CATENEXT.md` (bila masih bertanda Catenext), stub persona, skill bawaan yang belum ada | `.catenext/catenext.sqlite` (task/docs), skill yang sudah Anda edit, config YAML kecuali field yang `sync` kelola |
+| MCP, pointer, `AGENTS.md`/`CATENEXT.md` (bertanda Catenext), stub persona, skill bawaan baru | SQLite (task/docs), skill yang sudah Anda edit |
 
-Tips:
-
-- Pakai `npx -y catenext@latest …` di MCP jika Anda tidak ingin mengelola global install — tetap jalankan `sync` setelah rilis besar.
-- Setelah naik versi mayor/minor, baca changelog; contoh 0.6.x: state SQLite, seed persona **matched**, master prompt baru.
-- Jangan commit `.catenext/catenext.sqlite` atau cache; backup SQLite sendiri sebelum eksperimen besar.
+Tips: setelah 0.10/0.11 cek worktree, doctor, template, dan watch di changelog.
+Jangan commit `.catenext/catenext.sqlite` atau cache.
 
 ## Master prompt (salin ke chat)
 
-Tempel blok di bawah sebagai **pesan pertama** di chat agen (repo kosong atau sudah ada
-kode). Agen akan **menginstall CLI + `init`** bila belum ada, lalu jadi orchestrator.
+**Untuk Anda (manusia):**
 
-Setelah `init`, file **`CATENEXT.md`** di root berisi teks yang sama. Pointer platform
-(`CLAUDE.md`, `.cursor/CATENEXT.md`, …) mengarahkan ke situ, lalu ke `AGENTS.md`.
+1. Tempel blok di bawah sebagai **pesan pertama** di chat agen (repo kosong atau sudah ada kode).
+2. Izinkan agen menjalankan `init` / install bila diminta.
+3. Setelah `verify`, **restart IDE** dan percayai MCP `catenext`.
+4. Bila agen meminta approval, balas `1` / `2` / `3` (approve · revise · next).
+
+Setelah `init`, file root **`CATENEXT.md`** berisi pointer boot yang sama arahnya.
+Pointer platform (`CLAUDE.md`, `.cursor/CATENEXT.md`, …) mengarah ke situ, lalu ke `AGENTS.md`.
 
 ````markdown
 # Catenext · Master Prompt
@@ -117,7 +103,7 @@ You are starting a **new Catenext session** in this repo. Follow this file first
 ## Who you are
 
 - You are the **orchestrator** (main agent). Do **not** use `agent_alias`.
-- Persona subagents (`be`, `fe`, `tester`, `android`, `security`, `reviewer`, …) do the implementation work.
+- Persona subagents (`be`, `fe`, `tester`, `android`, `security`, `reviewer`, `scribe`, or custom via `persona set`) do the implementation work.
 - Ask the human first; mirror **their language**. Agent stubs and tool names stay English.
 
 ## Bootstrap (install if missing)
@@ -126,72 +112,48 @@ If `.catenext/config.yaml` is missing, or `catenext` / MCP is not usable yet, **
 
 1. Require **Node.js ≥ 22.12**. If missing, tell the human how to install it.
 2. Install CLI: `npm install -g catenext` (or `npx -y catenext …` for one-off).
-3. Detect IDE/CLI and **ask the human** which `--platform` to use (recommend what you detect):
-   `cursor` · `claude-code` · `codex` · `antigravity` · `opencode` · `vscode`
-4. Show a dry-run, wait for OK, then apply:
-   `catenext init --platform <id> --dry-run`
-   `catenext init --platform <id>` (TTY interview) or `catenext init --platform <id> --yes`
-5. `catenext verify --platform <id>` — then ask the human to **restart the IDE/CLI** and trust the `catenext` MCP server.
-6. Only after verify: continue with **First 60 seconds** below (read this file / `AGENTS.md`, then `catenext brief`).
+3. Ask which `--platform`: `cursor` · `claude-code` · `codex` · `antigravity` · `opencode` · `vscode`
+4. Dry-run, wait for OK, then apply: `catenext init --platform <id> --dry-run` → `catenext init --platform <id>` (or `--yes`)
+5. `catenext verify --platform <id>` — ask the human to **restart the IDE/CLI** and trust MCP `catenext`.
+6. Continue with **First 60 seconds** below.
 
 ## First 60 seconds
 
-1. Read **AGENTS.md** (detailed rules) and note project stack from `.catenext/config.yaml` / context.
-2. Call MCP/CLI `session_brief` (`catenext brief`) — compact only.
-3. If `pending_approvals` is non-empty, **present options to the human** before coding:
-   - `1` approve · `2` revise (with feedback) · `3` next
-4. Only then plan or delegate. Prefer `interview_setup` when IDE/CLI setup is still undecided.
-5. Before parallel coding: short cross-persona brainstorm → save `sync-board` (skill `cross-agent-sync`).
+1. Read **AGENTS.md** and note stack from `.catenext/config.yaml`.
+2. Call `session_brief` (`catenext brief`) — compact only.
+3. If `pending_approvals` exist, present **1 approve · 2 revise · 3 next** before coding.
+4. Kickoff brainstorm → `sync-board`, then DRAFT tasks; wait for human plan approval before parallel work.
 
 ## How work flows
 
 ```text
 human goal
   → orchestrator clarifies (user language)
-  → kickoff brainstorm (relevant personas) → sync-board
+  → kickoff brainstorm → sync-board
   → DRAFT tasks (persona + depends_on)
-  → human approve_plan
-  → parallel subagents each in their own worktree/branch
-  → mid-flight asks via orchestrator + sync-board
+  → human: task approve
+  → parallel subagents, each in own worktree/branch
   → handoff → NEEDS_REVIEW
-  → orchestrator reviews all worktrees, integrates if needed
-  → human: PR | merge to main | revise | next
+  → orchestrator integrates if needed
+  → human: PR | merge | revise | next
 ```
 
 ## Parallel worktrees
 
-- Concurrent personas **must** use different git worktrees (unique session/branch).
-- Orchestrator tracks every active worktree and does **not** let subagents merge `main`.
-- After handoffs, orchestrator combines/edits only as needed, then asks: **PR**, **merge**, **revise**, or **next**.
-
-## Docs
-
-- Tidy pass: persona `scribe` + skill `docs-hygiene`.
+- Concurrent personas **must** use different git worktrees.
+- Subagents never merge `main`. After handoffs ask: **PR**, **merge**, **revise**, or **next**.
 
 ## Missing tools / access
 
-If you lack a capability the work needs (web research, fetch/HTTP, browser, private URL, login, paid API, OS permission, etc.):
-1. **Stop guessing** — do not invent page contents, API responses, or “I browsed it”.
-2. **Ask the human** (their language) for permission or help, with a concrete ask.
-3. Wait for OK / paste / enable-tool before continuing that path.
-4. If the human pastes a secret into chat, **do not** copy it into docs, handoffs, commits, PRs, or issues — use env/local files they control.
+Stop guessing. Ask the human (their language). Wait for OK / paste / enable-tool.
+Never copy pasted secrets into docs, handoffs, commits, or PRs.
 
 ```text
 ACCESS NEEDED
 need: <research | fetch | browser | login | other>
 why: <one line>
 Options: 1) allow / enable tool  2) paste the info yourself  3) skip this path  4) other
-Reply with 1 / 2 / 3 / 4.
 ```
-
-## Secrets & credentials (never publish)
-
-Never publish or persist credentials or other critical secrets anywhere durable or shared:
-handoffs, docs, `sync-board`, commits, PRs, issues, chat logs meant for others, screenshots, CI logs.
-Includes: API keys, tokens, passwords, private keys, cookies, `.env` values, connection strings with passwords,
-OTA/signing keys, session cookies, personal data that must stay private.
-Cite **paths** (e.g. `.env`, `secrets/…`) only. Prefer env vars / secret managers the human already uses.
-Catenext scrubbing is best-effort — you still must not paste secrets on purpose.
 
 ## Human approval template
 
@@ -202,55 +164,46 @@ worktree/branch: <if any>
 summary: <one line>
 verify: <command if any>
 Options: 1) approve  2) revise <feedback>  3) next
-Reply with 1 / 2 / 3 (or the same words in chat).
 ```
 
 ## Commands (cheat sheet)
 
 | Need | Command |
 | --- | --- |
-| Install CLI | `npm install -g catenext` |
-| Upgrade CLI | `npm install -g catenext@latest` then `catenext sync --force` + restart IDE |
-| First-time setup | `catenext init --platform <id>` (`--dry-run` / `--yes`) |
-| Verify MCP | `catenext verify --platform <id>` |
-| Add persona | `catenext persona set <alias> --role <role>` then `catenext sync` |
-| Session snapshot | `catenext brief` |
-| Board | `catenext board` |
-| Claim (parallel-safe) | `catenext claim <id> --as <alias> --worktree` |
-| Approve plan | `catenext task approve <id>` |
-| Approve handoff | `catenext review approve <id>` |
+| Install / upgrade | `npm install -g catenext@latest` then `catenext sync --force` + restart IDE |
+| Setup | `catenext init --platform <id>` (`--dry-run` / `--yes`) |
+| Verify | `catenext verify --platform <id>` |
+| Session / board | `catenext brief` · `catenext board` · `catenext watch --once` |
+| Persona | `catenext persona set <alias> --role <role>` then `catenext sync` |
+| Claim (parallel) | `catenext claim <id> --as <alias> --worktree` (or `--create-worktree`) |
+| Worktrees | `catenext worktree list` · `catenext worktree prune` |
+| Template bundle | `catenext template export` · `catenext template import <file>` |
+| Doctor | `catenext doctor` |
+| Approve plan / handoff | `catenext task approve <id>` · `catenext review approve <id>` |
 | Revise | `catenext revise <id> --feedback "…"` |
-| Sync agents | `catenext sync` |
 
 ## Do / Don't
 
-- **Do** install/init when setup is missing; seed only personas that match this repo; add more with `persona set` when needed.
-- **Do** ask the human when research/fetch/browser (or any required access) is missing — never fake the result.
-- **Don't** invent cloud accounts, dashboards, or fake credentials — this CLI is local SQLite only.
-- **Don't** publish credentials or critical secrets (handoffs, docs, git, PR, issues) — paths only.
-- **Don't** implement persona tasks yourself unless the human explicitly asks.
-- **Don't** merge to main without explicit human choice; prefer PR when unsure.
+- **Do** install/init when missing; seed matched personas; add more with `persona set`.
+- **Do** ask when research/fetch/browser is missing — never fake results.
+- **Don't** invent cloud accounts or credentials — local SQLite only.
+- **Don't** publish secrets (paths only). Don't merge `main` without explicit human choice.
 - **Don't** invent test/merge results.
 
-Full rules → [AGENTS.md](./AGENTS.md). Persona stubs → platform `agents/` folders (English, stack-aware).
+Full rules → [AGENTS.md](./AGENTS.md).
 ````
-
-Alur: agen install/`init` bila perlu → restart IDE → `catenext brief` → approval jika ada →
-rencana / delegasi. Bahasa tanya-jawab mengikuti manusia; stub agen tetap Inggris.
 
 ## Orchestrator dan persona
 
-- **Orchestrator** memecah tujuan, menyusun DRAFT, mendelegasikan, meninjau worktree, dan
-  bertanya ke manusia sebelum merge/PR.
-- **Persona** adalah subagent (alias + role + repo). Setelah `init`, hanya yang **matched**
-  ke repo (plus `reviewer`). Catalog penuh tetap tersedia: `be`, `fe`, `tester`, `android`,
-  `security`, `reviewer`, `scribe`.
+- **Orchestrator** (agen utama): pecah tujuan, DRAFT, delegasi, tinjau worktree, tanya sebelum PR/merge.
+- **Persona** = subagent (alias + role + repo). Seed awal **matched** ke stack; catalog contoh:
+  `be`, `fe`, `tester`, `android`, `security`, `reviewer`, `scribe` — atau buat sendiri.
 
 ```bash
 catenext persona list
-catenext persona set tester --role testing    # tambah role yang kurang
+catenext persona set tester --role testing
 catenext persona set bambang --role backend --repo api
-catenext sync --platform cursor               # tulis stub agen untuk persona baru
+catenext sync --platform cursor
 catenext brief
 catenext board
 ```
@@ -261,70 +214,68 @@ catenext board
 catenext epic templates
 catenext epic create "Tambah ekspor billing"   # atau: --template fitur-login
 catenext task create --epic <epic_id> --file tasks.json
-# atau inline: catenext task create --epic <epic_id> --title "API" --prompt "..."
-catenext task update <task_id> --clear-stale
-catenext task deps <task_id> <dep_id...>
-catenext task cancel <task_id>
 catenext task approve <task_id>          # manusia: DRAFT → TODO
 catenext next --as bambang
 catenext claim <task_id> --as bambang --worktree
-# kerjakan di worktree itu, tes, commit
-catenext done <task_id> --lease <lease_id> --notes "Exporter siap" \
-  --verify "pnpm test"
+catenext done <task_id> --lease <lease_id> --notes "Exporter siap" --verify "pnpm test"
 catenext review approve <task_id>        # manusia: NEEDS_REVIEW → DONE
 ```
 
-`tasks.json` boleh array; task dalam batch bisa saling merujuk lewat `ref`:
-
-```json
-[
-  { "ref": "export", "title": "CSV export", "prompt_instruction": "Tulis exporter + unit test." },
-  { "ref": "docs", "title": "Dokumentasi CSV", "prompt_instruction": "Contoh + urutan kolom.", "depends_on": ["export"] }
-]
-```
-
-Persetujuan rencana dan handoff hanya lewat CLI manusia (`task approve` / `review approve`).
-Jalur MCP agen untuk approve ditolak. Catatan verifikasi disimpan sebagai catatan, bukan dijalankan
-oleh Catenext.
-
-Buntu? `catenext block <task_id> --category missing_env --reason "SMTP_HOST belum diisi."`
-Lepas tanpa blocker: `catenext release <task_id> --lease <lease_id>`.
+Persetujuan hanya lewat CLI manusia (`task approve` / `review approve`) — MCP agen tidak boleh approve.
+Buntu: `catenext block <task_id> --category missing_env --reason "…"`.
+Lepas lease: `catenext release <task_id> --lease <lease_id>`.
 
 ## Kerja paralel (worktree)
 
-Persona yang jalan bersamaan **wajib** worktree/branch terpisah. Orchestrator memantau semua
-worktree, mengintegrasikan bila perlu, lalu bertanya: **PR** · **merge ke main** · **revise** ·
-**next**. Subagent tidak boleh merge `main` sendiri.
+Persona paralel **wajib** worktree/branch terpisah. Orchestrator bertanya: **PR** · **merge** · **revise** · **next**.
 
 ```bash
-# buat checkout baru lalu claim, atau claim di checkout yang sudah ada
 catenext claim <task_id> --as bambang --create-worktree --branch feat/api --path ../api-lane
 catenext claim <task_id> --as bambang --worktree
 catenext worktree list                 # inventori Git + lease (read-only)
-catenext worktree prune                # pratinjau saja (default)
+catenext worktree prune                # pratinjau (default)
 catenext worktree prune --apply        # hapus checkout managed yang eligible; branch tetap
-catenext done <task_id> --lease <lease_id> --notes "…" --verify "pnpm test" \
-  --pr https://github.com/owner/repo/pull/42 --base main
 ```
 
-`prune` selalu pratinjau dulu; checkout primary, aktif, kotor, atau unmanaged tidak dihapus.
-URL PR opsional — hanya referensi lokal; review lokal tidak membuktikan merge remote.
+`prune` melindungi primary, aktif, kotor, dan unmanaged.
+
+## Template lintas proyek
+
+**Apa:** ekspor/impor personas + skill repo sebagai JSON bundle.
+**Kapan:** salin setup tim ke repo lain tanpa menyalin secret.
+
+```bash
+catenext template export -o team.json
+catenext template import team.json              # upsert
+catenext template import team.json --dry-run
+catenext template export --personas-only -o p.json
+catenext template import team.json --skills-only
+```
+
+Secret di-scrub saat export/import. Jangan commit bundle yang masih berisi kredensial.
+
+## Watch (monitor board)
+
+**Apa:** ringkasan terminal board, lease/worktree, pending approval, dan `task_events`.
+**Kapan:** pantau sesi tanpa membuka SQLite dengan writer lock.
+
+```bash
+catenext watch --once                  # satu snapshot
+catenext watch --interval 2000         # polling (default 2000 ms, min 250)
+catenext watch --once --epic <epic_id>
+catenext watch --once --json
+```
+
+Read-only — tidak mengunci writer dan tidak mengubah state.
 
 ## Doctor dan MCP CRUD
 
 ```bash
-catenext doctor            # diagnostik read-only (SQLite schema v4, MCP, registrasi Git)
-catenext doctor --fix      # perbaikan aman (mode/izin file state) — tidak pernah prune worktree
-catenext mcp               # default: tool CRUD disembunyikan + ditolak
-catenext mcp --allow-crud  # opt-in instance lokal terpercaya (tidak untuk --role worker)
+catenext doctor            # diagnostik read-only (SQLite, MCP, registrasi Git)
+catenext doctor --fix      # perbaikan aman mode/izin — tidak pernah prune
+catenext mcp               # CRUD disembunyikan + ditolak
+catenext mcp --allow-crud  # opt-in lokal (bukan untuk --role worker)
 ```
-
-- Doctor melaporkan registrasi Git yang `prunable`, terpisah dari eligibility `worktree prune`.
-- Tool MCP `update_task` / `update_epic` / `set_dependencies` / `cancel_task` hanya muncul bila
-  diluncurkan dengan `--allow-crud`. Persetujuan tetap CLI manusia (`task approve` /
-  `review approve`).
-- `init`/`sync` memilih launcher Node stabil (symlink ServBay/nvm `current` atau `node` di PATH)
-  agar path berversi tidak merusak entri MCP IDE; override dengan `--mcp-command` bila perlu.
 
 ## Revisi tanpa task baru
 
@@ -337,21 +288,16 @@ catenext assign <task_id> --to mira
 ## Banyak repo / monorepo
 
 ```bash
-# polyrepo: init di tiap checkout dengan --repo berbeda
+# polyrepo
 cd ~/code/api && catenext init --platform cursor --repo api
 cd ~/code/web && catenext init --platform cursor --repo web
 
-# monorepo: satu state SQLite; atur layout=monorepo di .catenext/config.yaml
-# claim paralel wajib --worktree
+# monorepo: layout=monorepo di .catenext/config.yaml; claim paralel wajib --worktree
 ```
 
-Untuk state bersama lintas checkout di satu mesin, arahkan `state_file` di
-`.catenext/config.yaml` ke file SQLite yang sama (path relatif ke root repo). Pakai filesystem
-lokal, bukan network mount / folder sync.
+State bersama di satu mesin: set `state_file` ke SQLite yang sama (filesystem lokal).
 
 ## Dokumen dan skill
-
-Dokumen proyek (blueprint, ERD, kontrak, keputusan) disimpan **lokal** di state SQLite.
 
 ```bash
 catenext doc list
@@ -360,10 +306,6 @@ catenext doc save erd --kind erd --file erd.md --version 0
 catenext skill load cross-agent-sync
 ```
 
-`--version` = versi yang terakhir Anda baca (`0` untuk baru). Konflik versi menolak timpa buta.
-Rapikan dokumen lewat persona `scribe` + skill `docs-hygiene`. Kickoff lintas persona: skill
-`cross-agent-sync` → dokumen `sync-board`.
-
 ## Indeks kode lokal
 
 ```bash
@@ -371,46 +313,40 @@ catenext index
 catenext search "login handler" --code
 ```
 
-MCP: `graph_neighbors`, `symbol_search`, `search_context` (dengan `sources: ["code"]`, hasil ringkas).
-
 ## Data lokal
 
 | Path | Isi |
 | --- | --- |
 | `.catenext/config.yaml` | Proyek, repo, layout, `state_file` |
-| `.catenext/catenext.sqlite` | Antrean task, handoff, persona, dokumen, graf kode |
+| `.catenext/catenext.sqlite` | Task, handoff, persona, dokumen, graf |
 | `.catenext/skills/` | Skill Markdown repo |
-| `.catenext/cache/` | Cache pencarian yang bisa dibangun ulang |
+| `.catenext/cache/` | Cache pencarian |
 | `CATENEXT.md` | Master prompt sesi baru |
-| `AGENTS.md` | Aturan orchestrator (blok Catenext) |
+| `AGENTS.md` | Aturan orchestrator |
 
-State lama `state.json` dimigrasi sekali ke SQLite (backup `*.bak`). Jangan commit state/cache.
-Backup SQLite terpisah jika perlu. Data Cloud lama **tidak** dimigrasi otomatis.
+Jangan commit state/cache. Backup SQLite sendiri bila perlu.
 
 ## Daftar perintah
 
 | CLI | Tool MCP | Fungsi |
 | --- | --- | --- |
-| `init` / `sync` / `verify` / `remove` | - | Setup MCP + stub agen (`--platform`, `--dry-run`) |
+| `init` / `sync` / `verify` / `remove` | - | Setup MCP + stub |
 | `brief` | `session_brief` | Ringkasan sesi + pending approval |
 | `board` | `get_project_board` | Papan lintas repo |
-| `root list\|add\|remove` | `manage_roots` | Workspace root milik persona |
-| `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task (`claim --worktree` / `--create-worktree`) |
-| `worktree list\|prune` | - | Inventori lease; prune pratinjau-by-default (`--apply` untuk hapus) |
+| `watch` | - | Monitor board/lease/approval/events (read-only) |
+| `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task |
+| `worktree list\|prune` | - | Inventori / prune preview-first |
+| `template export\|import` | - | Bundle persona + skill (scrub secret) |
 | `block` / `release` | `report_blocker` / `release_task` | Blokir / lepas lease |
 | `task approve` / `review approve` | - (manusia) | Setujui rencana / handoff |
 | `revise` / `assign` | `manage_task` | Revisi / ganti penanggung jawab |
 | `persona list\|set` | `list_personas` / `upsert_persona` | Persona proyek |
 | `doc …` | `get_document` / `save_document` | Dokumen lokal |
-| `epic` / `task create\|update\|cancel\|deps` | `list_epics` / `create_epic` / `create_tasks` (+ CRUD opt-in) | Rencana & CRUD lokal (DRAFT) |
-| `review …` | `review_pull_request` | Antrean review lokal |
-| `skill load` | `load_skill` / `save_repo_skill` | Skill repo |
-| `index` / `search` | `graph_neighbors` / `symbol_search` / `search_context` | Graf & pencarian lokal |
-| `log` | - | Audit log event task (`task_events`) |
-| `permission list\|set\|grant\|revoke` | - | Matriks permission lokal |
-| `doctor` | - | Diagnostik lokal read-only (`--fix` aman, tidak prune) |
-| `mcp` | - | Server MCP stdio (`--allow-crud` opt-in; worker ditolak) |
-| - | `interview_setup` | Kartu opsi setup untuk interview |
+| `epic` / `task create\|update\|cancel\|deps` | planning tools (+ CRUD opt-in) | Rencana lokal |
+| `doctor` | - | Diagnostik read-only |
+| `mcp` | - | Stdio MCP (`--allow-crud` opt-in) |
+| `index` / `search` | code search tools | Graf & pencarian |
+| `log` / `permission …` / `root …` / `skill …` | - | Audit, izin, roots, skill |
 
 Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.
 
@@ -418,26 +354,22 @@ Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.
 
 | Gejala | Yang perlu dilakukan |
 | --- | --- |
-| Task tidak muncul di `next` | Pastikan `task approve` sudah jalan, dependensi `DONE`, folder/`--as` cocok |
-| `repo_busy` / bentrok paralel | Selesaikan atau `release`; untuk paralel wajib `--worktree` |
-| `persona_repo_mismatch` | Pindah ke folder/`--repo` yang dipegang persona |
-| `document_version_conflict` | Baca ulang, gabungkan, simpan dengan versi terbaru |
-| Approve ditolak dari MCP | Setujui lewat CLI: `task approve` / `review approve` |
-| Tool MCP tidak terbaca | Mulai ulang IDE, lalu `catenext sync --platform … --force` |
-| Perilaku lama setelah rilis baru | `npm install -g catenext@latest`, lalu `sync --force`, restart IDE |
-| State lama JSON | Jalankan perintah apa pun yang membuka store — migrasi sekali ke SQLite |
+| Task tidak muncul di `next` | `task approve`, dependensi `DONE`, folder/`--as` cocok |
+| `repo_busy` / bentrok paralel | `release` atau wajib `--worktree` |
+| Approve ditolak dari MCP | Pakai CLI: `task approve` / `review approve` |
+| Tool MCP tidak terbaca | Restart IDE + `catenext sync --platform … --force` |
+| Perilaku lama setelah rilis | `npm install -g catenext@latest` → `sync --force` → restart |
+| `watch` kosong / filter aneh | Cek state SQLite; coba tanpa `--epic` |
+| Import template menolak secret | Bundle masih berisi kredensial — scrub/export ulang |
 
 ## Build dari source
 
-Repo ini adalah mirror publik CLI. Rilis npm dibangun dari sini dengan
+Repo ini adalah mirror publik CLI. Rilis npm memakai
 [npm provenance](https://docs.npmjs.com/generating-provenance-statements).
-`src/` = CLI + MCP; `shared/src/` = skema yang ikut di-bundle.
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm test
-pnpm build
+pnpm typecheck && pnpm test && pnpm build
 node dist/index.js --help
 ```
 

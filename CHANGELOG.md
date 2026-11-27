@@ -10,6 +10,12 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.11.1] - 2026-11-27
+
+### Diubah
+- Dokumentasi publik (README mirror): **Mulai cepat**, panduan starter prompt untuk manusia, diagram alur agen, serta dokumentasi `template export|import` dan `catenext watch`.
+- README CLI internal: contoh `catenext watch`.
+
 ## [0.11.0] - 2026-11-27
 
 ### Ditambahkan
