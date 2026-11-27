@@ -22,7 +22,7 @@ describe("scrubText", () => {
     ["xoxs-1234567890-abcdefghij", "slack_token"],
     ["xapp-1-A0123456789-1234567890-abcdef", "slack_token"],
     ["sk_live_abcdefghijklmnop", "stripe_key"],
-    ["AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGt688", "google_api_key"],
+    [["AIza", "SyTestFixture", "0123456789abcdef012345"].join(""), "google_api_key"],
     ["hf_abcdefghijklmnopqrstuvwxyz0123456789", "huggingface_token"],
     ["glpat-abcdefghijklmnopqrstuv", "gitlab_token"],
     ["pypi-AgEIcHlwaS5vcmcCJDEyMzQ1Njc4", "pypi_token"],

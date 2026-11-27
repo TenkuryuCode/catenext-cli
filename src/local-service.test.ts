@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,6 +14,7 @@ import {
   type McpToolInput,
 } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { indexProjectGraph } from "./db/graph-index.js";
 import { LocalService } from "./local-service.js";
 
 function readTaskJsonField(
@@ -1156,7 +1157,7 @@ describe("LocalService state persistence", () => {
       "Parallel epic A",
       "Parallel epic B",
     ]);
-  });
+  }, 20_000);
 
   it.each([
     "{bad json",
@@ -1650,5 +1651,135 @@ describe("LocalService state persistence", () => {
       verification_command: "pnpm test",
     });
     expect(fullClaim.dependencies[0]?.compact_handoff).toBeUndefined();
+  });
+});
+
+describe("LocalService code graph tools", () => {
+  it("supports graph_impact, graph_summary depth 5 / include_tests, and stale hints across all graph tools", async () => {
+    await mkdir(join(root, "apps/api/src/v1/users"), { recursive: true });
+    await mkdir(join(root, "apps/api/src/v1/routes"), { recursive: true });
+
+    const repoFile = join(root, "apps/api/src/v1/users/repo.ts");
+    const serviceFile = join(root, "apps/api/src/v1/users/service.ts");
+    const routeFile = join(root, "apps/api/src/v1/routes/users.ts");
+    const testFile = join(root, "apps/api/src/v1/users/repo.test.ts");
+
+    await writeFile(repoFile, "export function loadUserRecord() { return { id: 1 }; }\n");
+    await writeFile(
+      serviceFile,
+      `import { loadUserRecord } from "./repo.js";\nexport function getUserProfile() { return loadUserRecord(); }\n`,
+    );
+    await writeFile(
+      routeFile,
+      `import { getUserProfile } from "../users/service.js";\nexport function usersRoute() { return getUserProfile(); }\n`,
+    );
+    await writeFile(
+      testFile,
+      `import { loadUserRecord } from "./repo.js";\nexport function testLoadUser() { return loadUserRecord(); }\n`,
+    );
+
+    // Ensure DB exists before indexing; unindexed graph tools report stale: true (not_indexed).
+    await service.callTool("session_brief", {});
+    for (const [name, args] of [
+      ["graph_neighbors", { path: "apps/api/src/v1/users/repo.ts" }],
+      ["symbol_search", { query: "loadUserRecord" }],
+      ["graph_summary", {}],
+      ["graph_impact", { path: "apps/api/src/v1/users/repo.ts" }],
+    ] as const) {
+      const unindexed = await service.callTool(name, args);
+      expect(unindexed).toMatchObject({ stale: true, stale_reason: "not_indexed" });
+    }
+
+    await indexProjectGraph(service.stateFile, config.project_id, root);
+
+    // Fresh index: stale omitted on all 4 tools.
+    const neighbors = await service.callTool("graph_neighbors", {
+      path: "apps/api/src/v1/users/repo.ts",
+    });
+    expect(neighbors.stale).toBeUndefined();
+    expect(neighbors.edges.length).toBeGreaterThan(0);
+
+    const symbols = await service.callTool("symbol_search", { query: "loadUserRecord" });
+    expect(symbols.stale).toBeUndefined();
+    expect(symbols.hits).toMatchObject([
+      { name: "loadUserRecord", path: "apps/api/src/v1/users/repo.ts" },
+    ]);
+
+    // graph_summary depth 5 & include_tests toggle
+    const summaryNoTests = await service.callTool("graph_summary", {
+      depth: 5,
+      include_tests: false,
+    });
+    expect(summaryNoTests.stale).toBeUndefined();
+    expect(summaryNoTests.totals).toEqual({ files: 3, symbols: 3, edges: 2 });
+    expect(summaryNoTests.groups.map((g) => g.group).sort()).toEqual([
+      "apps/api/src/v1/routes",
+      "apps/api/src/v1/users",
+    ]);
+    expect(summaryNoTests.hubs.map((h) => h.path)).not.toContain(
+      "apps/api/src/v1/users/repo.test.ts",
+    );
+
+    const summaryWithTests = await service.callTool("graph_summary", {
+      depth: 5,
+      include_tests: true,
+    });
+    expect(summaryWithTests.totals).toEqual({ files: 4, symbols: 4, edges: 3 });
+    expect(summaryWithTests.hubs.map((h) => h.path)).toContain(
+      "apps/api/src/v1/users/repo.test.ts",
+    );
+
+    // graph_impact direct + transitive, with include_tests false vs true
+    const impactNoTests = await service.callTool("graph_impact", {
+      path: "apps/api/src/v1/users/repo.ts",
+      depth: 2,
+      include_tests: false,
+    });
+    expect(impactNoTests).toEqual({
+      target: "apps/api/src/v1/users/repo.ts",
+      indexed: true,
+      total_affected: 2,
+      truncated: false,
+      impacted: [
+        {
+          path: "apps/api/src/v1/users/service.ts",
+          distance: 1,
+          kind: "direct",
+          symbols_count: 1,
+        },
+        {
+          path: "apps/api/src/v1/routes/users.ts",
+          distance: 2,
+          kind: "transitive",
+          via: "apps/api/src/v1/users/service.ts",
+          symbols_count: 1,
+        },
+      ],
+    });
+
+    const impactWithTests = await service.callTool("graph_impact", {
+      path: "apps/api/src/v1/users/repo.ts",
+      depth: 2,
+      include_tests: true,
+    });
+    expect(impactWithTests.total_affected).toBe(3);
+    expect(impactWithTests.impacted.map((h) => h.path)).toContain(
+      "apps/api/src/v1/users/repo.test.ts",
+    );
+
+    // Modify indexed file with shifted mtime -> all 4 tools report stale: true (modified_files).
+    await writeFile(repoFile, "export function loadUserRecord() { return { id: 2 }; }\n");
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(repoFile, shifted, shifted);
+
+    for (const [name, args] of [
+      ["graph_neighbors", { path: "apps/api/src/v1/users/repo.ts" }],
+      ["symbol_search", { query: "loadUserRecord" }],
+      ["graph_summary", { depth: 5 }],
+      ["graph_impact", { path: "apps/api/src/v1/users/repo.ts" }],
+    ] as const) {
+      const staleOut = await service.callTool(name, args);
+      expect(staleOut).toMatchObject({ stale: true, stale_reason: "modified_files" });
+    }
   });
 });

@@ -5,10 +5,14 @@ import {
   CreateTasksInput,
   findCycle,
   GetReadyTasksInput,
+  GraphImpactInput,
+  GraphImpactOutput,
+  GraphNeighborsOutput,
   GraphSummaryInput,
   ManageTaskInput,
   MCP_TOOL_NAMES,
   SearchContextInput,
+  SymbolSearchOutput,
   UpsertPersonaInput,
 } from "../index.js";
 
@@ -29,6 +33,7 @@ describe("registry tool MCP", () => {
         "get_project_board",
         "get_project_context",
         "get_ready_tasks",
+        "graph_impact",
         "graph_neighbors",
         "graph_summary",
         "interview_setup",
@@ -129,16 +134,61 @@ describe("registry tool MCP", () => {
     ).toEqual(["document", "skill", "task", "code"]);
   });
 
-  it("graph_summary applies defaults and enforces depth and max_hubs bounds", () => {
+  it("graph_summary applies defaults and enforces depth (1..5), max_hubs, and include_tests", () => {
     expect(GraphSummaryInput.parse({})).toEqual({
       depth: 2,
       max_hubs: 12,
       include_mermaid: true,
+      include_tests: false,
     });
     expect(GraphSummaryInput.safeParse({ depth: 0 }).success).toBe(false);
-    expect(GraphSummaryInput.safeParse({ depth: 4 }).success).toBe(false);
+    expect(GraphSummaryInput.safeParse({ depth: 5 }).success).toBe(true);
+    expect(GraphSummaryInput.safeParse({ depth: 6 }).success).toBe(false);
     expect(GraphSummaryInput.safeParse({ max_hubs: 0 }).success).toBe(false);
     expect(GraphSummaryInput.safeParse({ max_hubs: 31 }).success).toBe(false);
+    expect(GraphSummaryInput.parse({ include_tests: true }).include_tests).toBe(true);
+  });
+
+  it("graph_impact validates input bounds and output freshness hints", () => {
+    expect(GraphImpactInput.parse({ path: "src/db.ts" })).toEqual({
+      path: "src/db.ts",
+      depth: 2,
+      limit: 20,
+      include_tests: false,
+    });
+    expect(GraphImpactInput.safeParse({ path: "" }).success).toBe(false);
+    expect(GraphImpactInput.safeParse({ path: "src/a.ts", depth: 0 }).success).toBe(false);
+    expect(GraphImpactInput.safeParse({ path: "src/a.ts", depth: 3 }).success).toBe(true);
+    expect(GraphImpactInput.safeParse({ path: "src/a.ts", depth: 4 }).success).toBe(false);
+    expect(GraphImpactInput.safeParse({ path: "src/a.ts", limit: 41 }).success).toBe(false);
+
+    expect(
+      GraphImpactOutput.parse({
+        target: "src/db.ts",
+        indexed: true,
+        stale: true,
+        stale_reason: "modified_files",
+        total_affected: 2,
+        truncated: false,
+        impacted: [
+          { path: "src/service.ts", distance: 1, kind: "direct", symbols_count: 3 },
+          {
+            path: "src/routes.ts",
+            distance: 2,
+            kind: "transitive",
+            via: "src/service.ts",
+            symbols_count: 2,
+          },
+        ],
+      }),
+    ).toMatchObject({ stale: true, total_affected: 2 });
+
+    expect(
+      GraphNeighborsOutput.parse({ path: "src/a.ts", edges: [], stale: true, stale_reason: "x" }),
+    ).toMatchObject({ stale: true });
+    expect(
+      SymbolSearchOutput.parse({ hits: [], stale: true, stale_reason: "not_indexed" }),
+    ).toMatchObject({ stale: true });
   });
 
   it("claim_task menerima worktree tanpa atau dengan worktree_path dan base_branch", () => {

@@ -83,6 +83,7 @@ export const SCRUB_TOOL_FIELDS: Partial<Record<McpToolName, readonly string[]>> 
   graph_neighbors: ["path"],
   symbol_search: ["query"],
   graph_summary: [],
+  graph_impact: ["path"],
 };
 
 export const DEFAULT_SCRUB_SKIP_KEYS: ReadonlySet<string> = new Set([

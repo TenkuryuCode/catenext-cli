@@ -1,16 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { CatenextConfigSchema, GraphSummaryOutput } from "@catenext/shared";
+import { CatenextConfigSchema, GraphImpactOutput, GraphSummaryOutput } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalService } from "../local-service.js";
 import { indexProjectGraph } from "./graph-index.js";
 import {
+  analyzeGraphImpact,
   groupForPath,
   renderArchitectureMarkdown,
+  renderImpactMarkdown,
   summarizeProjectGraph,
 } from "./graph-summary.js";
 import { openDatabaseAt } from "./open.js";
@@ -52,6 +54,11 @@ describe("groupForPath", () => {
     expect(groupForPath(nested, 1)).toBe("apps");
     expect(groupForPath(nested, 2)).toBe("apps/cli");
     expect(groupForPath(nested, 3)).toBe("apps/cli/src");
+    expect(groupForPath(nested, 4)).toBe("apps/cli/src/db");
+
+    const deeper = "apps/cli/src/v1/internal/graph-summary.ts";
+    expect(groupForPath(deeper, 4)).toBe("apps/cli/src/v1");
+    expect(groupForPath(deeper, 5)).toBe("apps/cli/src/v1/internal");
 
     expect(groupForPath("src\\local-service.ts", 2)).toBe("src");
     expect(groupForPath("apps\\cli\\src\\index.ts", 3)).toBe("apps/cli/src");
@@ -335,5 +342,296 @@ describe("renderArchitectureMarkdown", () => {
 
     const tableRows = md.split("\n").filter((line) => line.startsWith("|"));
     expect(tableRows).toHaveLength(10);
+  });
+
+  it("notes excluded test files and stale warnings in architecture markdown", () => {
+    const md = renderArchitectureMarkdown(
+      {
+        indexed: true,
+        stale: true,
+        stale_reason: "modified_files",
+        totals: { files: 1, symbols: 1, edges: 0 },
+        groups: [{ group: "src", files: 1, symbols: 1, edges_in: 0, edges_out: 0 }],
+        group_edges: [],
+        hubs: [],
+      },
+      { depth: 4, includeTests: false },
+    );
+    expect(md).toContain("(depth=4)");
+    expect(md).toContain("_Test files excluded (`include_tests=false`)._");
+    expect(md).toContain(
+      "> Warning: local code graph index is stale (modified_files). Run `catenext index` to refresh.",
+    );
+  });
+});
+
+describe("summarizeProjectGraph depth 4/5, include_tests, and stale flag", () => {
+  it("supports depth 4 and 5 and filters test files from hubs, groups, and mermaid when include_tests is false", async () => {
+    await mkdir(join(root, "apps/api/src/v1/users"), { recursive: true });
+    await mkdir(join(root, "apps/api/src/v1/orders"), { recursive: true });
+    await mkdir(join(root, "apps/api/src/__tests__"), { recursive: true });
+    await mkdir(join(root, "tests/e2e"), { recursive: true });
+
+    await writeFile(
+      join(root, "apps/api/src/v1/users/repo.ts"),
+      "export function findUser() { return 'u'; }\n",
+    );
+    await writeFile(
+      join(root, "apps/api/src/v1/orders/service.ts"),
+      `import { findUser } from "../users/repo.js";\nexport function createOrder() { return findUser(); }\n`,
+    );
+    await writeFile(
+      join(root, "apps/api/src/v1/users/repo.test.ts"),
+      `import { findUser } from "./repo.js";\nexport function testUser() { return findUser(); }\n`,
+    );
+    await writeFile(
+      join(root, "apps/api/src/__tests__/helper.ts"),
+      `import { findUser } from "../v1/users/repo.js";\nexport function helper() { return findUser(); }\n`,
+    );
+    await writeFile(
+      join(root, "tests/e2e/flow.spec.ts"),
+      `import { createOrder } from "../../apps/api/src/v1/orders/service.js";\nexport function e2e() { return createOrder(); }\n`,
+    );
+
+    const indexed = await indexProjectGraph(dbPath, projectId, root);
+    expect(indexed).toEqual({ files: 5, symbols: 5, edges: 4 });
+
+    const depth4NoTests = summarizeProjectGraph(dbPath, projectId, {
+      depth: 4,
+      include_mermaid: true,
+      include_tests: false,
+    });
+    expect(GraphSummaryOutput.parse(depth4NoTests)).toEqual(depth4NoTests);
+    expect(depth4NoTests.totals).toEqual({ files: 2, symbols: 2, edges: 1 });
+    expect(depth4NoTests.groups.map((g) => g.group)).toEqual(["apps/api/src/v1"]);
+    expect(depth4NoTests.hubs.map((h) => h.path)).toEqual([
+      "apps/api/src/v1/orders/service.ts",
+      "apps/api/src/v1/users/repo.ts",
+    ]);
+    expect(depth4NoTests.mermaid).toContain("apps/api/src/v1 (2 files)");
+    expect(depth4NoTests.mermaid).not.toContain("__tests__");
+    expect(depth4NoTests.mermaid).not.toContain("tests/e2e");
+
+    const depth5NoTests = summarizeProjectGraph(dbPath, projectId, {
+      depth: 5,
+      include_mermaid: true,
+      include_tests: false,
+    });
+    expect(depth5NoTests.groups).toEqual([
+      {
+        group: "apps/api/src/v1/orders",
+        files: 1,
+        symbols: 1,
+        edges_in: 0,
+        edges_out: 1,
+      },
+      {
+        group: "apps/api/src/v1/users",
+        files: 1,
+        symbols: 1,
+        edges_in: 1,
+        edges_out: 0,
+      },
+    ]);
+    expect(depth5NoTests.group_edges).toEqual([
+      { from: "apps/api/src/v1/orders", to: "apps/api/src/v1/users", count: 1 },
+    ]);
+    expect(depth5NoTests.mermaid).toContain("apps/api/src/v1/orders (1 file)");
+    expect(depth5NoTests.mermaid).toContain("apps/api/src/v1/users (1 file)");
+
+    const depth5WithTests = summarizeProjectGraph(dbPath, projectId, {
+      depth: 5,
+      include_mermaid: true,
+      include_tests: true,
+    });
+    expect(depth5WithTests.totals).toEqual({ files: 5, symbols: 5, edges: 4 });
+    expect(depth5WithTests.groups.map((g) => g.group)).toEqual([
+      "apps/api/src/v1/users",
+      "apps/api/src/v1/orders",
+      "apps/api/src/__tests__",
+      "tests/e2e",
+    ]);
+    expect(depth5WithTests.hubs.map((h) => h.path)).toContain("apps/api/src/v1/users/repo.test.ts");
+    expect(depth5WithTests.mermaid).toContain("apps/api/src/__tests__ (1 file)");
+    expect(depth5WithTests.mermaid).toContain("tests/e2e (1 file)");
+  });
+
+  it("reports stale: true with stale_reason when unindexed, modified, or missing on disk", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    const targetPath = join(root, "src/mod.ts");
+    await writeFile(targetPath, "export const v = 1;\n");
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    const notIndexed = summarizeProjectGraph(dbPath, projectId, {}, rootDirs);
+    expect(notIndexed.indexed).toBe(false);
+    expect(notIndexed.stale).toBe(true);
+    expect(notIndexed.stale_reason).toBe("not_indexed");
+
+    await indexProjectGraph(dbPath, projectId, root);
+    const fresh = summarizeProjectGraph(dbPath, projectId, {}, rootDirs);
+    expect(fresh.indexed).toBe(true);
+    expect(fresh.stale).toBeUndefined();
+    expect("stale" in fresh).toBe(false);
+
+    // Shift mtime deterministically so Math.floor(mtimeMs) differs from DB mtime_ms
+    await writeFile(targetPath, "export const v = 2;\n");
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(targetPath, shifted, shifted);
+
+    const modified = summarizeProjectGraph(dbPath, projectId, {}, rootDirs);
+    expect(modified.stale).toBe(true);
+    expect(modified.stale_reason).toBe("modified_files");
+
+    await rm(targetPath);
+    const missing = summarizeProjectGraph(dbPath, projectId, {}, rootDirs);
+    expect(missing.stale).toBe(true);
+    expect(missing.stale_reason).toBe("missing_files");
+  });
+});
+
+describe("analyzeGraphImpact", () => {
+  it("returns indexed: false when DB is empty and sets stale when code files exist", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/a.ts"), "export const a = 1;\n");
+
+    const unindexed = analyzeGraphImpact(dbPath, projectId, { path: "src/a.ts" }, [
+      { rootId: null, dir: root },
+    ]);
+    expect(GraphImpactOutput.parse(unindexed)).toEqual(unindexed);
+    expect(unindexed).toEqual({
+      target: "src/a.ts",
+      indexed: false,
+      stale: true,
+      stale_reason: "not_indexed",
+      total_affected: 0,
+      truncated: false,
+      impacted: [],
+    });
+  });
+
+  it("traces direct and transitive reverse dependents, handles cycles, enforces limit/truncated, and filters tests", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src/core.ts"),
+      "export function coreA() {}\nexport function coreB() {}\n",
+    );
+    await writeFile(
+      join(root, "src/service.ts"),
+      `import { coreA } from "./core.js";\nexport function runService() { return coreA(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/handler.ts"),
+      `import { runService } from "./service.js";\nexport function handle() { return runService(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/router.ts"),
+      `import { handle } from "./handler.js";\nexport function route() { return handle(); }\n`,
+    );
+    // Cycle: cycleA <-> cycleB, and leaf -> cycleB
+    await writeFile(
+      join(root, "src/cycle-a.ts"),
+      `import { cycleB } from "./cycle-b.js";\nexport function cycleA() { return cycleB(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/cycle-b.ts"),
+      `import { cycleA } from "./cycle-a.js";\nexport function cycleB() { return cycleA(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/cycle-leaf.ts"),
+      `import { cycleB } from "./cycle-b.js";\nexport function useCycle() { return cycleB(); }\n`,
+    );
+    // Test file depending on core.ts and intermediate test helper
+    await writeFile(
+      join(root, "src/core.test.ts"),
+      `import { coreA } from "./core.js";\nexport function testCore() { return coreA(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/core-spec-consumer.ts"),
+      `import { testCore } from "./core.test.js";\nexport function useTest() { return testCore(); }\n`,
+    );
+
+    await indexProjectGraph(dbPath, projectId, root);
+
+    // depth=2: direct + 1-hop transitive, test files excluded
+    const depth2 = analyzeGraphImpact(dbPath, projectId, {
+      path: "./src/core.ts",
+      depth: 2,
+      include_tests: false,
+    });
+    expect(GraphImpactOutput.parse(depth2)).toEqual(depth2);
+    expect(depth2).toEqual({
+      target: "src/core.ts",
+      indexed: true,
+      total_affected: 2,
+      truncated: false,
+      impacted: [
+        { path: "src/service.ts", distance: 1, kind: "direct", symbols_count: 1 },
+        {
+          path: "src/handler.ts",
+          distance: 2,
+          kind: "transitive",
+          via: "src/service.ts",
+          symbols_count: 1,
+        },
+      ],
+    });
+
+    // depth=3 reaches router.ts; include_tests=true includes core.test.ts and its dependent
+    const depth3WithTests = analyzeGraphImpact(dbPath, projectId, {
+      path: "src/core.ts",
+      depth: 3,
+      include_tests: true,
+    });
+    expect(depth3WithTests.total_affected).toBe(5);
+    expect(depth3WithTests.truncated).toBe(false);
+    expect(depth3WithTests.impacted.map((h) => [h.path, h.distance, h.kind])).toEqual([
+      ["src/core.test.ts", 1, "direct"],
+      ["src/service.ts", 1, "direct"],
+      ["src/handler.ts", 2, "transitive"],
+      ["src/core-spec-consumer.ts", 2, "transitive"],
+      ["src/router.ts", 3, "transitive"],
+    ]);
+
+    // limit & truncated
+    const limited = analyzeGraphImpact(dbPath, projectId, {
+      path: "src/core.ts",
+      depth: 3,
+      limit: 2,
+      include_tests: true,
+    });
+    expect(limited.total_affected).toBe(5);
+    expect(limited.truncated).toBe(true);
+    expect(limited.impacted).toHaveLength(2);
+
+    // Cycle handling: terminates cleanly, does not revisit target
+    const cycleImpact = analyzeGraphImpact(dbPath, projectId, {
+      path: "src/cycle-a.ts",
+      depth: 3,
+    });
+    expect(cycleImpact.total_affected).toBe(2);
+    expect(cycleImpact.impacted).toEqual([
+      { path: "src/cycle-b.ts", distance: 1, kind: "direct", symbols_count: 1 },
+      {
+        path: "src/cycle-leaf.ts",
+        distance: 2,
+        kind: "transitive",
+        via: "src/cycle-b.ts",
+        symbols_count: 1,
+      },
+    ]);
+
+    // Stale detection on analyzeGraphImpact
+    const rootDirs = [{ rootId: null, dir: root }];
+    await writeFile(join(root, "src/core.ts"), "export function coreA() { return 1; }\n");
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(join(root, "src/core.ts"), shifted, shifted);
+    const staleImpact = analyzeGraphImpact(dbPath, projectId, { path: "src/core.ts" }, rootDirs);
+    expect(staleImpact.stale).toBe(true);
+    expect(staleImpact.stale_reason).toBe("modified_files");
+
+    const md = renderImpactMarkdown(staleImpact);
+    expect(md).toContain("# Impact analysis: `src/core.ts`");
+    expect(md).toContain("stale (modified_files)");
+    expect(md).toContain("| `src/service.ts` | 1 | direct | - | 1 |");
   });
 });

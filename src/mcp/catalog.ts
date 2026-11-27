@@ -36,6 +36,7 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "graph_neighbors",
     "symbol_search",
     "graph_summary",
+    "graph_impact",
     "review_pull_request",
   ],
   worker: [
@@ -53,6 +54,7 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "graph_neighbors",
     "symbol_search",
     "graph_summary",
+    "graph_impact",
   ],
 };
 
@@ -93,6 +95,7 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   symbol_search: "Search indexed symbols in the local SQLite code graph.",
   graph_summary:
     "Summarize project module architecture, dependency groups, hubs, and Mermaid graph.",
+  graph_impact: "Analyze reverse transitive dependents of a file before editing.",
 };
 
 export interface CompactToolInputSchema {

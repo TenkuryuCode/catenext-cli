@@ -739,6 +739,91 @@ describe("CLI dan MCP stdio lokal", () => {
     });
   }, 20_000);
 
+  it("covers index --impact <path> [--json] and index --summary --include-tests", async () => {
+    git("init", "-b", "main");
+    cli(["init", "--platform", "claude-code"]);
+    await mkdir(join(root, "src/core"), { recursive: true });
+    await mkdir(join(root, "src/api"), { recursive: true });
+    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
+    await writeFile(
+      join(root, "src/api/route.ts"),
+      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/api/handler.ts"),
+      `import { handle } from "./route.js";\nexport function serve() { return handle(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/core/db.test.ts"),
+      `import { queryDb } from "./db.js";\nexport function testDb() { return queryDb(); }\n`,
+    );
+
+    const impactText = cli(["index", "--impact", "src/core/db.ts", "--depth", "2"]);
+    expect(impactText).toContain("✓ indexed files=4 symbols=4 edges=3");
+    expect(impactText).toContain("# Impact analysis: `src/core/db.ts`");
+    expect(impactText).toContain("Affected files: **2**.");
+    expect(impactText).toContain("`src/api/route.ts`");
+    expect(impactText).toContain("`src/api/handler.ts`");
+    expect(impactText).not.toContain("`src/core/db.test.ts`");
+
+    const impactJson = JSON.parse(
+      cli(["index", "--impact", "src/core/db.ts", "--depth", "2", "--include-tests", "--json"]),
+    ) as {
+      files: number;
+      symbols: number;
+      edges: number;
+      impact: {
+        target: string;
+        indexed: boolean;
+        total_affected: number;
+        truncated: boolean;
+        impacted: Array<{ path: string; distance: number; kind: string; via?: string }>;
+      };
+    };
+    expect(impactJson).toMatchObject({
+      files: 4,
+      symbols: 4,
+      edges: 3,
+      impact: {
+        target: "src/core/db.ts",
+        indexed: true,
+        total_affected: 3,
+        truncated: false,
+      },
+    });
+    expect(impactJson.impact.impacted.map((h) => h.path)).toEqual([
+      "src/api/route.ts",
+      "src/core/db.test.ts",
+      "src/api/handler.ts",
+    ]);
+
+    const summaryWithoutTests = JSON.parse(cli(["index", "--summary", "--json"])) as {
+      summary: {
+        totals: { files: number; symbols: number; edges: number };
+        hubs: Array<{ path: string }>;
+      };
+    };
+    expect(summaryWithoutTests.summary.totals).toEqual({ files: 3, symbols: 3, edges: 2 });
+    expect(summaryWithoutTests.summary.hubs.map((h) => h.path)).not.toContain(
+      "src/core/db.test.ts",
+    );
+
+    const summaryWithTestsJson = JSON.parse(
+      cli(["index", "--summary", "--include-tests", "--json"]),
+    ) as {
+      summary: {
+        totals: { files: number; symbols: number; edges: number };
+        hubs: Array<{ path: string }>;
+      };
+    };
+    expect(summaryWithTestsJson.summary.totals).toEqual({ files: 4, symbols: 4, edges: 3 });
+    expect(summaryWithTestsJson.summary.hubs.map((h) => h.path)).toContain("src/core/db.test.ts");
+
+    const summaryWithTestsText = cli(["index", "--summary", "--include-tests"]);
+    expect(summaryWithTestsText).toContain("**4** files, **4** symbols, **3** import edges");
+    expect(summaryWithTestsText).not.toContain("include_tests=false");
+  }, 20_000);
+
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {
       const result = runCli([command, "--platform", "unknown-platform"]);

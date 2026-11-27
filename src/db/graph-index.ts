@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { type Dirent, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { type ParseError, parse as parseJsonc } from "jsonc-parser";
+import { parse as parseYaml } from "yaml";
 import { collectRootTargets } from "../workspace-roots.js";
 import {
   DEFAULT_MAX_FILE_BYTES,
@@ -267,15 +269,93 @@ function extractSfcScriptBlocks(content: string): Array<{ code: string; startLin
   return blocks;
 }
 
-function parseTsJsImports(content: string): string[] {
-  const hits: string[] = [];
-  const re =
-    /(?:import|export)\s+(?:[^'";]+?\s+from\s+)?["']([^"']+)["']|(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
-  for (const match of content.matchAll(re)) {
-    const spec = match[1] ?? match[2];
-    if (spec?.startsWith(".")) hits.push(spec);
+type TsJsImportEntry = {
+  spec: string;
+  kind: "imports" | "reexport";
+};
+
+function maskTsJsComments(content: string): string {
+  let out = "";
+  let i = 0;
+  while (i < content.length) {
+    const ch = content[i] ?? "";
+    const next = content[i + 1] ?? "";
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      out += ch;
+      i++;
+      while (i < content.length) {
+        const sc = content[i] ?? "";
+        out += sc;
+        i++;
+        if (sc === "\\") {
+          if (i < content.length) {
+            out += content[i] ?? "";
+            i++;
+          }
+          continue;
+        }
+        if (sc === quote) break;
+      }
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      out += "  ";
+      i += 2;
+      while (i < content.length && content[i] !== "\n") {
+        out += " ";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const closeIdx = content.indexOf("*/", i + 2);
+      if (closeIdx !== -1) {
+        for (let j = i; j < closeIdx + 2; j++) {
+          out += content[j] === "\n" ? "\n" : " ";
+        }
+        i = closeIdx + 2;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
   }
-  return [...new Set(hits)];
+  return out;
+}
+
+function parseTsJsImportEntries(content: string, includeNonRelative = false): TsJsImportEntry[] {
+  const cleaned = maskTsJsComments(content);
+  const bySpec = new Map<string, "imports" | "reexport">();
+  const add = (spec: string | undefined, kind: "imports" | "reexport") => {
+    if (!spec) return;
+    if (!includeNonRelative && !spec.startsWith(".")) return;
+    const prev = bySpec.get(spec);
+    if (!prev || (prev === "reexport" && kind === "imports")) {
+      bySpec.set(spec, kind);
+    }
+  };
+
+  const stmtRe =
+    /(?:^|[;\n{}])\s*(?:(import)\s+(?:[^'";]+?\s+from\s*)?["']([^"']+)["']|(export)(?:\s+|\s*(?=[{*]))[^'";]+?\bfrom\s*["']([^"']+)["'])/g;
+  for (const match of cleaned.matchAll(stmtRe)) {
+    if (match[1]) {
+      add(match[2], "imports");
+    } else if (match[3]) {
+      add(match[4], "reexport");
+    }
+  }
+
+  const callRe = /(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
+  for (const match of cleaned.matchAll(callRe)) {
+    add(match[1], "imports");
+  }
+
+  return [...bySpec.entries()].map(([spec, kind]) => ({ spec, kind }));
+}
+
+function parseTsJsImports(content: string, includeNonRelative = false): string[] {
+  return parseTsJsImportEntries(content, includeNonRelative).map((entry) => entry.spec);
 }
 
 function parsePhpImports(content: string): string[] {
@@ -621,12 +701,17 @@ function parsePythonImports(content: string): string[] {
   return [...new Set(hits)];
 }
 
-export function parseImports(content: string, ext?: string): string[] {
+export function parseImports(
+  content: string,
+  ext?: string,
+  options?: { includeNonRelative?: boolean },
+): string[] {
+  const includeNonRelative = options?.includeNonRelative ?? false;
   const normalizedExt = ext?.toLowerCase();
   if (normalizedExt && SFC_EXT.has(normalizedExt)) {
     const hits: string[] = [];
     for (const block of extractSfcScriptBlocks(content)) {
-      hits.push(...parseTsJsImports(block.code));
+      hits.push(...parseTsJsImports(block.code, includeNonRelative));
     }
     return [...new Set(hits)];
   }
@@ -642,7 +727,97 @@ export function parseImports(content: string, ext?: string): string[] {
   if (normalizedExt === ".rs") {
     return parseRustImports(content);
   }
-  return parseTsJsImports(content);
+  return parseTsJsImports(content, includeNonRelative);
+}
+
+function lineAtOffset(text: string, offset: number): number {
+  let line = 1;
+  const bound = Math.min(offset, text.length);
+  for (let i = 0; i < bound; i++) {
+    if (text.charCodeAt(i) === 10) line++;
+  }
+  return line;
+}
+
+function parseTsJsReexportSymbols(
+  content: string,
+  lineOffset = 0,
+): Array<{ name: string; kind: string; line: number }> {
+  const cleaned = maskTsJsComments(content);
+  const results: Array<{ name: string; kind: string; line: number }> = [];
+
+  const nsRe =
+    /(?:^|[;\n{}])\s*export\s+(?:type\s+)?\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*["'][^"']+["']/g;
+  for (const match of cleaned.matchAll(nsRe)) {
+    const name = match[1];
+    if (!name) continue;
+    const exportIdx = match[0].indexOf("export");
+    const offset = (match.index ?? 0) + Math.max(0, exportIdx);
+    results.push({ name, kind: "reexport", line: lineOffset + lineAtOffset(cleaned, offset) });
+  }
+
+  const starRe = /(?:^|[;\n{}])\s*export\s+(?:type\s+)?\*\s+from\s*["'][^"']+["']/g;
+  for (const match of cleaned.matchAll(starRe)) {
+    const exportIdx = match[0].indexOf("export");
+    const offset = (match.index ?? 0) + Math.max(0, exportIdx);
+    results.push({ name: "*", kind: "reexport", line: lineOffset + lineAtOffset(cleaned, offset) });
+  }
+
+  const namedRe = /(?:^|[;\n{}])\s*export(?:\s+type)?\s*\{([^}]*)\}\s*from\s*["'][^"']+["']/g;
+  for (const match of cleaned.matchAll(namedRe)) {
+    const body = match[1] ?? "";
+    const braceRelIdx = match[0].indexOf("{");
+    const bodyStartOffset = (match.index ?? 0) + braceRelIdx + 1;
+    let cursor = 0;
+    for (const part of body.split(",")) {
+      const partOffset = bodyStartOffset + cursor;
+      cursor += part.length + 1;
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const withoutType = trimmed.replace(/^type\s+/, "").trim();
+      if (!withoutType) continue;
+      const asMatch = withoutType.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+      const exportedName =
+        asMatch?.[2] ?? (/^[A-Za-z_$][\w$]*$/.test(withoutType) ? withoutType : null);
+      if (!exportedName) continue;
+      const leadingWs = part.length - part.trimStart().length;
+      results.push({
+        name: exportedName,
+        kind: "reexport",
+        line: lineOffset + lineAtOffset(cleaned, partOffset + leadingWs),
+      });
+    }
+  }
+
+  return results;
+}
+
+function parseTsJsSymbolsForBlock(
+  content: string,
+  lineOffset = 0,
+): Array<{ name: string; kind: string; line: number }> {
+  const symbols: Array<{ name: string; kind: string; line: number }> = [];
+  const lines = content.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    for (const [re, kind] of TS_JS_SYMBOL_PATTERNS) {
+      const match = line.match(re);
+      if (match?.[1]) {
+        symbols.push({ name: match[1], kind, line: lineOffset + i + 1 });
+        break;
+      }
+    }
+  }
+  symbols.push(...parseTsJsReexportSymbols(content, lineOffset));
+  const seen = new Set<string>();
+  const deduped: Array<{ name: string; kind: string; line: number }> = [];
+  for (const sym of symbols.sort((a, b) => a.line - b.line)) {
+    const key = `${sym.line}\0${sym.kind}\0${sym.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(sym);
+  }
+  return deduped;
 }
 
 function patternsForExt(ext?: string): Array<[RegExp, string]> {
@@ -666,20 +841,14 @@ export function parseSymbols(
   if (normalizedExt && SFC_EXT.has(normalizedExt)) {
     const symbols: Array<{ name: string; kind: string; line: number }> = [];
     for (const block of extractSfcScriptBlocks(content)) {
-      const lines = block.code.split(/\r?\n/);
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i] ?? "";
-        for (const [re, kind] of TS_JS_SYMBOL_PATTERNS) {
-          const match = line.match(re);
-          if (match?.[1]) {
-            symbols.push({ name: match[1], kind, line: block.startLine + i });
-            break;
-          }
-        }
-        if (symbols.length >= 80) return symbols.slice(0, 80);
-      }
+      symbols.push(...parseTsJsSymbolsForBlock(block.code, block.startLine - 1));
+      if (symbols.length >= 80) return symbols.slice(0, 80);
     }
     return symbols.slice(0, 80);
+  }
+
+  if (normalizedExt && TS_JS_EXT.has(normalizedExt)) {
+    return parseTsJsSymbolsForBlock(content, 0).slice(0, 80);
   }
 
   const symbols: Array<{ name: string; kind: string; line: number }> = [];
@@ -694,6 +863,10 @@ export function parseSymbols(
         break;
       }
     }
+  }
+  if (!normalizedExt) {
+    symbols.push(...parseTsJsReexportSymbols(content, 0));
+    symbols.sort((a, b) => a.line - b.line);
   }
   return symbols.slice(0, 80);
 }
@@ -1102,6 +1275,716 @@ function resolvePythonImport(
   return null;
 }
 
+function readBoundedSafeFileSync(
+  realRoot: string,
+  filePath: string,
+  maxBytes = DEFAULT_MAX_FILE_BYTES,
+): string | null {
+  if (!isSafeRegularFileSync(realRoot, filePath)) return null;
+  try {
+    const stat = lstatSync(filePath);
+    if (stat.size > maxBytes) return null;
+    const raw = readFileSync(filePath, "utf8");
+    if (Buffer.byteLength(raw, "utf8") > maxBytes) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+function tryResolveCandidateBase(
+  base: string,
+  spec: string,
+  realRoot: string,
+  fromExt?: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  for (const candidate of importCandidates(base, spec, fromExt)) {
+    const rel = toRelInsideRoot(realRoot, candidate);
+    if (!rel) continue;
+    const exists = knownFiles ? knownFiles.has(rel) : isSafeRegularFileSync(realRoot, candidate);
+    if (exists) return rel;
+  }
+  return null;
+}
+
+export type WorkspacePackageEntry = {
+  name: string;
+  dir: string;
+  exports?: unknown;
+  main?: string;
+  module?: string;
+  types?: string;
+};
+
+type TsconfigPathMapping = {
+  prefix: string;
+  suffix: string;
+  hasWildcard: boolean;
+  targets: string[];
+  baseDir: string;
+};
+
+type TsconfigResolved = {
+  configDir: string;
+  baseUrlAbs: string | null;
+  mappings: TsconfigPathMapping[];
+};
+
+export type TsResolutionContext = {
+  realRoot: string;
+  packages: WorkspacePackageEntry[];
+  tsconfigCache: Map<string, TsconfigResolved | null>;
+};
+
+function globSegmentToRegex(segment: string): RegExp {
+  let src = "^";
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i] ?? "";
+    if (ch === "*") {
+      src += "[^/]*";
+    } else if (ch === "?") {
+      src += "[^/]";
+    } else if (/[.*+?^${}()|[\]\\]/.test(ch)) {
+      src += `\\${ch}`;
+    } else {
+      src += ch;
+    }
+  }
+  src += "$";
+  return new RegExp(src);
+}
+
+function workspaceGlobToRegex(pattern: string): RegExp | null {
+  const clean = pattern
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!clean) return null;
+  const segments = clean.split("/").filter(Boolean);
+  let src = "^";
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i] ?? "";
+    if (seg === "**") {
+      if (i === 0 && segments.length === 1) {
+        src += ".*";
+      } else if (i === 0) {
+        src += "(?:.+/)?";
+      } else {
+        src += "(?:/.*)?";
+      }
+      continue;
+    }
+    if (i > 0 && segments[i - 1] !== "**") src += "/";
+    src += globSegmentToRegex(seg).source.slice(1, -1);
+  }
+  src += "$";
+  try {
+    return new RegExp(src);
+  } catch {
+    return null;
+  }
+}
+
+function readWorkspacePatterns(realRoot: string): { includes: string[]; excludes: RegExp[] } {
+  const includes: string[] = [];
+  const excludes: RegExp[] = [];
+
+  const pushPattern = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith("!")) {
+      const re = workspaceGlobToRegex(trimmed.slice(1));
+      if (re) excludes.push(re);
+    } else {
+      includes.push(trimmed);
+    }
+  };
+
+  const pnpmWsRaw = readBoundedSafeFileSync(realRoot, join(realRoot, "pnpm-workspace.yaml"));
+  if (pnpmWsRaw !== null) {
+    try {
+      const parsed = parseYaml(pnpmWsRaw) as { packages?: unknown } | null;
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.packages)) {
+        for (const item of parsed.packages) {
+          if (typeof item === "string") pushPattern(item);
+        }
+      }
+    } catch {
+      // Ignore malformed pnpm-workspace.yaml
+    }
+  }
+
+  const rootPkgRaw = readBoundedSafeFileSync(realRoot, join(realRoot, "package.json"));
+  if (rootPkgRaw !== null) {
+    try {
+      const parsed = JSON.parse(rootPkgRaw) as { workspaces?: unknown };
+      const ws = parsed.workspaces;
+      const wsList = Array.isArray(ws)
+        ? ws
+        : ws && typeof ws === "object" && Array.isArray((ws as { packages?: unknown }).packages)
+          ? (ws as { packages: unknown[] }).packages
+          : [];
+      for (const item of wsList) {
+        if (typeof item === "string") pushPattern(item);
+      }
+    } catch {
+      // Ignore malformed root package.json
+    }
+  }
+
+  for (const fallback of ["apps/*", "packages/*"]) {
+    if (!includes.includes(fallback)) includes.push(fallback);
+  }
+
+  return { includes, excludes };
+}
+
+function parsePackageJsonEntry(pkgDir: string, realRoot: string): WorkspacePackageEntry | null {
+  const pkgPath = join(pkgDir, "package.json");
+  const raw = readBoundedSafeFileSync(realRoot, pkgPath);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as {
+      name?: unknown;
+      exports?: unknown;
+      main?: unknown;
+      module?: unknown;
+      types?: unknown;
+      typings?: unknown;
+    };
+    if (typeof parsed.name !== "string" || !parsed.name.trim()) return null;
+    return {
+      name: parsed.name.trim(),
+      dir: pkgDir,
+      ...(parsed.exports !== undefined ? { exports: parsed.exports } : {}),
+      ...(typeof parsed.main === "string" ? { main: parsed.main } : {}),
+      ...(typeof parsed.module === "string" ? { module: parsed.module } : {}),
+      ...(typeof parsed.types === "string"
+        ? { types: parsed.types }
+        : typeof parsed.typings === "string"
+          ? { types: parsed.typings }
+          : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function loadWorkspacePackages(root: string): WorkspacePackageEntry[] {
+  const realRoot = safeRealpathSync(resolve(root));
+  const { includes, excludes } = readWorkspacePatterns(realRoot);
+  const candidateDirs = new Set<string>();
+
+  const isExcluded = (relDir: string): boolean => excludes.some((re) => re.test(relDir));
+
+  for (const pattern of includes) {
+    const clean = pattern
+      .replaceAll("\\", "/")
+      .replace(/^\.\//, "")
+      .replace(/^\/+|\/+$/g, "");
+    if (!clean || clean.startsWith("/") || clean.split("/").includes("..")) continue;
+    const segments = clean.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+
+    const visitedGlobStates = new Set<string>();
+    const expandSegments = (
+      currentDir: string,
+      segs: readonly string[],
+      idx: number,
+      depth: number,
+    ): void => {
+      if (depth > 8) return;
+      if (idx >= segs.length) {
+        const rel = toRelInsideRoot(realRoot, currentDir);
+        if (rel && !isExcluded(rel)) candidateDirs.add(currentDir);
+        return;
+      }
+
+      const stateKey = `${currentDir}\0${idx}`;
+      if (visitedGlobStates.has(stateKey)) return;
+      visitedGlobStates.add(stateKey);
+
+      const seg = segs[idx] ?? "";
+      if (!seg || seg === ".") {
+        expandSegments(currentDir, segs, idx + 1, depth);
+        return;
+      }
+      if (seg === "..") return;
+
+      if (seg === "**") {
+        expandSegments(currentDir, segs, idx + 1, depth);
+        let entries: Dirent[];
+        try {
+          entries = readdirSync(currentDir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (entry.isSymbolicLink()) continue;
+          if (entry.name.startsWith(".") || DEFAULT_SKIP_DIRS.has(entry.name)) continue;
+          const child = join(currentDir, entry.name);
+          try {
+            const lst = lstatSync(child);
+            if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+            const realChild = realpathSync(child);
+            if (!isWithinRoot(realRoot, realChild)) continue;
+            expandSegments(realChild, segs, idx, depth + 1);
+          } catch {
+            // Ignore unreadable dirs
+          }
+        }
+        return;
+      }
+
+      if (!seg.includes("*") && !seg.includes("?")) {
+        const child = join(currentDir, seg);
+        try {
+          const lst = lstatSync(child);
+          if (lst.isSymbolicLink() || !lst.isDirectory()) return;
+          const realChild = realpathSync(child);
+          if (!isWithinRoot(realRoot, realChild)) return;
+          expandSegments(realChild, segs, idx + 1, depth + 1);
+        } catch {
+          // Ignore missing dir
+        }
+        return;
+      }
+
+      const segRe = globSegmentToRegex(seg);
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(currentDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue;
+        if (entry.name.startsWith(".") || DEFAULT_SKIP_DIRS.has(entry.name)) continue;
+        if (!segRe.test(entry.name)) continue;
+        const child = join(currentDir, entry.name);
+        try {
+          const lst = lstatSync(child);
+          if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+          const realChild = realpathSync(child);
+          if (!isWithinRoot(realRoot, realChild)) continue;
+          expandSegments(realChild, segs, idx + 1, depth + 1);
+        } catch {
+          // Ignore unreadable dirs
+        }
+      }
+    };
+
+    expandSegments(realRoot, segments, 0, 0);
+  }
+
+  const packages: WorkspacePackageEntry[] = [];
+  const seenNames = new Set<string>();
+
+  for (const dir of [...candidateDirs].sort()) {
+    const pkg = parsePackageJsonEntry(dir, realRoot);
+    if (!pkg || seenNames.has(pkg.name)) continue;
+    seenNames.add(pkg.name);
+    packages.push(pkg);
+  }
+
+  const rootPkg = parsePackageJsonEntry(realRoot, realRoot);
+  if (rootPkg && !seenNames.has(rootPkg.name)) {
+    packages.push(rootPkg);
+  }
+
+  return packages.sort((a, b) => b.name.length - a.name.length);
+}
+
+const EXPORT_CONDITION_ORDER = [
+  "source",
+  "development",
+  "import",
+  "module",
+  "default",
+  "node",
+  "browser",
+  "require",
+  "types",
+];
+
+function collectExportConditionTargets(node: unknown, out: string[]): void {
+  if (typeof node === "string") {
+    if (!out.includes(node)) out.push(node);
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectExportConditionTargets(item, out);
+    }
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  const record = node as Record<string, unknown>;
+  const keys = Object.keys(record);
+  for (const preferred of EXPORT_CONDITION_ORDER) {
+    if (preferred in record) {
+      collectExportConditionTargets(record[preferred], out);
+    }
+  }
+  for (const key of keys) {
+    if (!EXPORT_CONDITION_ORDER.includes(key)) {
+      collectExportConditionTargets(record[key], out);
+    }
+  }
+}
+
+function resolvePackageExportsTargets(exportsField: unknown, subpath: string): string[] {
+  if (typeof exportsField === "string") {
+    return subpath === "." ? [exportsField] : [];
+  }
+  if (Array.isArray(exportsField)) {
+    if (subpath !== ".") return [];
+    const out: string[] = [];
+    collectExportConditionTargets(exportsField, out);
+    return out;
+  }
+  if (!exportsField || typeof exportsField !== "object") return [];
+  const record = exportsField as Record<string, unknown>;
+  const keys = Object.keys(record);
+  const isSubpathMap = keys.some((k) => k === "." || k.startsWith("./"));
+
+  if (!isSubpathMap) {
+    if (subpath !== ".") return [];
+    const out: string[] = [];
+    collectExportConditionTargets(record, out);
+    return out;
+  }
+
+  if (subpath in record) {
+    if (record[subpath] === null) return [];
+    const out: string[] = [];
+    collectExportConditionTargets(record[subpath], out);
+    return out;
+  }
+
+  const wildcardKeys = keys
+    .filter((k) => k.startsWith("./") && k.includes("*"))
+    .sort((a, b) => {
+      const aStar = a.indexOf("*");
+      const bStar = b.indexOf("*");
+      return bStar - aStar || b.length - a.length;
+    });
+
+  for (const patternKey of wildcardKeys) {
+    const starIdx = patternKey.indexOf("*");
+    const prefix = patternKey.slice(0, starIdx);
+    const suffix = patternKey.slice(starIdx + 1);
+    if (subpath.length < prefix.length + suffix.length) continue;
+    if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) continue;
+    if (record[patternKey] === null) return [];
+    const matched = subpath.slice(prefix.length, subpath.length - suffix.length);
+    const rawTargets: string[] = [];
+    collectExportConditionTargets(record[patternKey], rawTargets);
+    return rawTargets.map((t) => (t.includes("*") ? t.replaceAll("*", matched) : t));
+  }
+
+  return [];
+}
+
+function normalizeDeclarationExt(relTarget: string): string[] {
+  if (relTarget.endsWith(".d.ts")) {
+    const stem = relTarget.slice(0, -5);
+    return [`${stem}.ts`, `${stem}.tsx`];
+  }
+  if (relTarget.endsWith(".d.mts")) {
+    return [`${relTarget.slice(0, -6)}.mts`];
+  }
+  if (relTarget.endsWith(".d.cts")) {
+    return [`${relTarget.slice(0, -6)}.cts`];
+  }
+  return [relTarget];
+}
+
+function tryResolvePackageTarget(
+  pkgDir: string,
+  rawTarget: string,
+  subpath: string,
+  realRoot: string,
+  fromExt?: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  const clean = rawTarget.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!clean || clean.startsWith("/") || clean.split("/").includes("..")) return null;
+
+  const candidateTargets: string[] = [];
+  const pushWithDts = (relPath: string) => {
+    for (const expanded of normalizeDeclarationExt(relPath)) {
+      if (!candidateTargets.includes(expanded)) candidateTargets.push(expanded);
+    }
+  };
+
+  if (/^(?:dist|build|out|lib)\//.test(clean)) {
+    const stripped = clean.replace(/^(?:dist|build|out|lib)\//, "");
+    pushWithDts(`src/${stripped}`);
+    pushWithDts(stripped);
+  }
+  pushWithDts(clean);
+  if (subpath === "." && !clean.startsWith("src/")) {
+    pushWithDts(`src/${clean}`);
+  }
+
+  for (const relTarget of candidateTargets) {
+    const candBase = resolve(pkgDir, relTarget);
+    const hit = tryResolveCandidateBase(candBase, relTarget, realRoot, fromExt, knownFiles);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function resolveWorkspacePackageImport(
+  spec: string,
+  packages: readonly WorkspacePackageEntry[],
+  realRoot: string,
+  fromExt?: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  for (const pkg of packages) {
+    if (spec !== pkg.name && !spec.startsWith(`${pkg.name}/`)) continue;
+    const subpath = spec === pkg.name ? "." : `./${spec.slice(pkg.name.length + 1)}`;
+    if (subpath.split("/").includes("..")) return null;
+
+    const candidateTargets: string[] = [];
+    if (pkg.exports !== undefined) {
+      candidateTargets.push(...resolvePackageExportsTargets(pkg.exports, subpath));
+    } else if (subpath === ".") {
+      for (const fallback of [pkg.module, pkg.main, pkg.types, "./src/index", "./index"]) {
+        if (fallback && !candidateTargets.includes(fallback)) {
+          candidateTargets.push(fallback);
+        }
+      }
+    } else {
+      const subRel = subpath.slice(2);
+      candidateTargets.push(`./src/${subRel}`, `./${subRel}`);
+    }
+
+    for (const target of candidateTargets) {
+      const hit = tryResolvePackageTarget(pkg.dir, target, subpath, realRoot, fromExt, knownFiles);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+function resolveTsconfigExtendsPath(
+  fromConfigDir: string,
+  extSpec: string,
+  realRoot: string,
+): string | null {
+  if (!extSpec || (!extSpec.startsWith(".") && !isAbsolute(extSpec))) return null;
+  const rawBase = isAbsolute(extSpec) ? resolve(extSpec) : resolve(fromConfigDir, extSpec);
+  const candidates = rawBase.endsWith(".json")
+    ? [rawBase]
+    : [rawBase, `${rawBase}.json`, join(rawBase, "tsconfig.json")];
+  for (const candidate of candidates) {
+    if (!toRelInsideRoot(realRoot, candidate)) continue;
+    if (isSafeRegularFileSync(realRoot, candidate)) {
+      return safeRealpathSync(candidate);
+    }
+  }
+  return null;
+}
+
+function loadTsconfigChain(
+  configPath: string,
+  realRoot: string,
+  cache: Map<string, TsconfigResolved | null>,
+  visited = new Set<string>(),
+): TsconfigResolved | null {
+  const realConfigPath = safeRealpathSync(configPath);
+  if (cache.has(realConfigPath)) return cache.get(realConfigPath) ?? null;
+  if (visited.has(realConfigPath) || visited.size >= 8) return null;
+  if (toRelInsideRoot(realRoot, realConfigPath) === null) return null;
+
+  const raw = readBoundedSafeFileSync(realRoot, realConfigPath);
+  if (raw === null) {
+    cache.set(realConfigPath, null);
+    return null;
+  }
+
+  const errors: ParseError[] = [];
+  const parsed = parseJsonc(raw, errors, { allowTrailingComma: true }) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    cache.set(realConfigPath, null);
+    return null;
+  }
+
+  const nextVisited = new Set(visited);
+  nextVisited.add(realConfigPath);
+
+  const configDir = dirname(realConfigPath);
+  const obj = parsed as { extends?: unknown; compilerOptions?: unknown };
+
+  let inheritedBaseUrl: string | null = null;
+  let inheritedMappings: TsconfigPathMapping[] = [];
+
+  const extendsList = Array.isArray(obj.extends)
+    ? obj.extends.filter((x): x is string => typeof x === "string")
+    : typeof obj.extends === "string"
+      ? [obj.extends]
+      : [];
+
+  for (const extSpec of extendsList) {
+    const extPath = resolveTsconfigExtendsPath(configDir, extSpec, realRoot);
+    if (!extPath) continue;
+    const parent = loadTsconfigChain(extPath, realRoot, cache, nextVisited);
+    if (!parent) continue;
+    if (parent.baseUrlAbs !== null) inheritedBaseUrl = parent.baseUrlAbs;
+    if (parent.mappings.length > 0) inheritedMappings = parent.mappings;
+  }
+
+  const co =
+    obj.compilerOptions &&
+    typeof obj.compilerOptions === "object" &&
+    !Array.isArray(obj.compilerOptions)
+      ? (obj.compilerOptions as { baseUrl?: unknown; paths?: unknown })
+      : undefined;
+
+  let baseUrlAbs = inheritedBaseUrl;
+  if (co && typeof co.baseUrl === "string" && co.baseUrl.trim()) {
+    const candidateBase = resolve(configDir, co.baseUrl.trim());
+    if (candidateBase === realRoot || toRelInsideRoot(realRoot, candidateBase) !== null) {
+      baseUrlAbs = candidateBase;
+    }
+  }
+
+  let mappings = inheritedMappings;
+  if (co?.paths && typeof co.paths === "object" && !Array.isArray(co.paths)) {
+    const baseDir = baseUrlAbs ?? configDir;
+    const own: TsconfigPathMapping[] = [];
+    for (const [pattern, rawTargets] of Object.entries(co.paths)) {
+      if (!Array.isArray(rawTargets)) continue;
+      const targets = rawTargets.filter((t): t is string => typeof t === "string" && t.length > 0);
+      if (targets.length === 0) continue;
+      const starIdx = pattern.indexOf("*");
+      if (starIdx === -1) {
+        own.push({ prefix: pattern, suffix: "", hasWildcard: false, targets, baseDir });
+      } else {
+        own.push({
+          prefix: pattern.slice(0, starIdx),
+          suffix: pattern.slice(starIdx + 1),
+          hasWildcard: true,
+          targets,
+          baseDir,
+        });
+      }
+    }
+    own.sort((a, b) => {
+      if (a.hasWildcard !== b.hasWildcard) return a.hasWildcard ? 1 : -1;
+      return b.prefix.length - a.prefix.length || b.suffix.length - a.suffix.length;
+    });
+    mappings = own;
+  } else if (baseUrlAbs && baseUrlAbs !== inheritedBaseUrl && inheritedMappings.length > 0) {
+    mappings = inheritedMappings.map((m) => ({ ...m, baseDir: baseUrlAbs }));
+  }
+
+  const resolved: TsconfigResolved = { configDir, baseUrlAbs, mappings };
+  cache.set(realConfigPath, resolved);
+  return resolved;
+}
+
+function findTsconfigsForDir(
+  fromDirInRealRoot: string,
+  realRoot: string,
+  cache: Map<string, TsconfigResolved | null>,
+): TsconfigResolved[] {
+  const configs: TsconfigResolved[] = [];
+  const seen = new Set<string>();
+  let cur = fromDirInRealRoot;
+  while (cur === realRoot || toRelInsideRoot(realRoot, cur) !== null) {
+    const candidate = join(cur, "tsconfig.json");
+    if (isSafeRegularFileSync(realRoot, candidate)) {
+      const realCfg = safeRealpathSync(candidate);
+      if (!seen.has(realCfg)) {
+        seen.add(realCfg);
+        const loaded = loadTsconfigChain(realCfg, realRoot, cache);
+        if (loaded) configs.push(loaded);
+      }
+    }
+    if (cur === realRoot) break;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return configs;
+}
+
+function resolveWithTsconfig(
+  spec: string,
+  tsconfig: TsconfigResolved,
+  realRoot: string,
+  fromExt?: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  for (const mapping of tsconfig.mappings) {
+    if (!mapping.hasWildcard) {
+      if (spec !== mapping.prefix) continue;
+      for (const target of mapping.targets) {
+        const candBase = resolve(mapping.baseDir, target);
+        const hit = tryResolveCandidateBase(candBase, spec, realRoot, fromExt, knownFiles);
+        if (hit) return hit;
+      }
+      continue;
+    }
+
+    if (spec.length < mapping.prefix.length + mapping.suffix.length) continue;
+    if (!spec.startsWith(mapping.prefix) || !spec.endsWith(mapping.suffix)) continue;
+    const matched = spec.slice(mapping.prefix.length, spec.length - mapping.suffix.length);
+    for (const target of mapping.targets) {
+      const expanded = target.includes("*") ? target.replaceAll("*", matched) : target;
+      const candBase = resolve(mapping.baseDir, expanded);
+      const hit = tryResolveCandidateBase(candBase, spec, realRoot, fromExt, knownFiles);
+      if (hit) return hit;
+    }
+  }
+
+  if (tsconfig.baseUrlAbs) {
+    const candBase = resolve(tsconfig.baseUrlAbs, spec);
+    const hit = tryResolveCandidateBase(candBase, spec, realRoot, fromExt, knownFiles);
+    if (hit) return hit;
+  }
+
+  return null;
+}
+
+export function createTsResolutionContext(root: string): TsResolutionContext {
+  const realRoot = safeRealpathSync(resolve(root));
+  return {
+    realRoot,
+    packages: loadWorkspacePackages(realRoot),
+    tsconfigCache: new Map<string, TsconfigResolved | null>(),
+  };
+}
+
+function resolveTsJsNonRelativeImport(
+  fromFile: string,
+  spec: string,
+  absRoot: string,
+  realRoot: string,
+  fromExt: string,
+  knownFiles?: ReadonlySet<string>,
+  tsContext?: TsResolutionContext,
+): string | null {
+  if (!spec || spec.startsWith("node:") || spec.startsWith("/")) return null;
+  const ctx = tsContext ?? createTsResolutionContext(realRoot);
+
+  const absFrom = isAbsolute(fromFile) ? resolve(fromFile) : resolve(absRoot, fromFile);
+  const relFrom = toRelInsideRoot(absRoot, absFrom) ?? toRelInsideRoot(realRoot, absFrom);
+  const fromDirInRealRoot = relFrom ? dirname(resolve(realRoot, relFrom)) : realRoot;
+
+  for (const tsconfig of findTsconfigsForDir(fromDirInRealRoot, realRoot, ctx.tsconfigCache)) {
+    const hit = resolveWithTsconfig(spec, tsconfig, realRoot, fromExt, knownFiles);
+    if (hit) return hit;
+  }
+
+  return resolveWorkspacePackageImport(spec, ctx.packages, realRoot, fromExt, knownFiles);
+}
+
 export function resolveImport(
   fromFile: string,
   spec: string,
@@ -1109,6 +1992,7 @@ export function resolveImport(
   knownFiles?: ReadonlySet<string>,
   psr4Entries?: readonly ComposerPsr4Entry[],
   goModule?: string | null,
+  tsContext?: TsResolutionContext,
 ): string | null {
   const absRoot = resolve(root);
   const realRoot = safeRealpathSync(absRoot);
@@ -1128,6 +2012,17 @@ export function resolveImport(
     }
     if (fromExt === ".py") {
       return resolvePythonImport(fromFile, spec, absRoot, realRoot, knownFiles);
+    }
+    if (!fromExt || TS_JS_EXT.has(fromExt) || SFC_EXT.has(fromExt)) {
+      return resolveTsJsNonRelativeImport(
+        fromFile,
+        spec,
+        absRoot,
+        realRoot,
+        fromExt,
+        knownFiles,
+        tsContext,
+      );
     }
     return null;
   }
@@ -1262,13 +2157,18 @@ export async function indexProjectGraph(
 
     const idByPath = new Map<string, number>();
     const mtimeOnlyUpdates: Array<{ id: number; rootId: string | null; mtimeMs: number }> = [];
+    type ResolvedEdgeTarget = {
+      to: string;
+      kind: "imports" | "reexport";
+    };
+
     const newFiles: Array<{
       rootId: string | null;
       rel: string;
       hash: string;
       mtimeMs: number;
       symbols: Array<{ name: string; kind: string; line: number }>;
-      imports: string[];
+      imports: ResolvedEdgeTarget[];
     }> = [];
     const modifiedFiles: Array<{
       id: number;
@@ -1277,9 +2177,9 @@ export async function indexProjectGraph(
       hash: string;
       mtimeMs: number;
       symbols: Array<{ name: string; kind: string; line: number }>;
-      imports: string[];
+      imports: ResolvedEdgeTarget[];
     }> = [];
-    const refreshedEdges: Array<{ id: number; rel: string; imports: string[] }> = [];
+    const refreshedEdges: Array<{ id: number; rel: string; imports: ResolvedEdgeTarget[] }> = [];
 
     const psr4ByRoot = new Map<string, ComposerPsr4Entry[]>();
     const getPsr4ForRoot = (realRoot: string): ComposerPsr4Entry[] => {
@@ -1301,32 +2201,78 @@ export async function indexProjectGraph(
       return mod;
     };
 
-    const resolveImportsForEntry = (entry: WalkedEntry, content: string): string[] => {
+    const tsContextByRoot = new Map<string, TsResolutionContext>();
+    const getTsContextForRoot = (realRoot: string): TsResolutionContext => {
+      let cached = tsContextByRoot.get(realRoot);
+      if (!cached) {
+        cached = createTsResolutionContext(realRoot);
+        tsContextByRoot.set(realRoot, cached);
+      }
+      return cached;
+    };
+
+    const resolveImportsForEntry = (entry: WalkedEntry, content: string): ResolvedEdgeTarget[] => {
       const rootKnown = knownFilesByRoot.get(entry.rootId);
       const psr4 = entry.ext === ".php" ? getPsr4ForRoot(entry.realRoot) : undefined;
       const goMod = entry.ext === ".go" ? getGoModuleForRoot(entry.realRoot) : undefined;
-      const resolvedTargets: string[] = [];
-      for (const spec of parseImports(content, entry.ext)) {
+      const isTsJs = TS_JS_EXT.has(entry.ext);
+      const isSfc = SFC_EXT.has(entry.ext);
+      const tsCtx = isTsJs || isSfc ? getTsContextForRoot(entry.realRoot) : undefined;
+
+      const specs: TsJsImportEntry[] = isTsJs
+        ? parseTsJsImportEntries(content, true)
+        : isSfc
+          ? (() => {
+              const merged = new Map<string, "imports" | "reexport">();
+              for (const block of extractSfcScriptBlocks(content)) {
+                for (const item of parseTsJsImportEntries(block.code, true)) {
+                  const prev = merged.get(item.spec);
+                  if (!prev || (prev === "reexport" && item.kind === "imports")) {
+                    merged.set(item.spec, item.kind);
+                  }
+                }
+              }
+              return [...merged.entries()].map(([spec, kind]) => ({ spec, kind }));
+            })()
+          : parseImports(content, entry.ext).map((spec) => ({ spec, kind: "imports" as const }));
+
+      const byTarget = new Map<string, "imports" | "reexport">();
+      const recordTarget = (target: string, kind: "imports" | "reexport") => {
+        const prev = byTarget.get(target);
+        if (!prev || (prev === "reexport" && kind === "imports")) {
+          byTarget.set(target, kind);
+        }
+      };
+
+      for (const item of specs) {
         if (entry.ext === ".go") {
           for (const target of resolveGoImport(
-            spec,
+            item.spec,
             entry.realRoot,
             entry.realRoot,
             goMod ?? null,
             rootKnown,
           )) {
             if (target !== entry.relInRoot) {
-              resolvedTargets.push(entry.prefix ? `${entry.prefix}/${target}` : target);
+              recordTarget(entry.prefix ? `${entry.prefix}/${target}` : target, "imports");
             }
           }
           continue;
         }
-        const to = resolveImport(entry.full, spec, entry.realRoot, rootKnown, psr4, goMod);
+        const to = resolveImport(
+          entry.full,
+          item.spec,
+          entry.realRoot,
+          rootKnown,
+          psr4,
+          goMod,
+          tsCtx,
+        );
         if (to && to !== entry.relInRoot) {
-          resolvedTargets.push(entry.prefix ? `${entry.prefix}/${to}` : to);
+          recordTarget(entry.prefix ? `${entry.prefix}/${to}` : to, item.kind);
         }
       }
-      return [...new Set(resolvedTargets)];
+      return [...byTarget.entries()].map(([to, kind]) => ({ to, kind }));
     };
 
     for (const entry of entries) {
@@ -1416,7 +2362,7 @@ export async function indexProjectGraph(
       for (const id of deletedIds) deleteFile.run(projectId, id);
       for (const item of mtimeOnlyUpdates) updateMtime.run(item.rootId, item.mtimeMs, item.id);
 
-      const pendingEdges: Array<{ fromId: number; to: string }> = [];
+      const pendingEdges: Array<{ fromId: number; to: string; kind: "imports" | "reexport" }> = [];
 
       for (const item of newFiles) {
         const row = insertFile.get(projectId, item.rootId, item.rel, item.hash, item.mtimeMs) as {
@@ -1426,7 +2372,9 @@ export async function indexProjectGraph(
         for (const symbol of item.symbols) {
           insertSymbol.run(projectId, row.id, symbol.name, symbol.kind, symbol.line);
         }
-        for (const to of item.imports) pendingEdges.push({ fromId: row.id, to });
+        for (const edge of item.imports) {
+          pendingEdges.push({ fromId: row.id, to: edge.to, kind: edge.kind });
+        }
       }
 
       for (const item of modifiedFiles) {
@@ -1436,17 +2384,21 @@ export async function indexProjectGraph(
         for (const symbol of item.symbols) {
           insertSymbol.run(projectId, item.id, symbol.name, symbol.kind, symbol.line);
         }
-        for (const to of item.imports) pendingEdges.push({ fromId: item.id, to });
+        for (const edge of item.imports) {
+          pendingEdges.push({ fromId: item.id, to: edge.to, kind: edge.kind });
+        }
       }
 
       for (const item of refreshedEdges) {
         deleteEdgesForFile.run(projectId, item.id);
-        for (const to of item.imports) pendingEdges.push({ fromId: item.id, to });
+        for (const edge of item.imports) {
+          pendingEdges.push({ fromId: item.id, to: edge.to, kind: edge.kind });
+        }
       }
 
       for (const edge of pendingEdges) {
         const toId = idByPath.get(edge.to);
-        insertEdge.run(projectId, "imports", edge.fromId, toId ?? null, edge.to);
+        insertEdge.run(projectId, edge.kind, edge.fromId, toId ?? null, edge.to);
       }
 
       db.exec(useSavepoint ? "RELEASE SAVEPOINT graph_index" : "COMMIT");
@@ -1585,4 +2537,172 @@ export function symbolSearch(
       ...(row.line != null ? { line: row.line } : {}),
     }));
   });
+}
+
+export type GraphFreshnessResult = {
+  stale: boolean;
+  reason?: string;
+  checked_files?: number;
+};
+
+const MAX_FRESHNESS_CHECK_FILES = 100;
+const MAX_UNINDEXED_SCAN_DIRS = 64;
+const MAX_UNINDEXED_SCAN_ENTRIES = 256;
+
+function hasAnyCodeFileBounded(absDir: string): boolean {
+  let realRoot: string;
+  try {
+    const rootStat = lstatSync(absDir);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return false;
+    realRoot = realpathSync(absDir);
+  } catch {
+    return false;
+  }
+
+  const queue: string[] = [realRoot];
+  const visited = new Set<string>([realRoot]);
+  let dirsChecked = 0;
+  let entriesChecked = 0;
+
+  while (queue.length > 0 && dirsChecked < MAX_UNINDEXED_SCAN_DIRS) {
+    const dir = queue.shift();
+    if (!dir) break;
+    dirsChecked++;
+
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (entriesChecked >= MAX_UNINDEXED_SCAN_ENTRIES) return false;
+      entriesChecked++;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith(".") || DEFAULT_SKIP_DIRS.has(entry.name)) continue;
+
+      const full = join(dir, entry.name);
+      try {
+        const lst = lstatSync(full);
+        if (lst.isSymbolicLink()) continue;
+        if (lst.isDirectory()) {
+          const realChild = realpathSync(full);
+          if (isWithinRoot(realRoot, realChild) && !visited.has(realChild)) {
+            visited.add(realChild);
+            queue.push(realChild);
+          }
+          continue;
+        }
+        if (lst.isFile() && CODE_EXT.has(extname(entry.name).toLowerCase())) {
+          const realFile = realpathSync(full);
+          if (isWithinRoot(realRoot, realFile)) return true;
+        }
+      } catch {
+        // Ignore transient or unreadable entries
+      }
+    }
+  }
+
+  return false;
+}
+
+export function checkGraphFreshness(
+  db: DatabaseSync,
+  projectId: string,
+  rootDirs: Array<{ rootId: string | null; dir: string }>,
+): GraphFreshnessResult {
+  const totalFiles = (
+    db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
+      c: number;
+    }
+  ).c;
+
+  if (totalFiles === 0) {
+    for (const rootDir of rootDirs) {
+      if (hasAnyCodeFileBounded(resolve(rootDir.dir))) {
+        return { stale: true, reason: "not_indexed", checked_files: 0 };
+      }
+    }
+    return { stale: false, checked_files: 0 };
+  }
+
+  const rootById = new Map<string | null, { absDir: string; realDir: string }>();
+  for (const rootDir of rootDirs) {
+    const absDir = resolve(rootDir.dir);
+    const realDir = safeRealpathSync(absDir);
+    rootById.set(rootDir.rootId, { absDir, realDir });
+  }
+
+  type FreshnessRow = {
+    id: number;
+    root_id: string | null;
+    path: string;
+    mtime_ms: number | null;
+  };
+
+  let sampleRows: FreshnessRow[];
+  if (totalFiles <= MAX_FRESHNESS_CHECK_FILES) {
+    sampleRows = db
+      .prepare(
+        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY id LIMIT ?",
+      )
+      .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
+  } else {
+    const half = Math.floor(MAX_FRESHNESS_CHECK_FILES / 2);
+    const recentRows = db
+      .prepare(
+        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(mtime_ms, 0) DESC, id ASC LIMIT ?",
+      )
+      .all(projectId, half) as FreshnessRow[];
+    const spreadRows = db
+      .prepare(
+        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(hash, ''), id ASC LIMIT ?",
+      )
+      .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
+    const byId = new Map<number, FreshnessRow>();
+    for (const row of recentRows) byId.set(row.id, row);
+    for (const row of spreadRows) {
+      if (byId.size >= MAX_FRESHNESS_CHECK_FILES) break;
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+    sampleRows = [...byId.values()];
+  }
+
+  let checked = 0;
+  for (const row of sampleRows) {
+    const rootEntry = rootById.get(row.root_id);
+    if (!rootEntry) continue;
+
+    let relInRoot = row.path;
+    if (row.root_id !== null && relInRoot.startsWith("@")) {
+      const slashIdx = relInRoot.indexOf("/");
+      if (slashIdx !== -1) relInRoot = relInRoot.slice(slashIdx + 1);
+    }
+
+    const candidate = resolve(rootEntry.absDir, relInRoot);
+    if (!toRelInsideRoot(rootEntry.absDir, candidate)) continue;
+
+    checked++;
+    let diskMtimeMs: number;
+    try {
+      const lst = lstatSync(candidate);
+      if (lst.isSymbolicLink() || !lst.isFile()) {
+        return { stale: true, reason: "missing_files", checked_files: checked };
+      }
+      const realCandidate = realpathSync(candidate);
+      if (!isWithinRoot(rootEntry.realDir, realCandidate)) {
+        return { stale: true, reason: "missing_files", checked_files: checked };
+      }
+      diskMtimeMs = Math.floor(lst.mtimeMs);
+    } catch {
+      return { stale: true, reason: "missing_files", checked_files: checked };
+    }
+
+    if (row.mtime_ms === null || diskMtimeMs !== row.mtime_ms) {
+      return { stale: true, reason: "modified_files", checked_files: checked };
+    }
+  }
+
+  return { stale: false, checked_files: checked };
 }

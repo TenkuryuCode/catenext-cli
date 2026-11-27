@@ -104,6 +104,8 @@ export const GraphEdgeSchema = z.object({
 export const GraphNeighborsOutput = z.object({
   path: z.string(),
   edges: z.array(GraphEdgeSchema).max(40),
+  stale: z.boolean().optional(),
+  stale_reason: z.string().optional(),
 });
 
 export const SymbolSearchInput = z.object({
@@ -118,12 +120,42 @@ export const SymbolHitSchema = z.object({
 });
 export const SymbolSearchOutput = z.object({
   hits: z.array(SymbolHitSchema).max(40),
+  stale: z.boolean().optional(),
+  stale_reason: z.string().optional(),
 });
 
-export const GraphSummaryInput = z.object({
+export const GraphImpactInput = z.object({
+  path: z.string().min(1).max(500),
   depth: z.number().int().min(1).max(3).default(2),
+  limit: z.number().int().min(1).max(40).default(20),
+  include_tests: z.boolean().default(false),
+});
+export type GraphImpactInputType = z.infer<typeof GraphImpactInput>;
+
+export const GraphImpactHitSchema = z.object({
+  path: z.string(),
+  distance: z.number().int().min(1),
+  kind: z.enum(["direct", "transitive"]),
+  via: z.string().optional(),
+  symbols_count: z.number().int().min(0).optional(),
+});
+
+export const GraphImpactOutput = z.object({
+  target: z.string(),
+  indexed: z.boolean(),
+  stale: z.boolean().optional(),
+  stale_reason: z.string().optional(),
+  total_affected: z.number().int().min(0),
+  truncated: z.boolean(),
+  impacted: z.array(GraphImpactHitSchema).max(40),
+});
+export type GraphImpactOutputType = z.infer<typeof GraphImpactOutput>;
+
+export const GraphSummaryInput = z.object({
+  depth: z.number().int().min(1).max(5).default(2),
   max_hubs: z.number().int().min(1).max(30).default(12),
   include_mermaid: z.boolean().default(true),
+  include_tests: z.boolean().default(false),
 });
 export type GraphSummaryInputType = z.infer<typeof GraphSummaryInput>;
 
@@ -152,6 +184,8 @@ export const GraphSummaryHubSchema = z.object({
 
 export const GraphSummaryOutput = z.object({
   indexed: z.boolean(),
+  stale: z.boolean().optional(),
+  stale_reason: z.string().optional(),
   totals: z.object({
     files: z.number().int().min(0),
     symbols: z.number().int().min(0),

@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { ReleaseTaskInput, SetDependenciesInput, UpdateEpicInput, UpdateTaskInput } from "./api.js";
 import {
+  GraphImpactInput,
+  GraphImpactOutput,
   GraphNeighborsInput,
   GraphNeighborsOutput,
   GraphSummaryInput,
@@ -700,6 +702,11 @@ export const MCP_TOOLS = {
     "Compact SQLite code-graph architecture map: module groups, inter-module edges, top hub files, and Mermaid diagram.",
     GraphSummaryInput,
     GraphSummaryOutput,
+  ),
+  graph_impact: tool(
+    "Trace reverse transitive dependents of a file before editing or refactoring.",
+    GraphImpactInput,
+    GraphImpactOutput,
   ),
 } as const;
 

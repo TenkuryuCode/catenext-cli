@@ -33,8 +33,12 @@ import {
 import type { z } from "zod";
 import { HUMAN_APPROVAL_COMMANDS, requireHumanApproval } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
-import { graphNeighbors, symbolSearch } from "./db/graph-index.js";
-import { summarizeProjectGraph } from "./db/graph-summary.js";
+import { checkGraphFreshness, graphNeighbors, symbolSearch } from "./db/graph-index.js";
+import {
+  analyzeGraphImpact,
+  type GraphRootDir,
+  summarizeProjectGraph,
+} from "./db/graph-summary.js";
 import { LocalStore, newRootId } from "./db/store.js";
 import {
   insertTaskEvents,
@@ -904,15 +908,48 @@ class LocalWorkflow {
     interview_setup: (input) => buildInterviewSetup(this.root, input.step, this.config.stack ?? []),
     session_brief: (input) => this.sessionBrief(Boolean(input.verbose)),
     manage_roots: (input) => this.manageRoots(input),
-    graph_neighbors: (input) => ({
-      path: input.path,
-      edges: graphNeighbors(this.db, this.config.project_id, input.path, input.limit, input.depth),
-    }),
-    symbol_search: (input) => ({
-      hits: symbolSearch(this.db, this.config.project_id, input.query, input.limit),
-    }),
-    graph_summary: (input) => summarizeProjectGraph(this.db, this.config.project_id, input),
+    graph_neighbors: (input) => {
+      const rootDirs = this.graphRootDirs();
+      return {
+        path: input.path,
+        edges: graphNeighbors(
+          this.db,
+          this.config.project_id,
+          input.path,
+          input.limit,
+          input.depth,
+        ),
+        ...this.graphFreshness(rootDirs),
+      };
+    },
+    symbol_search: (input) => {
+      const rootDirs = this.graphRootDirs();
+      return {
+        hits: symbolSearch(this.db, this.config.project_id, input.query, input.limit),
+        ...this.graphFreshness(rootDirs),
+      };
+    },
+    graph_summary: (input) =>
+      summarizeProjectGraph(this.db, this.config.project_id, input, this.graphRootDirs()),
+    graph_impact: (input) =>
+      analyzeGraphImpact(this.db, this.config.project_id, input, this.graphRootDirs()),
   };
+
+  private graphRootDirs(): GraphRootDir[] {
+    return [
+      { rootId: null, dir: this.root },
+      ...(this.project.workspace_roots ?? []).map((r) => ({ rootId: r.id, dir: r.path })),
+    ];
+  }
+
+  private graphFreshness(rootDirs: GraphRootDir[]): { stale?: boolean; stale_reason?: string } {
+    const freshness = checkGraphFreshness(this.db, this.config.project_id, rootDirs);
+    if (!freshness.stale) return {};
+    return {
+      stale: true,
+      ...(freshness.reason ? { stale_reason: freshness.reason } : {}),
+    };
+  }
 
   /** Only the exact lease_id holder renews its own lease; expired leases are returned first. */
   tick(leaseId: string | undefined, name: McpToolName): void {

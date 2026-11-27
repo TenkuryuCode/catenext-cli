@@ -186,11 +186,12 @@ Persona paralel **wajib** worktree/branch terpisah. Orchestrator bertanya: **PR*
 catenext claim <task_id> --as bambang --create-worktree --branch feat/api --path ../api-lane
 catenext claim <task_id> --as bambang --worktree
 catenext worktree list                 # inventori Git + lease (read-only)
+catenext worktree status [--json]      # status dirty, lease SQLite & deteksi overlap file lintas worktree (read-only)
 catenext worktree prune                # pratinjau (default)
 catenext worktree prune --apply        # hapus checkout managed yang eligible; branch tetap
 ```
 
-`prune` melindungi primary, aktif, kotor, dan unmanaged.
+`prune` melindungi primary, aktif, kotor, dan unmanaged. `worktree status` melaporkan `dirty_count`, `modified_files` (maks. 50), metadata lease aktif, dan tumpang tindih file kotor antar worktree.
 
 ## Template lintas proyek
 
@@ -292,13 +293,14 @@ Portabilitas lintas repo: [template export/import](#template-lintas-proyek).
 
 ```bash
 catenext index
-catenext index --summary --depth 2 --max-hubs 12
+catenext index --summary --depth 2 --max-hubs 12 [--include-tests]
+catenext index --impact <path> [--depth 2] [--limit 20] [--include-tests]
 catenext index --write-doc architecture      # simpan peta arsitektur ke dokumen lokal (default: architecture)
 catenext search "login handler" --code
 ```
 
-- **Graf poliglot:** mendukung JS/TS (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`), `.vue`/`.svelte` (blok `<script>`), Python (impor lokal + relatif), Go (`go.mod`), Rust (`mod`, `crate::`, `super::`, `self::`), PHP (`composer.json` PSR-4 dalam batas `realRoot`), serta simbol `.java`/`.kt`.
-- **Peta arsitektur hemat token:** tool MCP `graph_summary` (`depth` 1–3 default 2, `max_hubs` 1–30 default 12, `include_mermaid` default `true`) tersedia read-only untuk `orchestrator` dan `worker` (28 tool MCP default; 32 dengan `--allow-crud`), bersama `graph_neighbors`, `symbol_search`, dan `search_context` (`sources: ["code"]`).
+- **Graf poliglot:** mendukung JS/TS (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`) dengan resolusi workspace monorepo (`package.json`/`pnpm-workspace.yaml`), `tsconfig.json` (`baseUrl`, `paths`, `extends` dalam batas `realRoot`), dan barrel re-export (`export *`, `export { ... } from`), `.vue`/`.svelte` (blok `<script>`), Python (impor lokal + relatif), Go (`go.mod`), Rust (`mod`, `crate::`, `super::`, `self::`), PHP (`composer.json` PSR-4 dalam batas `realRoot`), serta simbol `.java`/`.kt`.
+- **Peta arsitektur & analisis dampak hemat token:** tool MCP `graph_summary` (`depth` 1–5 default `2`, `max_hubs` 1–30 default `12`, `include_mermaid` default `true`, `include_tests` default `false`) dan `graph_impact` (`depth` 1–3 default `2`, `limit` 1–40 default `20`, `include_tests` default `false`) tersedia read-only untuk `orchestrator` dan `worker` (**29** tool MCP default; **33** dengan `--allow-crud`), bersama `graph_neighbors`, `symbol_search` (keempatnya menyertakan hint kesegaran `stale` / `stale_reason` yang dibatasi), dan `search_context` (`sources: ["code"]`).
 - **Pencarian FTS5:** SQLite FTS5 (`unicode61`, fallback `LIKE`) termasuk `.php`, `.vue`, `.svelte`, `.astro`, `.graphql`, `.proto`, dengan penelusuran `.gitignore`-aware, batas 256 KiB per file, guard symlink `lstat`/`realpath`, dan checkpoint WAL bersih saat koneksi ditutup.
 
 ## Data lokal
@@ -328,7 +330,7 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `board` | `get_project_board` | Papan lintas repo |
 | `watch` | - | Monitor board/lease/approval/events (read-only) |
 | `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task |
-| `worktree list\|prune` | - | Inventori / prune preview-first |
+| `worktree list\|status\|prune` | - | Inventori / status dirty & overlap / prune preview-first |
 | `template export\|import` | - | Bundle persona + skill (scrub secret) |
 | `block` / `release` | `report_blocker` / `release_task` | Blokir / lepas lease |
 | `task approve` / `review approve` | - (manusia) | Setujui rencana / handoff |
@@ -340,7 +342,7 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `doctor` | - | Diagnostik read-only |
 | `backup` / `restore` | - | Snapshot SQLite konsisten (`0600`) & pulihkan dengan cek integritas |
 | `mcp` | - | Stdio MCP (`--allow-crud` opt-in) |
-| `index` / `search` | `graph_summary` / `graph_neighbors` / `symbol_search` / `search_context` | Graf poliglot, peta arsitektur (`--summary`, `--write-doc`), & pencarian FTS5 |
+| `index` / `search` | `graph_summary` / `graph_impact` / `graph_neighbors` / `symbol_search` / `search_context` | Graf poliglot, peta arsitektur (`--summary`, `--write-doc`), dampak (`--impact`), & pencarian FTS5 |
 | `log` / `permission …` / `root …` | - | Audit, izin, roots |
 
 Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.

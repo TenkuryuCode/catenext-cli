@@ -92,6 +92,7 @@ import {
 } from "./template-bundle.js";
 import { formatChecks, verifySetup } from "./verify.js";
 import { runWatch } from "./watch.js";
+import { formatWorktreeStatus, readWorktreeStatus } from "./worktree-status.js";
 import {
   pruneWorktrees,
   readWorktreeInventory,
@@ -691,20 +692,36 @@ program
     "--write-doc [slug]",
     "Simpan ringkasan arsitektur ke dokumen proyek (default: architecture)",
   )
-  .option("--depth <n>", "Kedalaman kelompok direktori (1-3)", parseIntRange("--depth", 1, 3), 2)
+  .option("--impact <path>", "Analisis file terdampak secara transitif untuk <path>")
+  .option(
+    "--depth <n>",
+    "Kedalaman kelompok direktori (1-5) atau hop dampak (1-3)",
+    parseIntRange("--depth", 1, 5),
+    2,
+  )
+  .option(
+    "--limit <n>",
+    "Jumlah maksimal file terdampak untuk --impact (1-40)",
+    parseIntRange("--limit", 1, 40),
+    20,
+  )
   .option(
     "--max-hubs <n>",
     "Jumlah maksimal hub arsitektur (1-30)",
     parseIntRange("--max-hubs", 1, 30),
     12,
   )
+  .option("--include-tests", "Sertakan file test pada ringkasan dan analisis dampak")
   .option("--json", "Keluaran JSON")
   .action(
     (opts: {
       summary?: boolean;
       writeDoc?: string | boolean;
+      impact?: string;
       depth: number;
+      limit: number;
       maxHubs: number;
+      includeTests?: boolean;
       json?: boolean;
     }) =>
       friendly(async () => {
@@ -717,9 +734,11 @@ program
         const { indexProjectGraph } = await import("./db/graph-index.js");
         const result = await indexProjectGraph(dbPath, config.project_id, root);
 
+        const includeTests = Boolean(opts.includeTests);
         const wantDoc = opts.writeDoc !== undefined && opts.writeDoc !== false;
         const wantSummary = Boolean(opts.summary || wantDoc);
         let summary: Awaited<ReturnType<typeof service.callTool<"graph_summary">>> | undefined;
+        let impact: Awaited<ReturnType<typeof service.callTool<"graph_impact">>> | undefined;
         let savedDoc: Awaited<ReturnType<typeof service.callTool<"save_document">>> | undefined;
 
         if (wantSummary) {
@@ -727,6 +746,16 @@ program
             depth: opts.depth,
             max_hubs: opts.maxHubs,
             include_mermaid: true,
+            include_tests: includeTests,
+          });
+        }
+
+        if (opts.impact) {
+          impact = await service.callTool("graph_impact", {
+            path: opts.impact,
+            depth: opts.depth,
+            limit: opts.limit,
+            include_tests: includeTests,
           });
         }
 
@@ -736,7 +765,10 @@ program
             typeof opts.writeDoc === "string" && opts.writeDoc.trim()
               ? opts.writeDoc.trim()
               : "architecture";
-          const content = renderArchitectureMarkdown(summary, { depth: opts.depth });
+          const content = renderArchitectureMarkdown(summary, {
+            depth: opts.depth,
+            includeTests,
+          });
           let expectedVersion: number | undefined;
           try {
             const existing = await service.callTool("get_document", {
@@ -764,6 +796,7 @@ program
               {
                 ...result,
                 ...(summary ? { summary } : {}),
+                ...(impact ? { impact } : {}),
                 ...(savedDoc ? { document: savedDoc.document, created: savedDoc.created } : {}),
               },
               null,
@@ -778,7 +811,13 @@ program
         );
         if (opts.summary && summary) {
           const { renderArchitectureMarkdown } = await import("./db/graph-summary.js");
-          console.log(`\n${renderArchitectureMarkdown(summary, { depth: opts.depth }).trimEnd()}`);
+          console.log(
+            `\n${renderArchitectureMarkdown(summary, { depth: opts.depth, includeTests }).trimEnd()}`,
+          );
+        }
+        if (impact) {
+          const { renderImpactMarkdown } = await import("./db/graph-summary.js");
+          console.log(`\n${renderImpactMarkdown(impact).trimEnd()}`);
         }
         if (savedDoc) {
           console.log(
@@ -954,6 +993,18 @@ worktree
       const worktrees = await readWorktreeInventory({ root, config: await readConfig(root) });
       if (opts.json) console.log(JSON.stringify({ worktrees }, null, 2));
       else printWorktrees(worktrees);
+    }),
+  );
+
+worktree
+  .command("status")
+  .description("Lihat status dirty dan potensi konflik file antar worktree Git (read-only)")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { json?: boolean }) =>
+    friendly(async () => {
+      const result = await readWorktreeStatus(process.cwd());
+      if (opts.json) console.log(JSON.stringify(result, null, 2));
+      else console.log(formatWorktreeStatus(result));
     }),
   );
 

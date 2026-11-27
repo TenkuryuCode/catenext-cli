@@ -10,6 +10,24 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.15.0] - 2026-11-27
+
+### Ditambahkan
+- Resolusi import monorepo & `tsconfig.json` pada `apps/cli/src/db/graph-index.ts`: membaca `pnpm-workspace.yaml`, `package.json` (`workspaces`, `exports`, `main`, `module`, `types` termasuk pemetaan `dist/`/`build/`/`out/`/`lib/` dan `.d.ts` ke `src/`), serta `tsconfig.json` (`baseUrl`, `paths`, `extends` dengan stripping komentar JSONC aman) dalam batas ketat `realRoot` + guard symlink.
+- Ekstraksi barrel re-export (`export * from`, `export type * from`, `export * as <ns> from`, `export { ... } from`) sebagai simbol dan edge `reexport` sehingga file barrel `index.ts` tidak lagi melaporkan `0` simbol atau putus edge dependensi.
+- Pemeriksa kesegaran indeks berbatas `checkGraphFreshness` (maks 100 file via `lstat`/`realpath`/`mtime_ms` tanpa membaca isi file; 64 direktori / 256 entri saat belum terindeks) yang menambahkan hint opsional `stale` dan `stale_reason` (`not_indexed`, `missing_files`, `modified_files`) di `graph_summary`, `graph_impact`, `graph_neighbors`, dan `symbol_search`.
+- Tool MCP read-only `graph_impact` (`depth` 1–3 default `2`, `limit` 1–40 default `20`, `include_tests` default `false`) untuk menelusuri dependent transitif balik sebelum refactor (katalog kini **29** tool default; **33** dengan `--allow-crud`) beserta CLI `catenext index --impact <path> [--depth <n>] [--limit <n>] [--include-tests] [--json]`.
+- Perintah read-only `catenext worktree status [--json]` (`apps/cli/src/worktree-status.ts`) untuk memeriksa branch, jumlah file kotor (`dirty_count`), daftar `modified_files` (maks 50), enrichment lease SQLite aktif, dan peringatan `OVERLAP` file yang diubah bersamaan di beberapa worktree.
+
+### Diubah
+- Optimasi token `graph_summary` (`packages/shared/src/brief.ts`, `apps/cli/src/db/graph-summary.ts`): menaikkan batas `depth` dari `3` ke `5` (default `2`) untuk pengelompokan monorepo lebih granular serta menyaring file test (`include_tests: false` default) agar tidak menggelembungkan hub produksi dan diagram Mermaid; CLI `catenext index --summary` mendukung `--include-tests`.
+- Penyelarasan dokumentasi `README.md`, `apps/cli/README.md`, `apps/cli/mirror/README.md`, `docs/blueprint.md`, dan `docs/STATUS.md`.
+
+### Diperbaiki
+- Merakit fixture uji `google_api_key` di `apps/cli/src/scrubber.test.ts` secara dinamis agar tetap menguji sensor tanpa memicu false-positive GitHub Secret Scanning / Push Protection.
+- Normalisasi path worktree yang hilang/prunable di `apps/cli/src/worktree-status.ts` pada Windows dan penambahan timeout `20_000` ms pada uji multi-proses `apps/cli/src/local-service.test.ts`.
+- Menambahkan `paths-ignore` untuk perubahan dokumentasi/lisensi pada `.github/workflows/ci.yml` dan `apps/cli/mirror/.github/workflows/ci.yml`.
+
 ## [0.14.1] - 2026-11-27
 
 ### Diperbaiki

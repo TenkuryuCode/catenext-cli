@@ -2,16 +2,18 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { CatenextConfigSchema } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalService } from "../local-service.js";
 import { DEFAULT_MAX_FILE_BYTES } from "../workspace-walk.js";
 import {
+  checkGraphFreshness,
   graphNeighbors,
   indexProjectGraph,
   loadGoModule,
+  loadWorkspacePackages,
   parseImports,
   parseSymbols,
   resolveImport,
@@ -1225,5 +1227,386 @@ describe("Go, Rust & Python local import resolution", () => {
         label: "pkg/util/__init__.py",
       },
     ]);
+  });
+});
+
+describe("workspace package, tsconfig alias, barrel re-export & freshness", () => {
+  it("resolves monorepo workspace package root and subpath imports including @catenext/shared pattern", async () => {
+    await mkdir(join(root, "apps/web/src"), { recursive: true });
+    await mkdir(join(root, "packages/shared/src/utils"), { recursive: true });
+    await mkdir(join(root, "packages/shared/dist"), { recursive: true });
+    await mkdir(join(root, "packages/legacy/src"), { recursive: true });
+
+    await writeFile(
+      join(root, "pnpm-workspace.yaml"),
+      ["packages:", '  - "apps/*"', '  - "packages/*"', ""].join("\n"),
+    );
+    await writeFile(
+      join(root, "packages/shared/package.json"),
+      JSON.stringify({
+        name: "@acme/shared",
+        type: "module",
+        main: "./dist/index.js",
+        types: "./dist/index.d.ts",
+        exports: {
+          ".": {
+            types: "./dist/index.d.ts",
+            import: "./dist/index.js",
+            default: "./dist/index.js",
+          },
+          "./*": {
+            types: "./dist/*.d.ts",
+            import: "./dist/*.js",
+          },
+        },
+      }),
+    );
+    await writeFile(
+      join(root, "packages/shared/src/index.ts"),
+      "export const SHARED_VERSION = 1;\n",
+    );
+    await writeFile(
+      join(root, "packages/shared/src/utils/format.ts"),
+      "export function formatId(id: string) { return id; }\n",
+    );
+    // Even if built dist/ artifacts exist on disk, resolver maps back to src/
+    await writeFile(
+      join(root, "packages/shared/dist/index.js"),
+      "export const SHARED_VERSION = 1;\n",
+    );
+
+    await writeFile(
+      join(root, "packages/legacy/package.json"),
+      JSON.stringify({
+        name: "@acme/legacy",
+        main: "./dist/entry.js",
+      }),
+    );
+    await writeFile(
+      join(root, "packages/legacy/src/entry.ts"),
+      "export const legacyReady = true;\n",
+    );
+
+    const webEntry = join(root, "apps/web/src/index.ts");
+    await writeFile(
+      webEntry,
+      [
+        'import { SHARED_VERSION } from "@acme/shared";',
+        'import { formatId } from "@acme/shared/utils/format";',
+        'import { legacyReady } from "@acme/legacy";',
+        'import { z } from "zod";',
+        "export function boot() { return SHARED_VERSION + formatId('a').length + Number(legacyReady) + Number(Boolean(z)); }",
+      ].join("\n"),
+    );
+
+    expect(loadWorkspacePackages(root).map((p) => p.name)).toEqual([
+      "@acme/legacy",
+      "@acme/shared",
+    ]);
+    expect(resolveImport(webEntry, "@acme/shared", root)).toBe("packages/shared/src/index.ts");
+    expect(resolveImport(webEntry, "@acme/shared/utils/format", root)).toBe(
+      "packages/shared/src/utils/format.ts",
+    );
+    expect(resolveImport(webEntry, "@acme/legacy", root)).toBe("packages/legacy/src/entry.ts");
+    expect(resolveImport(webEntry, "zod", root)).toBeNull();
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(4);
+    expect(res.edges).toBe(3);
+
+    expect(graphNeighbors(dbPath, projectId, "apps/web/src/index.ts", 10, 1)).toEqual([
+      {
+        kind: "imports",
+        from: "apps/web/src/index.ts",
+        to: "packages/shared/src/index.ts",
+        label: "packages/shared/src/index.ts",
+      },
+      {
+        kind: "imports",
+        from: "apps/web/src/index.ts",
+        to: "packages/shared/src/utils/format.ts",
+        label: "packages/shared/src/utils/format.ts",
+      },
+      {
+        kind: "imports",
+        from: "apps/web/src/index.ts",
+        to: "packages/legacy/src/entry.ts",
+        label: "packages/legacy/src/entry.ts",
+      },
+    ]);
+
+    // Verify against this repo's actual @catenext/shared import in both monorepo and mirror layouts
+    const monorepoRoot = resolve(import.meta.dirname, "../../../..");
+    const mirrorRoot = resolve(import.meta.dirname, "../..");
+    if (existsSync(join(monorepoRoot, "packages/shared/src/index.ts"))) {
+      expect(
+        resolveImport(
+          join(monorepoRoot, "apps/cli/src/local-service.ts"),
+          "@catenext/shared",
+          monorepoRoot,
+        ),
+      ).toBe("packages/shared/src/index.ts");
+    } else {
+      expect(
+        resolveImport(join(mirrorRoot, "src/local-service.ts"), "@catenext/shared", mirrorRoot),
+      ).toBe("shared/src/index.ts");
+    }
+  });
+
+  it("resolves tsconfig.json baseUrl & paths aliases while rejecting targets escaping realRoot", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "catenext-tsconfig-outside-"));
+    try {
+      await mkdir(join(root, "apps/app/src/components"), { recursive: true });
+      await mkdir(join(root, "apps/app/src/lib"), { recursive: true });
+      await writeFile(join(outside, "secret.ts"), "export const secret = 42;\n");
+
+      // Root base tsconfig (JSONC with comments & trailing commas)
+      await writeFile(
+        join(root, "tsconfig.base.json"),
+        [
+          "{",
+          "  // base config",
+          '  "compilerOptions": {',
+          '    "strict": true,',
+          "  },",
+          "}",
+        ].join("\n"),
+      );
+
+      await writeFile(
+        join(root, "apps/app/tsconfig.json"),
+        [
+          "{",
+          '  "extends": "../../tsconfig.base.json",',
+          '  "compilerOptions": {',
+          '    "baseUrl": ".",',
+          '    "paths": {',
+          '      "@/*": ["src/*"],',
+          '      "@special": ["src/lib/special.ts"],',
+          '      "@escape/*": ["../../../' +
+            `${outside.split("/").pop()}` +
+            '/*", "../../../../outside/*"],',
+          "    },",
+          "  },",
+          "}",
+        ].join("\n"),
+      );
+
+      // Nested tsconfig with escaping baseUrl must not resolve outside realRoot
+      await mkdir(join(root, "apps/escaped/src"), { recursive: true });
+      await writeFile(
+        join(root, "apps/escaped/tsconfig.json"),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: "../../..",
+            paths: {
+              "@leak/*": ["*"],
+            },
+          },
+        }),
+      );
+
+      const pageFile = join(root, "apps/app/src/page.ts");
+      await writeFile(
+        pageFile,
+        [
+          'import { Button } from "@/components/Button";',
+          'import { helper } from "src/lib/helper";',
+          'import { special } from "@special";',
+          'import { secret } from "@escape/secret";',
+          "export function renderPage() { return [Button, helper, special, secret]; }",
+        ].join("\n"),
+      );
+      await writeFile(
+        join(root, "apps/app/src/components/Button.tsx"),
+        "export function Button() { return null; }\n",
+      );
+      await writeFile(join(root, "apps/app/src/lib/helper.ts"), "export const helper = 1;\n");
+      await writeFile(join(root, "apps/app/src/lib/special.ts"), "export const special = 2;\n");
+
+      const escapedEntry = join(root, "apps/escaped/src/entry.ts");
+      await writeFile(escapedEntry, "export const x = 1;\n");
+
+      let hasSymlink = false;
+      try {
+        await symlink(join(outside, "secret.ts"), join(root, "apps/app/src/linked-secret.ts"));
+        hasSymlink = true;
+      } catch (error) {
+        if (
+          !(
+            process.platform === "win32" &&
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "EPERM"
+          )
+        ) {
+          throw error;
+        }
+      }
+
+      expect(resolveImport(pageFile, "@/components/Button", root)).toBe(
+        "apps/app/src/components/Button.tsx",
+      );
+      expect(resolveImport(pageFile, "src/lib/helper", root)).toBe("apps/app/src/lib/helper.ts");
+      expect(resolveImport(pageFile, "@special", root)).toBe("apps/app/src/lib/special.ts");
+      expect(resolveImport(pageFile, "@escape/secret", root)).toBeNull();
+      expect(resolveImport(pageFile, `@escape/${outside.split("/").pop()}`, root)).toBeNull();
+      expect(
+        resolveImport(escapedEntry, `@leak/${outside.split("/").pop()}/secret`, root),
+      ).toBeNull();
+      if (hasSymlink) {
+        expect(resolveImport(pageFile, "@/linked-secret", root)).toBeNull();
+      }
+
+      const res = await indexProjectGraph(dbPath, projectId, root);
+      expect(res.files).toBe(5);
+      expect(graphNeighbors(dbPath, projectId, "apps/app/src/page.ts", 10, 1)).toEqual([
+        {
+          kind: "imports",
+          from: "apps/app/src/page.ts",
+          to: "apps/app/src/components/Button.tsx",
+          label: "apps/app/src/components/Button.tsx",
+        },
+        {
+          kind: "imports",
+          from: "apps/app/src/page.ts",
+          to: "apps/app/src/lib/helper.ts",
+          label: "apps/app/src/lib/helper.ts",
+        },
+        {
+          kind: "imports",
+          from: "apps/app/src/page.ts",
+          to: "apps/app/src/lib/special.ts",
+          label: "apps/app/src/lib/special.ts",
+        },
+      ]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts barrel export * and export { a, b as c } symbols and reexport edges", async () => {
+    const barrelCode = [
+      'export * from "./star";',
+      'export * as ns from "./ns";',
+      'export { alpha, beta as renamedBeta, type MyType } from "./named";',
+      '// export * from "./commented";',
+      "export function localHelper() {}",
+    ].join("\n");
+
+    expect(parseSymbols(barrelCode, ".ts")).toEqual([
+      { name: "*", kind: "reexport", line: 1 },
+      { name: "ns", kind: "reexport", line: 2 },
+      { name: "alpha", kind: "reexport", line: 3 },
+      { name: "renamedBeta", kind: "reexport", line: 3 },
+      { name: "MyType", kind: "reexport", line: 3 },
+      { name: "localHelper", kind: "function", line: 5 },
+    ]);
+
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/index.ts"), barrelCode);
+    await writeFile(join(root, "src/star.ts"), "export const starVal = 1;\n");
+    await writeFile(join(root, "src/ns.ts"), "export const nsVal = 2;\n");
+    await writeFile(
+      join(root, "src/named.ts"),
+      "export const alpha = 1;\nexport const beta = 2;\nexport type MyType = string;\n",
+    );
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(4);
+    expect(res.edges).toBe(3);
+
+    expect(graphNeighbors(dbPath, projectId, "src/index.ts", 10, 1)).toEqual([
+      { kind: "reexport", from: "src/index.ts", to: "src/star.ts", label: "src/star.ts" },
+      { kind: "reexport", from: "src/index.ts", to: "src/ns.ts", label: "src/ns.ts" },
+      { kind: "reexport", from: "src/index.ts", to: "src/named.ts", label: "src/named.ts" },
+    ]);
+
+    expect(symbolSearch(dbPath, projectId, "renamedBeta", 10)).toEqual([
+      { name: "renamedBeta", kind: "reexport", path: "src/index.ts", line: 3 },
+    ]);
+    expect(symbolSearch(dbPath, projectId, "*", 10)).toEqual([
+      { name: "*", kind: "reexport", path: "src/index.ts", line: 1 },
+    ]);
+  });
+
+  it("reports checkGraphFreshness accurately across empty, fresh, modified, and deleted states", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    const rootDirs = [{ rootId: null, dir: root }];
+
+    // Empty DB + no code files on disk -> not stale
+    {
+      const db = openDatabaseAt(dbPath);
+      try {
+        expect(checkGraphFreshness(db, projectId, rootDirs)).toEqual({
+          stale: false,
+          checked_files: 0,
+        });
+      } finally {
+        db.close();
+      }
+    }
+
+    const aPath = join(root, "src/a.ts");
+    const bPath = join(root, "src/b.ts");
+    await writeFile(aPath, "export const a = 1;\n");
+    await writeFile(bPath, "export const b = 2;\n");
+
+    // Empty DB + code files present -> stale: true, reason: "not_indexed"
+    {
+      const db = openDatabaseAt(dbPath);
+      try {
+        expect(checkGraphFreshness(db, projectId, rootDirs)).toEqual({
+          stale: true,
+          reason: "not_indexed",
+          checked_files: 0,
+        });
+      } finally {
+        db.close();
+      }
+    }
+
+    // Right after indexing -> stale: false
+    await indexProjectGraph(dbPath, projectId, root);
+    {
+      const db = openDatabaseAt(dbPath);
+      try {
+        expect(checkGraphFreshness(db, projectId, rootDirs)).toEqual({
+          stale: false,
+          checked_files: 2,
+        });
+      } finally {
+        db.close();
+      }
+    }
+
+    // Modify/touch an indexed file -> stale: true, reason: "modified_files"
+    const future = new Date(Date.now() + 10_000);
+    await writeFile(aPath, "export const a = 99;\n");
+    await utimes(aPath, future, future);
+    {
+      const db = openDatabaseAt(dbPath);
+      try {
+        const res = checkGraphFreshness(db, projectId, rootDirs);
+        expect(res.stale).toBe(true);
+        expect(res.reason).toBe("modified_files");
+      } finally {
+        db.close();
+      }
+    }
+
+    // Re-index, then delete an indexed file -> stale: true, reason: "missing_files"
+    await indexProjectGraph(dbPath, projectId, root);
+    await rm(bPath);
+    {
+      const db = openDatabaseAt(dbPath);
+      try {
+        const res = checkGraphFreshness(db, projectId, rootDirs);
+        expect(res.stale).toBe(true);
+        expect(res.reason).toBe("missing_files");
+      } finally {
+        db.close();
+      }
+    }
   });
 });
