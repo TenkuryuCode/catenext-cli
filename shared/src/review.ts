@@ -70,14 +70,85 @@ export type PullRequestState = z.infer<typeof PullRequestStateSchema>;
 
 export const ReviewDecisionSchema = z.enum(["approve", "request_changes"]);
 
+/** Maximum serialized UTF-8 JSON bytes for the optional review_context_pack. */
+export const REVIEW_CONTEXT_PACK_MAX_BYTES = 4096;
+
+export const ReviewChangedFileSchema = z.object({
+  path: z.string().min(1).max(300),
+  status: z.enum(["added", "modified", "deleted", "renamed", "typechange", "handoff"]),
+  additions: z.number().int().min(0),
+  deletions: z.number().int().min(0),
+  binary: z.boolean().optional(),
+  previous_path: z.string().min(1).max(300).optional(),
+  in_scope: z.boolean().optional(),
+});
+export type ReviewChangedFile = z.infer<typeof ReviewChangedFileSchema>;
+
+export const ReviewScopeDriftSchema = z.object({
+  scope_files: z.array(z.string().min(1).max(300)),
+  in_scope_files: z.array(z.string().min(1).max(300)),
+  out_of_scope_files: z.array(z.string().min(1).max(300)),
+  untouched_scope_files: z.array(z.string().min(1).max(300)),
+  drift_detected: z.boolean(),
+});
+export type ReviewScopeDrift = z.infer<typeof ReviewScopeDriftSchema>;
+
+export const ReviewDiffMetaSchema = z.object({
+  source: z.enum(["git_diff", "handoff_only"]),
+  base_ref: z.string().min(1).max(255).optional(),
+  total_files: z.number().int().min(0),
+  additions: z.number().int().min(0),
+  deletions: z.number().int().min(0),
+  changed_files: z.array(ReviewChangedFileSchema),
+  files_truncated: z.boolean().optional(),
+  scope_drift: ReviewScopeDriftSchema.optional(),
+});
+export type ReviewDiffMeta = z.infer<typeof ReviewDiffMetaSchema>;
+
+export const ReviewDetailPointersSchema = z.object({
+  git_diff_command: z.string().min(1).max(400),
+  git_show_stat_command: z.string().min(1).max(400),
+  doc_refs: z.array(z.string().min(1).max(160)).optional(),
+  mcp_tools: z.array(z.string().min(1).max(160)),
+});
+export type ReviewDetailPointers = z.infer<typeof ReviewDetailPointersSchema>;
+
+export const ReviewContextPackSchema = z.object({
+  task_id: IdSchema,
+  reviewed_commit_sha: CommitShaSchema,
+  head_sha: CommitShaSchema,
+  last_commit_hash: z.string().regex(/^[0-9a-f]{7,64}$/),
+  base_branch: z.string().min(1).max(255),
+  git_branch: z.string().min(1).max(255).optional(),
+  diff_meta: ReviewDiffMetaSchema,
+  handoff_decisions: z.array(z.string()),
+  verification_command: z.string().nullable(),
+  task_verify_command: z.string().nullable().optional(),
+  epic_summary_excerpt: z.string().optional(),
+  sync_board_excerpt: z.string().optional(),
+  detail_pointers: ReviewDetailPointersSchema,
+  byte_length: z.number().int().min(1).max(REVIEW_CONTEXT_PACK_MAX_BYTES),
+  truncated: z.literal(true).optional(),
+});
+export type ReviewContextPack = z.infer<typeof ReviewContextPackSchema>;
+
 export const ReviewInput = z.discriminatedUnion("action", [
   z.object({ action: z.literal("list"), limit: z.number().int().min(1).max(30).default(10) }),
   z.object({
     action: z.literal("claim"),
     task_id: IdSchema,
     agent_alias: z.string().min(1).max(80).optional(),
+    head_sha: CommitShaSchema.optional(),
+    compact: z.boolean().optional(),
+    include_context: z.boolean().optional(),
   }),
-  z.object({ action: z.literal("refresh"), task_id: IdSchema }),
+  z.object({
+    action: z.literal("refresh"),
+    task_id: IdSchema,
+    head_sha: CommitShaSchema.optional(),
+    compact: z.boolean().optional(),
+    include_context: z.boolean().optional(),
+  }),
   z.object({
     action: z.literal("submit"),
     task_id: IdSchema,
@@ -103,6 +174,9 @@ export const ReviewOutput = z.union([
     /** Batas review lokal, bukan kegagalan aksi. */
     notice: z.string().optional(),
     warning: z.string().optional(),
+    stale_commit: z.literal(true).optional(),
+    review_context_pack: ReviewContextPackSchema.optional(),
+    byte_length: z.number().int().min(1).optional(),
   }),
 ]);
 export type ReviewRequest = z.output<typeof ReviewInput>;

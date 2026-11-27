@@ -96,7 +96,44 @@ const task = z.strictObject({
   scope_files: TaskScopeFilesSchema.optional(),
   verify_command: TaskVerifyCommandSchema.optional(),
   doc_refs: TaskDocRefsSchema.optional(),
+  archived_at: IsoDateTimeSchema.nullable().optional(),
 });
+
+export const EpicSummaryTaskRefSchema = z.strictObject({
+  task_id: IdSchema,
+  title: z.string().min(1).max(200),
+  status: TaskStatusSchema,
+  commit_sha: z
+    .string()
+    .regex(/^[0-9a-f]{7,64}$/)
+    .nullable()
+    .optional(),
+  branch: z.string().min(1).max(255).nullable().optional(),
+});
+export type EpicSummaryTaskRef = z.output<typeof EpicSummaryTaskRefSchema>;
+
+export const VersionedEpicSummarySchema = z.strictObject({
+  version: z.number().int().min(1),
+  updated_at: IsoDateTimeSchema,
+  source_task_count: z.number().int().min(0),
+  done_task_count: z.number().int().min(0),
+  overview: z.string().min(1).max(600),
+  key_decisions: z.array(z.string().min(1).max(240)).max(12),
+  task_refs: z.array(EpicSummaryTaskRefSchema).max(20),
+  outcomes: z.array(z.string().min(1).max(240)).max(12),
+  unresolved_risks: z.array(z.string().min(1).max(240)).max(10),
+  byte_length: z.number().int().min(0),
+  truncated: z.boolean().optional(),
+});
+export type VersionedEpicSummary = z.output<typeof VersionedEpicSummarySchema>;
+
+export type LocalEpic = {
+  id: string;
+  title: string;
+  description: string | null;
+  summary?: VersionedEpicSummary | null;
+  archived_at?: string | null;
+};
 
 export const PERMISSION_ACTIONS = [
   "approve_plan",
@@ -121,7 +158,7 @@ export type LocalRoot = {
 
 export type LocalProject = {
   repos: string[];
-  epics: Array<{ id: string; title: string; description: string | null }>;
+  epics: LocalEpic[];
   personas: z.output<typeof PersonaSchema>[];
   tasks: z.output<typeof task>[];
   documents: z.output<typeof ProjectDocumentSchema>[];

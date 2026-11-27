@@ -240,7 +240,7 @@ async function claimNewWorktree(
     }
   };
   const res = await service
-    .callTool("claim_task", { ...claim, worktree }, checkout.validate)
+    .callTool("claim_task", { ...claim, worktree }, { beforeClaim: checkout.validate })
     .catch(async (error: unknown) => {
       // Failed checkout identity validation must not turn a changed checkout into a prune target.
       if (error instanceof WorktreeError) throw error;
@@ -311,7 +311,7 @@ export async function taskClaim(service: LocalService, taskId: string, opts: Cla
           }
         }
       : undefined;
-  const res = await service.callTool("claim_task", payload, validate);
+  const res = await service.callTool("claim_task", payload, { beforeClaim: validate });
   if (opts.json) return console.log(JSON.stringify(res, null, 2));
   console.log(renderClaim(res));
 }
@@ -430,15 +430,29 @@ export async function taskReview(service: LocalService, input: unknown, json: bo
     if (result.lease_id)
       console.log(`Lease review: ${result.lease_id} (sampai ${result.lease_expires_at})`);
     if (result.notes_for_next_agent) console.log(result.notes_for_next_agent);
+    if (result.review_context_pack) {
+      const pack = result.review_context_pack;
+      const drift = pack.diff_meta.scope_drift
+        ? ` · scope_drift=${pack.diff_meta.scope_drift.drift_detected ? "yes" : "no"}`
+        : "";
+      console.log(
+        `Context pack: ${pack.diff_meta.total_files} file (+${pack.diff_meta.additions}/-${pack.diff_meta.deletions})${drift} · ${pack.byte_length}B${pack.truncated ? " (truncated)" : ""}`,
+      );
+    }
     if (result.warning) console.error(result.warning);
   }
   if ("warning" in result && result.warning) process.exitCode = 1;
 }
 
 /** Orchestrator: kembalikan task ke kolom Revisi atau tetapkan persona/role (manage_task). */
-export async function taskManage(service: LocalService, input: unknown, json: boolean) {
+export async function taskManage(
+  service: LocalService,
+  input: unknown,
+  json: boolean,
+  approvalSnapshot?: string,
+) {
   const body = prepare(ManageTaskInput, input, ["action", "task_id", "agent_alias", "role"]);
-  const res = await service.callTool("manage_task", body);
+  const res = await service.callTool("manage_task", body, { approvalSnapshot });
   if (json) return console.log(JSON.stringify(res, null, 2));
   const owner = res.persona ? `@${res.persona}` : res.role ? `role ${res.role}` : "tanpa persona";
   if (body.action === "request_revision") {

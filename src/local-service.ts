@@ -33,7 +33,12 @@ import {
   UpdateTaskInput,
 } from "@catenext/shared";
 import type { z } from "zod";
-import { HUMAN_APPROVAL_COMMANDS, requireHumanApproval } from "./approval-policy.js";
+import {
+  type ApprovalAction,
+  ApprovalSnapshotSchema,
+  HUMAN_APPROVAL_COMMANDS,
+  requireHumanApproval,
+} from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
 import {
   checkGraphFreshness,
@@ -47,6 +52,7 @@ import {
   type GraphRootDir,
   summarizeProjectGraph,
 } from "./db/graph-summary.js";
+import { loadProject } from "./db/project-codec.js";
 import { LocalStore, newRootId } from "./db/store.js";
 import {
   insertTaskEvents,
@@ -54,8 +60,36 @@ import {
   type ReadTaskEventsOptions,
   type TaskEventRecord,
 } from "./db/task-events.js";
+import {
+  acceptedReview,
+  assertIntegration,
+  assertRunHealthy,
+  type EpicRun,
+  epicRunAction,
+  integrationBranch,
+  previewRun,
+  readRun,
+  runBranch,
+  runIssue,
+  runPrefix,
+  runTaskChanges,
+  saveRun,
+} from "./epic-run.js";
+import { assertDescends, assertRunCheckout, fullSha, localCommit } from "./epic-run-git.js";
 import { LocalServiceError } from "./errors.js";
 import { buildInterviewSetup } from "./interview.js";
+import {
+  archiveEpicInProject,
+  type EpicArchiveResult,
+  type EpicRestoreResult,
+  filterVisibleEpics,
+  filterVisibleTasks,
+  isEpicSummaryStale,
+  resolveEpicSummaryText,
+  restoreEpicInProject,
+  UpsertEpicSummaryInput,
+  upsertVersionedEpicSummary,
+} from "./local-retention.js";
 import { type LocalSearchItem, searchLocalContext } from "./local-search.js";
 import {
   type LocalPermission,
@@ -64,10 +98,22 @@ import {
   type LocalTask,
   PERMISSION_ACTIONS,
   type PermissionAction,
+  type VersionedEpicSummary,
 } from "./local-state.js";
-import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep } from "./scrubber.js";
+import {
+  buildReviewContextPack,
+  isStaleReviewCommit,
+  withReviewResponseByteLength,
+} from "./review-context.js";
+import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep, scrubText } from "./scrubber.js";
 import { applyProjectSeed } from "./seed.js";
-import { listSkills, loadSkill, type Skill, saveSkill } from "./skills.js";
+import {
+  type DiscoveredSkillEntry,
+  discoverSkillCatalog,
+  loadCatalogSkill,
+  toSkillIndexEntries,
+} from "./skill-catalog.js";
+import { saveSkill } from "./skills.js";
 import {
   type ActiveWorktreeLease,
   readWorktreeOverlapHint,
@@ -285,13 +331,21 @@ function extractSyncBoardExcerpt(
   return excerpt;
 }
 
-function prioritizeSkills(skills: readonly Skill[], task: LocalTask): string[] {
+function prioritizeSkills(
+  skills: readonly Pick<
+    DiscoveredSkillEntry,
+    "name" | "when_to_use" | "disable_model_invocation"
+  >[],
+  task: LocalTask,
+): string[] {
   const docNeedles = new Set((task.doc_refs ?? []).map((ref) => ref.toLowerCase()));
   const roleNeedles = [task.role, task.persona]
     .filter((v): v is string => typeof v === "string" && v.length > 0)
     .map((v) => v.toLowerCase());
 
-  const matches = (skill: Skill): boolean => {
+  const matches = (
+    skill: Pick<DiscoveredSkillEntry, "name" | "when_to_use" | "disable_model_invocation">,
+  ): boolean => {
     const nameLow = skill.name.toLowerCase();
     if (docNeedles.has(nameLow)) return true;
     for (const ref of docNeedles) {
@@ -303,7 +357,10 @@ function prioritizeSkills(skills: readonly Skill[], task: LocalTask): string[] {
 
   const prioritized: string[] = [];
   const rest: string[] = [];
+  const seen = new Set<string>();
   for (const skill of skills) {
+    if (skill.disable_model_invocation || seen.has(skill.name)) continue;
+    seen.add(skill.name);
     if (matches(skill)) prioritized.push(skill.name);
     else rest.push(skill.name);
   }
@@ -368,6 +425,88 @@ export class LocalService {
   ) {
     this.stateFile = resolve(repoRoot, config.state_file ?? ".catenext/catenext.sqlite");
     this.store = new LocalStore(this.stateFile);
+  }
+
+  /** Local trusted-host boundary. Deliberately not registered as an MCP tool. */
+  async epicRun(epic: string, raw: z.input<typeof epicRunAction>) {
+    if (this.caller !== "human")
+      fail("human_approval_required", "Epic runs require a trusted local host.");
+    const parsed = epicRunAction.safeParse(raw);
+    if (!IdSchema.safeParse(epic).success || !parsed.success)
+      fail("invalid_input", "Invalid epic run input.");
+    const options = parsed.data;
+    if (
+      (options.action === "preview" || options.action === "start") &&
+      scrubText(options.check) !== options.check
+    ) {
+      fail("invalid_input", "Verification command must not contain credentials.");
+    }
+    if (options.action === "review") options.feedback = scrubText(options.feedback);
+    if (options.action === "pause") options.reason = scrubText(options.reason);
+    const projectId = this.config.project_id;
+    if (options.action === "preview") {
+      return this.store.read(projectId, (project, db) =>
+        previewRun(this.repoRoot, this.config, project, db, epic, options),
+      );
+    }
+    return this.store.transaction(
+      projectId,
+      this.config.repo_name,
+      (project, dirty, db, afterSave) => {
+        const tools = new LocalWorkflow(
+          project,
+          this.config,
+          this.repoRoot,
+          db,
+          Date.now(),
+          dirty,
+          this.caller,
+        );
+        let run = readRun(db, projectId, epic);
+        if (run && run.plan.repo !== this.config.repo_name)
+          fail("wrong_repo", "Run belongs to another repo.");
+        const persist = (state: EpicRun) => {
+          const events = tools.drainEvents();
+          afterSave((tx) => {
+            saveRun(tx, projectId, state);
+            insertTaskEvents(tx, projectId, events);
+          });
+        };
+        if (options.action === "start") {
+          if (run) {
+            if (
+              run.snapshot === options.snapshot &&
+              run.plan.base === options.base &&
+              run.plan.check === options.check &&
+              run.status !== "CLOSED"
+            )
+              return tools.runView(run);
+            fail(
+              "run_state",
+              "Epic already has a local run. Start a new epic for a new authorization.",
+            );
+          }
+          if (
+            db
+              .prepare("SELECT 1 FROM epic_runs WHERE project_id = ? AND repo = ? AND closed = 0")
+              .get(projectId, this.config.repo_name)
+          ) {
+            fail("run_state", "Close the existing local run before starting another in this repo.");
+          }
+          const preview = previewRun(this.repoRoot, this.config, project, db, epic, options);
+          if (options.snapshot !== preview.snapshot)
+            fail("stale_approval", "Plan changed since preview. Request fresh confirmation.");
+          run = tools.startRun(preview.plan, preview.snapshot);
+          persist(run);
+          return tools.runView(run);
+        }
+        if (!run) fail("not_found", "No local run for this epic.");
+        const before = JSON.stringify(run);
+        tools.advanceRun(run, options);
+        if (before !== JSON.stringify(run)) persist(run);
+        return tools.runView(run);
+      },
+    );
   }
 
   /** Seed default personas/docs/permissions once (idempotent). */
@@ -600,6 +739,152 @@ export class LocalService {
           if (t.epicId === epic.id) counts.set(t.status, (counts.get(t.status) ?? 0) + 1);
         }
         return { ...epic, task_counts: Object.fromEntries(counts) };
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  /** Read-only retrieval of an epic's versioned summary (with staleness flag and safe fallback excerpt). */
+  async getEpicSummary(epicId: string): Promise<{
+    epic_id: string;
+    title: string;
+    archived_at: string | null;
+    stale: boolean;
+    summary: VersionedEpicSummary | null;
+    excerpt: string;
+  }> {
+    if (!IdSchema.safeParse(epicId).success) {
+      fail("invalid_input", "epic_id harus UUID yang valid.");
+    }
+    return await this.store.query((db) => {
+      const project = loadProject(db, this.config.project_id);
+      const epic = project.epics.find((e) => e.id === epicId);
+      if (!epic) fail("not_found", "Epic tidak ditemukan di proyek ini.");
+      return {
+        epic_id: epic.id,
+        title: epic.title,
+        archived_at: epic.archived_at ?? null,
+        stale: isEpicSummaryStale(epic, project.tasks),
+        summary: epic.summary ?? null,
+        excerpt: resolveEpicSummaryText(epic, project.tasks, 1000),
+      };
+    });
+  }
+
+  /** Build, refresh, or update a versioned epic summary (bounded UTF-8 size, optimistic version check). */
+  async saveEpicSummary(
+    epicId: string,
+    input: Omit<z.input<typeof UpsertEpicSummaryInput>, "epic_id"> = {},
+  ): Promise<{
+    epic_id: string;
+    title: string;
+    archived_at: string | null;
+    summary: VersionedEpicSummary;
+    excerpt: string;
+  }> {
+    this.requireCrudPermission();
+    const skipKeys = new Set([...DEFAULT_SCRUB_SKIP_KEYS, "epic_id", "expected_version"]);
+    const parsed = UpsertEpicSummaryInput.safeParse(
+      scrubDeep({ ...input, epic_id: epicId }, skipKeys).value,
+    );
+    if (!parsed.success) {
+      const paths = [
+        ...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "(root)")),
+      ];
+      fail("invalid_input", `Input saveEpicSummary tidak valid: ${paths.join(", ")}.`, {
+        fields: paths,
+      });
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        const epic = project.epics.find((e) => e.id === parsed.data.epic_id);
+        if (!epic) fail("not_found", "Epic tidak ditemukan di proyek ini.");
+        const summary = upsertVersionedEpicSummary(epic, project.tasks, {
+          overview: parsed.data.overview,
+          key_decisions: parsed.data.key_decisions,
+          outcomes: parsed.data.outcomes,
+          unresolved_risks: parsed.data.unresolved_risks,
+          expected_version: parsed.data.expected_version,
+        });
+        dirty();
+        return {
+          epic_id: epic.id,
+          title: epic.title,
+          archived_at: epic.archived_at ?? null,
+          summary,
+          excerpt: resolveEpicSummaryText(epic, project.tasks, 1000),
+        };
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  /**
+   * Archive a completed/inactive epic (or perform a strictly read-only dry-run estimation).
+   */
+  async archiveEpic(
+    epicId: string,
+    options: { dry_run?: boolean } = {},
+  ): Promise<EpicArchiveResult> {
+    this.requireCrudPermission();
+    if (!IdSchema.safeParse(epicId).success) {
+      fail("invalid_input", "epic_id harus UUID yang valid.");
+    }
+    if (options.dry_run) {
+      const preview = await this.store.inspect((db) =>
+        archiveEpicInProject(
+          db,
+          this.config.project_id,
+          loadProject(db, this.config.project_id),
+          epicId,
+          { dry_run: true },
+        ),
+      );
+      return (
+        preview ?? fail("not_found", "Current project database required for read-only preview.")
+      );
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty, db) => {
+        const result = archiveEpicInProject(db, this.config.project_id, project, epicId, {
+          dry_run: false,
+        });
+        dirty();
+        return result;
+      },
+    );
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
+  /** Restore a previously archived epic and its tasks back to active visibility. */
+  async restoreEpic(epicId: string): Promise<EpicRestoreResult> {
+    this.requireCrudPermission();
+    if (!IdSchema.safeParse(epicId).success) {
+      fail("invalid_input", "epic_id harus UUID yang valid.");
+    }
+    const existed = existsSync(this.stateFile);
+    const out = await this.store.transaction(
+      this.config.project_id,
+      this.config.repo_name,
+      (project, dirty) => {
+        const result = restoreEpicInProject(project, epicId);
+        dirty();
+        return result;
       },
     );
     if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
@@ -984,8 +1269,12 @@ export class LocalService {
   async callTool<K extends McpToolName>(
     name: K,
     input: unknown,
-    /** Local CLI only: confirm checkout still exists under the same lock as prune. */
-    beforeClaim?: K extends "claim_task" ? () => Promise<void> : never,
+    local?: {
+      /** Confirm checkout still exists under the same lock as prune. */
+      beforeClaim?: K extends "claim_task" ? () => Promise<void> : never;
+      /** Compare against what was presented to the human, not proof of authorship. */
+      approvalSnapshot?: K extends "manage_task" ? string : never;
+    },
   ): Promise<McpToolOutput<K>> {
     const toolName: McpToolName = name as McpToolName;
     if (isMcpCrudTool(toolName)) this.requireCrudPermission();
@@ -1009,7 +1298,7 @@ export class LocalService {
       this.config.project_id,
       this.config.repo_name,
       async (project, dirty, db, afterSave) => {
-        if (name === "claim_task") await beforeClaim?.();
+        if (name === "claim_task") await local?.beforeClaim?.();
         const now = Date.now();
         const tools = new LocalWorkflow(
           project,
@@ -1030,10 +1319,19 @@ export class LocalService {
         // Registry key correlates parser, handler, and output. TS cannot retain that correlation
         // on a generic indexed access; output validation happens before the transaction commits.
         const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
-        const result = contract.output.parse(await run(parsed.data));
+        const result = contract.output.parse(
+          name === "manage_task" && local?.approvalSnapshot !== undefined
+            ? tools.manageTask(
+                MCP_TOOLS.manage_task.input.parse(parsed.data),
+                local.approvalSnapshot,
+              )
+            : await run(parsed.data),
+        );
         const events = tools.drainEvents();
-        if (events.length > 0) {
+        const runs = tools.drainRuns();
+        if (events.length > 0 || runs.length > 0) {
           afterSave((txDb) => {
+            for (const run of runs) saveRun(txDb, this.config.project_id, run);
             insertTaskEvents(txDb, this.config.project_id, events);
           });
         }
@@ -1057,6 +1355,7 @@ class LocalWorkflow {
   private readonly repo: string;
   private readonly iso: string;
   private readonly events: NewTaskEvent[] = [];
+  private readonly runs: EpicRun[] = [];
 
   constructor(
     private readonly project: LocalProject,
@@ -1080,9 +1379,198 @@ class LocalWorkflow {
     return this.events.splice(0);
   }
 
+  drainRuns(): EpicRun[] {
+    return this.runs.splice(0);
+  }
+
+  private taskRun(task: LocalTask): EpicRun | undefined {
+    const run = readRun(this.db, this.config.project_id, task.epicId);
+    return run?.status === "CLOSED" ? undefined : run;
+  }
+
+  private assertHealthy(run: EpicRun) {
+    assertRunHealthy(run, this.project, this.db, this.config.project_id);
+  }
+
+  startRun(plan: EpicRun["plan"], snapshot: string): EpicRun {
+    for (const { id } of plan.tasks) {
+      const task = this.task(id);
+      if (task.status === "DRAFT") this.manageTask({ action: "approve_plan", task_id: id });
+      this.recordEvent({
+        task_id: id,
+        event: "epic_run_start",
+        actor: "human",
+        detail: { epic_id: plan.epic_id, snapshot },
+      });
+    }
+    return {
+      plan,
+      snapshot,
+      authorized_at: this.iso,
+      status: "RUNNING",
+      reviews: [],
+      verification: [],
+    };
+  }
+
+  private pauseRun(run: EpicRun, reason: string) {
+    run.status = "PAUSED";
+    run.reason = reason;
+    delete run.ready_head;
+  }
+
+  advanceRun(
+    run: EpicRun,
+    options: Exclude<z.output<typeof epicRunAction>, { action: "preview" | "start" }>,
+  ) {
+    if (options.action === "close") {
+      if (run.plan.tasks.some(({ id }) => this.tasks.get(id)?.lease))
+        fail("run_state", "Release held task leases before closing the run.");
+      run.status = "CLOSED";
+      return;
+    }
+    if (run.status === "CLOSED") return;
+    if (options.action === "pause") {
+      this.pauseRun(run, options.reason);
+      return;
+    }
+    const issue = runIssue(run, this.project, this.db, this.config.project_id);
+    if (issue) {
+      this.pauseRun(run, issue);
+      return;
+    }
+    if (run.status === "READY_FOR_PR") {
+      try {
+        if (localCommit(this.root, integrationBranch(run.plan.epic_id)) !== run.ready_head) {
+          this.pauseRun(run, "Verified integration branch moved.");
+        }
+      } catch {
+        this.pauseRun(run, "Verified integration branch is missing or unreadable.");
+      }
+      return;
+    }
+    if (options.action === "resume") return;
+    if (options.action === "verify") {
+      if (run.verification.some(({ attempt }) => attempt === options.attempt)) return;
+      try {
+        assertIntegration(this.root, run, this.project, options.path, options.head);
+      } catch (error) {
+        if (
+          !(error instanceof LocalServiceError) ||
+          !["run_scope", "run_risk"].includes(error.code)
+        )
+          throw error;
+        this.pauseRun(run, error.message);
+        return;
+      }
+      run.verification.push({
+        attempt: options.attempt,
+        head: options.head,
+        result: options.result,
+        at: this.iso,
+      });
+      if (options.result === "pass") {
+        run.status = "READY_FOR_PR";
+        run.ready_head = options.head;
+      } else if (run.verification.filter(({ result }) => result === "fail").length >= 2) {
+        this.pauseRun(run, "Integration verification failed twice.");
+      }
+      return;
+    }
+    const task = this.task(options.task);
+    if (!run.plan.tasks.some(({ id }) => id === task.id))
+      fail("run_scope", "Task is outside run scope.");
+    const reviewer = this.persona(options.reviewer);
+    if (
+      reviewer.role !== "reviewer" ||
+      reviewer.alias === task.persona ||
+      !allowsRepo(reviewer, this.repo)
+    ) {
+      fail("reviewer_required", "An independent reviewer persona for this repo is required.");
+    }
+    const previous = run.reviews.findLast(({ task: id }) => id === task.id);
+    if (
+      previous?.head === options.head &&
+      previous.decision === options.decision &&
+      previous.feedback === options.feedback &&
+      previous.reviewer === options.reviewer &&
+      (previous.revision === task.revision ||
+        (previous.decision === "request_changes" && previous.revision + 1 === task.revision))
+    )
+      return;
+    if (task.status !== "NEEDS_REVIEW" || task.handoff?.last_commit_hash !== options.head) {
+      fail("run_review", "Review must target current NEEDS_REVIEW handoff and its exact commit.");
+    }
+    try {
+      runTaskChanges(this.root, run, this.project, task, options.head);
+    } catch (error) {
+      if (!(error instanceof LocalServiceError) || !["run_scope", "run_risk"].includes(error.code))
+        throw error;
+      this.pauseRun(run, error.message);
+      return;
+    }
+    const revision = task.revision;
+    if (options.decision === "request_changes") {
+      if (revision >= 2) this.pauseRun(run, `Task ${task.id} reached its two-revision limit.`);
+      else this.revise(task, options.feedback);
+    } else if (previous?.revision === revision && previous.head === options.head) {
+      fail(
+        "run_review",
+        "Acceptance is already recorded for this handoff. Request changes to supersede it.",
+      );
+    }
+    run.reviews.push({
+      task: task.id,
+      head: options.head,
+      reviewer: options.reviewer,
+      decision: options.decision,
+      feedback: options.feedback,
+      revision,
+      at: this.iso,
+    });
+    this.dirty();
+    this.recordEvent({
+      task_id: task.id,
+      event: "epic_run_review",
+      actor: options.reviewer,
+      note: options.feedback,
+      detail: {
+        source: "delegated_review",
+        decision: options.decision,
+        head: options.head,
+        revision,
+        to: task.status,
+      },
+    });
+  }
+
+  runView(run: EpicRun) {
+    const tasks = run.plan.tasks.map(({ id }) => this.tasks.get(id));
+    const busy = tasks.filter((task) => task?.lease).length;
+    const slots = Math.max(0, 2 - busy);
+    const eligible =
+      run.status === "RUNNING"
+        ? tasks.flatMap((task) => (task && this.readyByDeps(task) ? [task.id] : [])).slice(0, slots)
+        : [];
+    return {
+      ...run,
+      integration_branch: integrationBranch(run.plan.epic_id),
+      host_mode: "stepped" as const,
+      unattended_supported: false,
+      eligible,
+      tasks: run.plan.tasks.map(({ id }, index) => ({
+        id,
+        status: tasks[index]?.status ?? null,
+        revision: tasks[index]?.revision ?? null,
+        branch: runBranch(run.plan.epic_id, id),
+        head: tasks[index]?.handoff?.last_commit_hash ?? null,
+      })),
+    };
+  }
+
   readonly handlers: Handlers = {
     create_epic: (input) => this.createEpic(input),
-    list_epics: () => ({ epics: this.epicSummaries() }),
+    list_epics: (input) => ({ epics: this.epicSummaries(input.include_archived) }),
     create_tasks: (input) => this.createTasks(input),
     manage_task: (input) => this.manageTask(input),
     list_personas: () => ({
@@ -1109,9 +1597,22 @@ class LocalWorkflow {
     restore_document: (input) => this.restoreDocument(input),
     search_context: (input) => this.search(input),
     review_pull_request: ({ request }) => this.review(request),
-    load_skill: async ({ name, revision }) => {
-      const skill = await loadSkill(this.root, name, revision);
-      return { ...skill, ...(revision ? { revision } : {}) };
+    load_skill: async ({ name, revision, source_id }) => {
+      const skill = await loadCatalogSkill(this.root, name, {
+        platforms: this.config.platforms,
+        sourceId: source_id,
+        revision,
+      });
+      return {
+        name: skill.name,
+        when_to_use: skill.when_to_use,
+        content: skill.content,
+        source_id: skill.source_id,
+        source_kind: skill.source_kind,
+        source_path: skill.source_path,
+        ...(skill.collision ? { collision: true } : {}),
+        ...(revision ? { revision } : {}),
+      };
     },
     save_repo_skill: (input) => saveSkill(this.root, input, new Date(this.now)),
     interview_setup: (input) => buildInterviewSetup(this.root, input.step, this.config.stack ?? []),
@@ -1225,7 +1726,8 @@ class LocalWorkflow {
     const persona = alias ? this.persona(alias) : undefined;
     const role = input.role ?? persona?.role ?? this.config.overrides?.default_role;
     if (!allowsRepo(persona, this.repo)) return [];
-    return this.project.tasks
+    const activeTasks = filterVisibleTasks(this.project.tasks, this.project.epics, false);
+    return activeTasks
       .filter(
         (task) =>
           this.readyByDeps(task) &&
@@ -1252,15 +1754,25 @@ class LocalWorkflow {
     };
   }
 
-  private epicSummaries() {
-    const counts = new Map(this.project.epics.map((epic) => [epic.id, new Map<string, number>()]));
+  private epicSummaries(includeArchived = false) {
+    const visibleEpics = filterVisibleEpics(this.project.epics, includeArchived);
+    const counts = new Map(visibleEpics.map((epic) => [epic.id, new Map<string, number>()]));
     for (const task of this.project.tasks) {
       const entry = counts.get(task.epicId);
       entry?.set(task.status, (entry.get(task.status) ?? 0) + 1);
     }
-    return this.project.epics.map((epic) => ({
-      ...epic,
+    return visibleEpics.map((epic) => ({
+      id: epic.id,
+      title: epic.title,
+      description: epic.description,
       task_counts: Object.fromEntries(counts.get(epic.id) ?? []),
+      ...(epic.archived_at ? { archived_at: epic.archived_at } : {}),
+      ...(epic.summary
+        ? {
+            summary_version: epic.summary.version,
+            summary_updated_at: epic.summary.updated_at,
+          }
+        : {}),
     }));
   }
 
@@ -1272,7 +1784,7 @@ class LocalWorkflow {
   }
 
   private createTasks(input: Parsed<"create_tasks">): McpToolOutput<"create_tasks"> {
-    if (!this.project.epics.some((epic) => epic.id === input.epic_id))
+    if (!this.project.epics.some((epic) => epic.id === input.epic_id && !epic.archived_at))
       fail("not_found", "Epic tidak ditemukan di proyek ini.");
     const ids = new Map(input.tasks.map((task) => [task.ref, randomUUID()]));
     let position = (this.project.tasks.at(-1)?.position ?? -1) + 1;
@@ -1390,16 +1902,28 @@ class LocalWorkflow {
 
   private board(input: Parsed<"get_project_board">): McpToolOutput<"get_project_board"> {
     const personas = this.personas();
-    const epics = this.epicSummaries().filter(
+    const includeArchived = Boolean(input.include_archived);
+    const epics = this.epicSummaries(includeArchived).filter(
       (epic) => !input.epic_id || epic.id === input.epic_id,
     );
-    const rows = this.project.tasks.filter(
+    const visibleTasks = filterVisibleTasks(
+      this.project.tasks,
+      this.project.epics,
+      includeArchived,
+    );
+    const rows = visibleTasks.filter(
       (task) =>
         (!input.epic_id || task.epicId === input.epic_id) &&
+        (!input.task_id || task.id === input.task_id) &&
         (!input.status?.length || input.status.includes(task.status)),
     );
     return {
-      epics: epics.map(({ id, title, task_counts }) => ({ id, title, counts: task_counts })),
+      epics: epics.map(({ id, title, task_counts, archived_at }) => ({
+        id,
+        title,
+        counts: task_counts,
+        ...(archived_at ? { archived_at } : {}),
+      })),
       repos: this.repos().map((repo) => ({
         repo,
         personas: personas.filter((p) => p.repos.includes(repo)).map((p) => p.alias),
@@ -1421,9 +1945,31 @@ class LocalWorkflow {
         blocker_reason: task.blocker
           ? briefText(task.blocker.reason, input.verbose ? 1000 : 160)
           : null,
+        ...(task.archived_at ? { archived_at: task.archived_at } : {}),
       })),
       truncated: rows.length > input.limit,
     };
+  }
+
+  /** Bind decision to project, action, task content and its latest audit event (including ABA). */
+  private approvalSnapshot(task: LocalTask, action: ApprovalAction): string {
+    const latest = this.db
+      .prepare("SELECT max(id) AS id FROM task_events WHERE project_id = ? AND task_id = ?")
+      .get(this.config.project_id, task.id)?.id;
+    const { lease: _lease, review, ...content } = task;
+    const { lease: _reviewLease, ...reviewContent } = review ?? {};
+    // Ignore transient leases; membership of dependencies matters, not their read order.
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          this.config.project_id,
+          action,
+          latest ?? null,
+          { ...content, dependencies: [...content.dependencies].sort() },
+          reviewContent,
+        ]),
+      )
+      .digest("hex");
   }
 
   sessionBrief(verbose: boolean): {
@@ -1431,10 +1977,11 @@ class LocalWorkflow {
     hintSnapshot: SessionBriefHintSnapshot;
   } {
     const lines: McpToolOutput<"session_brief">["lines"] = [];
-    const ready = this.project.tasks.filter((task) => this.readyByDeps(task));
-    const blocked = this.project.tasks.filter((task) => task.status === "BLOCKED");
-    const draft = this.project.tasks.filter((task) => task.status === "DRAFT");
-    const needsReview = this.project.tasks.filter((task) => task.status === "NEEDS_REVIEW");
+    const activeTasks = filterVisibleTasks(this.project.tasks, this.project.epics, false);
+    const ready = activeTasks.filter((task) => this.readyByDeps(task));
+    const blocked = activeTasks.filter((task) => task.status === "BLOCKED");
+    const draft = activeTasks.filter((task) => task.status === "DRAFT");
+    const needsReview = activeTasks.filter((task) => task.status === "NEEDS_REVIEW");
     const approvalOptions = (taskId: string, kind: "plan" | "review") => [
       {
         id: "approve" as const,
@@ -1458,6 +2005,8 @@ class LocalWorkflow {
         title: briefText(task.title, 120),
         status: task.status,
         summary: briefText(task.instruction, verbose ? 160 : 120),
+        approval_snapshot: this.approvalSnapshot(task, "approve_plan"),
+        ...(task.verify_command ? { verify_command: task.verify_command } : {}),
         options: approvalOptions(task.id, "plan"),
       })),
       ...needsReview.slice(0, 5).map((task) => ({
@@ -1470,6 +2019,16 @@ class LocalWorkflow {
             "Needs review",
           verbose ? 160 : 120,
         ),
+        approval_snapshot: this.approvalSnapshot(task, "approve"),
+        ...(task.handoff
+          ? {
+              branch: task.handoff.git_branch,
+              commit: task.handoff.last_commit_hash,
+              ...(task.handoff.verification_command
+                ? { verify_command: task.handoff.verification_command }
+                : {}),
+            }
+          : {}),
         options: approvalOptions(task.id, "review"),
       })),
     ].slice(0, 10);
@@ -1717,7 +2276,9 @@ class LocalWorkflow {
     for (const task of active ? [active] : this.ready(input, 5)) {
       for (const handoff of this.dependencyHandoffs(task)) recent.set(handoff.task_id, handoff);
     }
-    const { skills } = await listSkills(this.root);
+    const catalog = await discoverSkillCatalog(this.root, {
+      platforms: this.config.platforms,
+    });
     return {
       project: {
         id: this.config.project_id,
@@ -1730,13 +2291,10 @@ class LocalWorkflow {
       ...(persona ? { persona } : {}),
       ...(epic
         ? {
-            epic_summary: `${epic.title}${epic.description ? `: ${epic.description}` : ""}`.slice(
-              0,
-              1000,
-            ),
+            epic_summary: resolveEpicSummaryText(epic, this.project.tasks, 1000),
           }
         : {}),
-      skills: skills.map(({ name, when_to_use }) => ({ name, when_to_use, repo_name: this.repo })),
+      skills: toSkillIndexEntries(catalog.entries, this.repo),
       recent_handoffs: [...recent.values()].slice(0, active ? undefined : 5),
       project_repos: this.repos(),
       documents: filterVisibleDocuments(this.project.documents, input.include_archived)
@@ -1750,6 +2308,24 @@ class LocalWorkflow {
   private async claim(input: Parsed<"claim_task">): Promise<McpToolOutput<"claim_task">> {
     const task = this.task(input.task_id);
     const { worktree } = input;
+    const run = this.taskRun(task);
+    if (run) {
+      this.assertHealthy(run);
+      const branch = runBranch(task.epicId, task.id);
+      if (run.plan.repo !== this.repo) fail("wrong_repo", "Run belongs to another repo.");
+      if (!worktree?.worktree_path || worktree.branch !== branch) {
+        fail("run_worktree", `Claim in linked checkout on ${branch}.`);
+      }
+      assertRunCheckout(this.root, runPrefix(task.epicId), branch, worktree.worktree_path);
+      if (
+        this.project.tasks.filter(
+          (other) => other.epicId === task.epicId && other.id !== task.id && other.lease,
+        ).length >= 2
+      ) {
+        fail("run_capacity", "Two run tasks already hold leases.");
+      }
+      assertDescends(this.root, run.plan.base_sha, localCommit(this.root, branch));
+    }
     const alias = input.agent_alias ?? this.config.overrides?.default_agent_alias;
     const persona = alias ? this.persona(alias) : undefined;
     const owner = task.persona ? this.persona(task.persona) : undefined;
@@ -1871,19 +2447,18 @@ class LocalWorkflow {
       const pack: ClaimContextPack = {};
       const epic = this.project.epics.find((item) => item.id === task.epicId);
       if (epic) {
-        pack.epic_summary = briefText(
-          `${epic.title}${epic.description ? `: ${epic.description}` : ""}`,
-          240,
-        );
+        pack.epic_summary = resolveEpicSummaryText(epic, this.project.tasks, 240);
       }
       const syncDoc = this.project.documents.find((d) => d.slug === "sync-board" && !d.archived_at);
       if (syncDoc) {
         const excerpt = extractSyncBoardExcerpt(syncDoc.content, task.id, task.persona);
         if (excerpt) pack.sync_board_excerpt = excerpt;
       }
-      const { skills } = await listSkills(this.root);
-      if (skills.length > 0) {
-        const hint = prioritizeSkills(skills, task);
+      const catalog = await discoverSkillCatalog(this.root, {
+        platforms: this.config.platforms,
+      });
+      if (catalog.entries.length > 0) {
+        const hint = prioritizeSkills(catalog.entries, task);
         if (hint.length > 0) pack.skills_hint = hint;
       }
       if (task.scope_files?.length && getGraphCounts(this.db, this.config.project_id).files > 0) {
@@ -1978,6 +2553,31 @@ class LocalWorkflow {
     const handoff = input.handoff_summary;
     if (task.branch && task.branch.name !== handoff.git_branch)
       fail("branch_mismatch", `Kirim handoff dari branch "${task.branch.name}".`);
+    const run = this.taskRun(task);
+    if (run) {
+      this.assertHealthy(run);
+      if (
+        handoff.pull_request ||
+        !fullSha.test(handoff.last_commit_hash) ||
+        localCommit(this.root, runBranch(task.epicId, task.id)) !== handoff.last_commit_hash
+      ) {
+        fail(
+          "run_handoff",
+          "Run handoff needs the current local branch tip (full SHA), without PR metadata.",
+        );
+      }
+      try {
+        runTaskChanges(this.root, run, this.project, task, handoff.last_commit_hash);
+      } catch (error) {
+        if (
+          !(error instanceof LocalServiceError) ||
+          !["run_scope", "run_risk"].includes(error.code)
+        )
+          throw error;
+        this.pauseRun(run, error.message);
+        this.runs.push(run);
+      }
+    }
     const fromStatus = task.status;
     const actor = task.lease?.alias ?? task.persona ?? this.caller;
     advance(task, "complete");
@@ -2052,8 +2652,40 @@ class LocalWorkflow {
     return updated;
   }
 
-  private manageTask(input: Parsed<"manage_task">): McpToolOutput<"manage_task"> {
+  manageTask(input: Parsed<"manage_task">, snapshot?: string): McpToolOutput<"manage_task"> {
     const task = this.task(input.task_id);
+    if (snapshot !== undefined) {
+      if (
+        !ApprovalSnapshotSchema.safeParse(snapshot).success ||
+        (input.action !== "approve_plan" && input.action !== "approve")
+      ) {
+        fail("invalid_input", "Snapshot hanya berlaku untuk persetujuan rencana atau handoff.");
+      }
+      if (task.stale || this.approvalSnapshot(task, input.action) !== snapshot) {
+        fail(
+          "stale_approval",
+          "Task berubah atau ditandai stale. Tinjau ulang dan minta persetujuan baru.",
+        );
+      }
+    }
+    if (task.archived_at) fail("already_archived", "Restore epic before editing archived task.");
+    const run = this.taskRun(task);
+    if (run) {
+      this.assertHealthy(run);
+      if (input.action === "approve") {
+        if (run.plan.repo !== this.repo) fail("wrong_repo", "Run belongs to another repo.");
+        if (!acceptedReview(run, task))
+          fail(
+            "run_review",
+            "Record delegated acceptance before requesting separate human handoff approval.",
+          );
+      } else {
+        fail(
+          "run_state",
+          "Record revisions through epic run review; close the run for manual governance changes.",
+        );
+      }
+    }
     const fromStatus = task.status;
     let stale: string[] = [];
     let unlocked: string[] | undefined;
@@ -2126,6 +2758,7 @@ class LocalWorkflow {
           from: fromStatus,
           to: task.status,
           ...(unlocked?.length ? { unlocked_task_ids: unlocked } : {}),
+          ...(snapshot !== undefined ? { dispatch: "conditional_cli" } : {}),
         },
       });
     }
@@ -2240,7 +2873,11 @@ class LocalWorkflow {
       for (const doc of filterVisibleDocuments(this.project.documents, input.include_archived))
         items.push({ source: "document", ref: doc.slug, title: doc.title, text: doc.content });
     if (sources.has("task"))
-      for (const task of this.tasks.values())
+      for (const task of filterVisibleTasks(
+        this.project.tasks,
+        this.project.epics,
+        input.include_archived,
+      ))
         items.push({
           source: "task",
           ref: task.id,
@@ -2248,13 +2885,17 @@ class LocalWorkflow {
           text: [task.instruction, task.feedback].filter(Boolean).join("\n"),
         });
     if (sources.has("skill")) {
-      const { skills } = await listSkills(this.root);
-      for (const skill of skills)
+      const catalog = await discoverSkillCatalog(this.root, {
+        platforms: this.config.platforms,
+      });
+      for (const skill of catalog.entries)
         items.push({
           source: "skill",
-          ref: `${this.repo}:${skill.name}`,
+          ref: skill.collision
+            ? `${this.repo}:${skill.source_id}:${skill.name}`
+            : `${this.repo}:${skill.name}`,
           title: skill.name,
-          text: skill.when_to_use,
+          text: `${skill.when_to_use} ${skill.source_path}`,
         });
     }
     const contextHits = items.length ? searchLocalContext(input.query, items, input.limit) : [];
@@ -2350,10 +2991,43 @@ class LocalWorkflow {
     if (status !== "NEEDS_REVIEW" && status !== "DONE" && status !== "REVISION_REQUESTED")
       fail("review_not_pending", "Tunggu handoff berikutnya.");
     const entry = this.reviewEntry(task, review, status);
-    if (input.action === "refresh") return { ...entry, notice: offlineReview };
+    if (input.action === "refresh") {
+      if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
+        return {
+          ...entry,
+          stale_commit: true,
+          warning: `Review tidak cocok: head SHA handoff sudah berubah. ${offlineReview}`,
+        };
+      }
+      const contextPack =
+        input.include_context === true
+          ? buildReviewContextPack({
+              repoRoot: this.root,
+              project: this.project,
+              task,
+              review,
+              compact: Boolean(input.compact),
+            })
+          : undefined;
+      const refreshed = {
+        ...entry,
+        notice: offlineReview,
+        ...(contextPack ? { review_context_pack: contextPack } : {}),
+      };
+      return input.include_context === true || input.compact === true
+        ? withReviewResponseByteLength(refreshed)
+        : refreshed;
+    }
     if (status !== "NEEDS_REVIEW")
       return { ...entry, warning: `Review tidak menunggu keputusan. ${offlineReview}` };
     if (input.action === "claim") {
+      if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
+        return {
+          ...entry,
+          stale_commit: true,
+          warning: `Review tidak diambil: head SHA handoff sudah berubah. ${offlineReview}`,
+        };
+      }
       const alias =
         input.agent_alias ??
         (this.config.overrides?.default_role === "reviewer"
@@ -2374,21 +3048,36 @@ class LocalWorkflow {
       };
       review.updatedAt = this.iso;
       this.dirty();
-      return {
+      const contextPack =
+        input.include_context === true
+          ? buildReviewContextPack({
+              repoRoot: this.root,
+              project: this.project,
+              task,
+              review,
+              compact: Boolean(input.compact),
+            })
+          : undefined;
+      const rawNotes = task.handoff?.notes_for_next_agent;
+      const notes =
+        rawNotes !== undefined && input.compact === true ? briefText(rawNotes, 160) : rawNotes;
+      const claimed = {
         ...this.reviewEntry(task, review, status),
         lease_id: leaseId,
         lease_expires_at: review.lease.expiresAt,
-        notes_for_next_agent: task.handoff?.notes_for_next_agent,
+        ...(notes !== undefined ? { notes_for_next_agent: notes } : {}),
         notice: offlineReview,
+        ...(contextPack ? { review_context_pack: contextPack } : {}),
       };
+      return input.include_context === true || input.compact === true
+        ? withReviewResponseByteLength(claimed)
+        : claimed;
     }
-    if (
-      !review.lease ||
-      !leaseMatches(review.lease.id, input.lease_id) ||
-      review.ref.head_sha !== input.head_sha
-    ) {
+    const staleSubmit = isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha });
+    if (!review.lease || !leaseMatches(review.lease.id, input.lease_id) || staleSubmit) {
       return {
         ...entry,
+        ...(staleSubmit ? { stale_commit: true as const } : {}),
         warning: `Review tidak disimpan: lease atau head SHA handoff tidak cocok. ${offlineReview}`,
       };
     }

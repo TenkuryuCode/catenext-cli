@@ -90,18 +90,17 @@ it.each(["change", "remove"])(
     const flags = opts("claim");
     const original = service.callTool.bind(service);
     const warn = vi.spyOn(console, "error").mockImplementation(() => {});
-    const spy = vi
-      .spyOn(service, "callTool")
-      .mockImplementation(async (name, input, beforeClaim) => {
-        if (name !== "claim_task" || !beforeClaim) return original(name, input, beforeClaim);
-        const validate = async () => {
-          expect((await lstat(`${service.stateFile}.lock`)).isFile()).toBe(true);
-          if (action === "change") git(flags.path, "switch", "-c", "feat/replacement");
-          else git(root, "worktree", "remove", "--", flags.path);
-          await beforeClaim();
-        };
-        return original(name, input, validate);
-      });
+    const spy = vi.spyOn(service, "callTool").mockImplementation(async (name, input, local) => {
+      const beforeClaim = local?.beforeClaim;
+      if (name !== "claim_task" || !beforeClaim) return original(name, input, local);
+      const validate = async () => {
+        expect((await lstat(`${service.stateFile}.lock`)).isFile()).toBe(true);
+        if (action === "change") git(flags.path, "switch", "-c", "feat/replacement");
+        else git(root, "worktree", "remove", "--", flags.path);
+        await beforeClaim();
+      };
+      return original(name, input, { beforeClaim: validate });
+    });
     await expect(taskClaim(service, id, flags)).rejects.toThrow(/telah berubah atau hilang/);
     spy.mockRestore();
     expect(warn.mock.calls.flat().join(" ")).not.toContain("Checkout tetap tersedia");

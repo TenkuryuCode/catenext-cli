@@ -72,7 +72,7 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   archive_document:
     "Soft-archive a project document by setting archived_at; hidden from default indexes.",
   restore_document: "Restore an archived project document so it appears in default indexes again.",
-  manage_task: "Assign, revise, unblock, or return tasks to draft. Approvals require CLI.",
+  manage_task: "Assign, revise, unblock, or return tasks to draft. MCP cannot approve.",
   review_pull_request: "Manage local PR review queue, claim, refresh, or submit recommendation.",
   get_project_context:
     "Read repo identity, persona rules, skill index, docs, and dependency handoffs.",

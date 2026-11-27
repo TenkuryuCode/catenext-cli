@@ -6,6 +6,7 @@ import {
   MASTER_MARKER,
   MASTER_PROMPT_FILE,
   PLATFORM_ENTRY_FILES,
+  renderMasterPrompt,
 } from "./agents/entry-pointers.js";
 import { CONFIG_PATH, configuredPlatforms, parseConfig, stateFilePath } from "./config.js";
 import { AGENTS_MD, BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./init/agents-md.js";
@@ -134,6 +135,8 @@ export async function planSync(opts: {
   const agents = await readRepoFile(root, AGENTS_MD);
   if (agents?.includes(BLOCK_START) || opts.force)
     add(AGENTS_MD, agents, upsertAgentsBlock(agents));
+  const master = await readRepoFile(root, MASTER_PROMPT_FILE);
+  if (master?.includes(MASTER_MARKER)) add(MASTER_PROMPT_FILE, master, renderMasterPrompt());
   return { edits, findings };
 }
 

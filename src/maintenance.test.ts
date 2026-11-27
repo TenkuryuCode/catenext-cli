@@ -40,6 +40,25 @@ describe("local sync", () => {
     expect((await planSync({ root, fix: false, defaultCommand: NEW })).edits).toEqual([]);
   });
 
+  it("refreshes managed approval instructions without touching config or user text", async () => {
+    await write("CATENEXT.md", "<!-- catenext:master -->\nOld master prompt\n");
+    await write(
+      AGENTS_MD,
+      `Team instructions\n\n${BLOCK_START}\nOld gate\n<!-- catenext:end -->\n`,
+    );
+    const opts = { root, fix: false, defaultCommand: NEW };
+    const { edits } = await planSync(opts);
+    expect(edits.map(({ path }) => path)).toEqual([AGENTS_MD, "CATENEXT.md"]);
+    expect(await read("CATENEXT.md")).toContain("Old master prompt");
+    await applyFileEdits(root, edits);
+    expect(await read(AGENTS_MD)).toContain("Team instructions");
+    expect(await read(AGENTS_MD)).toContain("--if-snapshot");
+    expect(await read("CATENEXT.md")).toContain("explicit human reply");
+    expect((await planSync(opts)).edits).toEqual([]);
+    await write("CATENEXT.md", "Custom master prompt\n");
+    expect((await planSync(opts)).edits).toEqual([]);
+  });
+
   it("repairs duplicates and stale commands only with --fix and keeps comments", async () => {
     const source =
       '{"mcpServers": {\n  "catenext":{"command":"catenext","args":["mcp"]},\n  // neighbor comment\n  "x"  : {"command":"x","args":[]},\n  "catenext":{"command":"/gone/node","args":["/gone/script.js","mcp"]},\n}}\n';

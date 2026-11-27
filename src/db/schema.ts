@@ -1,6 +1,19 @@
-/** SQLite DDL for local Catenext orchestration (schema version 7). */
+/** SQLite DDL for local Catenext orchestration (schema version 9). */
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 9;
+
+export const EPIC_RUNS_SQL = `
+CREATE TABLE IF NOT EXISTS epic_runs (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  epic_id TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0, 1)),
+  state_json TEXT NOT NULL,
+  PRIMARY KEY (project_id, epic_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_epic_runs_open_repo
+  ON epic_runs(project_id, repo) WHERE closed = 0;
+`;
 
 export const CODE_SEARCH_FILES_SQL = `
 CREATE TABLE IF NOT EXISTS code_search_files (
@@ -51,6 +64,8 @@ CREATE TABLE IF NOT EXISTS epics (
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   description TEXT,
+  summary_json TEXT,
+  archived_at TEXT,
   PRIMARY KEY (project_id, id)
 );
 
@@ -107,6 +122,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   scope_files_json TEXT,
   verify_command TEXT,
   doc_refs_json TEXT,
+  archived_at TEXT,
   position REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (project_id, id)
 );
@@ -196,4 +212,5 @@ CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project_id, kind);
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(project_id, path);
 
 ${CODE_SEARCH_FILES_SQL}
+${EPIC_RUNS_SQL}
 `;

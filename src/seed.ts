@@ -194,6 +194,7 @@ export function starterDocuments(
         "7. Missing research/fetch/browser (or other access): ask the human with ACCESS NEEDED — never invent results.",
         "8. Never publish credentials or critical secrets (handoffs/docs/git/PR) — cite paths only.",
         "9. Keep tool outputs brief; no code dumps.",
+        "10. Present one task UUID and transition at a time. Wait for an explicit direct human reply, then use the conditional CLI with the original card snapshot and verify the exact task on the board. Follow AGENTS.md. Ask separately before merging, tagging, or publishing.",
       ].join("\n"),
     },
     {
@@ -205,13 +206,13 @@ export function starterDocuments(
         "",
         "| Action | Who |",
         "| --- | --- |",
-        "| approve_plan | human |",
+        "| approve_plan / approve | human decision, dispatched via trusted local CLI |",
         "| edit_setup | human, orchestrator |",
         "| manage_roots | human, orchestrator |",
         "| upsert_persona | human, orchestrator |",
         "| remove_persona (MCP) | same gate as upsert_persona |",
         "",
-        "Human CLI remains the hard gate for approve / approve_plan.",
+        "MCP rejects both approvals for all roles. The orchestrator may dispatch the conditional CLI after explicit scoped chat confirmation; humans can still use the manual CLI. The host, not Catenext, establishes chat authorship and limits worker shell and SQLite access. A snapshot checks freshness, not authority.",
       ].join("\n"),
     },
     {

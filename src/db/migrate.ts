@@ -24,6 +24,7 @@ import { emptyExtendedProject, saveProject } from "./project-codec.js";
 import {
   CODE_SEARCH_FILES_SQL,
   CODE_SEARCH_FTS_SQL,
+  EPIC_RUNS_SQL,
   SCHEMA_SQL,
   SCHEMA_VERSION,
 } from "./schema.js";
@@ -216,7 +217,43 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       }
     },
   },
+  {
+    version: 8,
+    description: "Add opt-in local epic runs",
+    up(db) {
+      db.exec(EPIC_RUNS_SQL);
+    },
+  },
+  {
+    version: 9,
+    description: "Add epic summary_json and epic/task archived_at retention metadata",
+    up(db) {
+      db.exec(EPIC_RUNS_SQL);
+      ensureRetentionColumns(db);
+    },
+  },
 ];
+
+/** Idempotently ensure epic summary and epic/task archival columns exist on an open DB. */
+export function ensureRetentionColumns(db: DatabaseSync): void {
+  const epicColumns = new Set(
+    (db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]).map((col) => col.name),
+  );
+  if (epicColumns.size > 0) {
+    if (!epicColumns.has("summary_json")) {
+      db.exec("ALTER TABLE epics ADD COLUMN summary_json TEXT");
+    }
+    if (!epicColumns.has("archived_at")) {
+      db.exec("ALTER TABLE epics ADD COLUMN archived_at TEXT");
+    }
+  }
+  const taskColumns = new Set(
+    (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map((col) => col.name),
+  );
+  if (taskColumns.size > 0 && !taskColumns.has("archived_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN archived_at TEXT");
+  }
+}
 
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;

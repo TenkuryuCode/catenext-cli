@@ -73,13 +73,28 @@ const counts = (c: Record<string, number>) =>
     .map(([status, n]) => `${n} ${status}`)
     .join(", ") || "belum ada task";
 
-export async function epicList(service: LocalService, asJson: boolean) {
-  const res = await service.callTool("list_epics", {});
+export async function epicList(
+  service: LocalService,
+  asJson: boolean,
+  opts: { includeArchived?: boolean } = {},
+) {
+  const res = await service.callTool(
+    "list_epics",
+    opts.includeArchived ? { include_archived: true } : {},
+  );
   if (asJson) return console.log(JSON.stringify(res, null, 2));
   if (res.epics.length === 0) {
     return console.log('Belum ada epic. Buat dengan: catenext epic create "<judul>"');
   }
-  for (const e of res.epics) console.log(`${e.id}  ${e.title}  (${counts(e.task_counts)})`);
+  for (const e of res.epics) {
+    const flags = [
+      e.summary_version ? `summary v${e.summary_version}` : null,
+      e.archived_at ? "arsip" : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    console.log(`${e.id}  ${e.title}  (${counts(e.task_counts)})${flags ? `  [${flags}]` : ""}`);
+  }
 }
 
 export function epicTemplates(asJson: boolean) {
@@ -172,6 +187,96 @@ export async function epicUpdate(
   const updated = await service.updateEpic(epicId, body);
   if (opts.json) return console.log(JSON.stringify({ epic: updated }, null, 2));
   console.log(`✓ Epic "${updated.title}" diperbarui: ${updated.id}`);
+}
+
+export async function epicSummary(
+  service: LocalService,
+  epicId: string,
+  opts: {
+    refresh?: boolean;
+    overview?: string;
+    decision?: string[];
+    outcome?: string[];
+    risk?: string[];
+    expectedVersion?: string;
+    json?: boolean;
+  } = {},
+) {
+  const shouldWrite =
+    Boolean(opts.refresh) ||
+    opts.overview !== undefined ||
+    Boolean(opts.decision?.length) ||
+    Boolean(opts.outcome?.length) ||
+    Boolean(opts.risk?.length) ||
+    opts.expectedVersion !== undefined;
+
+  if (shouldWrite) {
+    if (opts.expectedVersion !== undefined && !/^\d+$/.test(opts.expectedVersion.trim())) {
+      throw new PlanningInputError("--expected-version harus bilangan bulat >= 0.");
+    }
+    const res = await service.saveEpicSummary(epicId, {
+      ...(opts.overview !== undefined ? { overview: opts.overview } : {}),
+      ...(opts.decision?.length ? { key_decisions: opts.decision } : {}),
+      ...(opts.outcome?.length ? { outcomes: opts.outcome } : {}),
+      ...(opts.risk?.length ? { unresolved_risks: opts.risk } : {}),
+      ...(opts.expectedVersion !== undefined
+        ? { expected_version: Number.parseInt(opts.expectedVersion, 10) }
+        : {}),
+    });
+    if (opts.json) return console.log(JSON.stringify(res, null, 2));
+    console.log(
+      `✓ Ringkasan epic "${res.title}" disimpan (v${res.summary.version}, ${res.summary.byte_length} byte).`,
+    );
+    console.log(`  ${res.excerpt}`);
+    return;
+  }
+
+  const res = await service.getEpicSummary(epicId);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  const ver = res.summary ? `v${res.summary.version}` : "belum disimpan";
+  const staleLabel = res.stale ? " (stale/fallback)" : "";
+  const archivedLabel = res.archived_at ? ` [arsip ${res.archived_at}]` : "";
+  console.log(`# ${res.title} (${ver}${staleLabel})${archivedLabel}`);
+  console.log(res.excerpt);
+}
+
+export async function epicArchive(
+  service: LocalService,
+  epicId: string,
+  opts: { dryRun?: boolean; json?: boolean } = {},
+) {
+  const res = await service.archiveEpic(epicId, { dry_run: Boolean(opts.dryRun) });
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  if (res.dry_run) {
+    console.log(
+      `[dry-run] Epic "${res.title}" (${res.epic_id}) — ${res.eligible ? "SIAP DIARSIPKAN" : "TIDAK BISA DIARSIPKAN"}`,
+    );
+    console.log(
+      `  Item: ${res.counts.task_count} task, ${res.counts.handoff_count} handoff, ${res.counts.event_count} event`,
+    );
+    console.log(
+      `  Estimasi payload: ${res.bytes.total_estimated_bytes} byte (task=${res.bytes.tasks_bytes}, handoff=${res.bytes.handoffs_bytes}, event=${res.bytes.events_bytes})`,
+    );
+    for (const blocker of res.blockers) {
+      console.log(`  ! [${blocker.code}] ${blocker.message}`);
+    }
+    return;
+  }
+  console.log(
+    `✓ Epic "${res.title}" (${res.epic_id}) diarsipkan pada ${res.archived_at} (${res.counts.task_count} task, summary v${res.summary_version ?? "-"}).`,
+  );
+}
+
+export async function epicRestore(
+  service: LocalService,
+  epicId: string,
+  opts: { json?: boolean } = {},
+) {
+  const res = await service.restoreEpic(epicId);
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(
+    `✓ Epic "${res.title}" (${res.epic_id}) dipulihkan (${res.restored_task_count} task aktif kembali).`,
+  );
 }
 
 export async function readJsonInput(file: string): Promise<unknown> {
@@ -424,15 +529,23 @@ export async function regenPersonaSubagents(
 /** Papan proyek lintas repo untuk orchestrator (setara get_project_board). */
 export async function boardShow(
   service: LocalService,
-  opts: { epic?: string; status?: string[]; json?: boolean },
+  opts: {
+    epic?: string;
+    task?: string;
+    status?: string[];
+    includeArchived?: boolean;
+    json?: boolean;
+  },
 ) {
   const body = prepare(
     GetProjectBoardInput,
     {
       ...(opts.epic ? { epic_id: opts.epic } : {}),
+      ...(opts.task ? { task_id: opts.task } : {}),
       ...(opts.status?.length ? { status: opts.status } : {}),
+      ...(opts.includeArchived ? { include_archived: true } : {}),
     },
-    ["epic_id", "status"],
+    ["epic_id", "task_id", "status", "include_archived"],
   );
   const res = await service.callTool("get_project_board", body);
   if (opts.json) return console.log(JSON.stringify(res, null, 2));

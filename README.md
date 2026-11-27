@@ -50,6 +50,12 @@ Orchestrator mengikuti **bahasa Anda** di chat; stub persona dan nama tool tetap
 Dokumen lokal (`sync-board`, blueprint): `catenext doc save|get` — baca ringkas dengan
 `--outline` / `--section`, arsip dengan `doc archive|restore` ([detail](#dokumen-dan-skill)).
 
+**v0.17.0 (source; npm belum publish):**
+- Epic run berbatas: `catenext epic run preview|start|resume|pause|close|review|verify`
+- Katalog skill terpadu: `skill list --user-skills` / `init|sync --user-skills` (read-only)
+- Context reviewer kompak: `review claim|refresh --include-context`
+- Ringkasan + arsip epic lokal: `epic summary|archive|restore`
+
 | Klien | `--platform` | Konfigurasi |
 | --- | --- | --- |
 | Claude Code | `claude-code` | `.mcp.json` + `CLAUDE.md` |
@@ -62,7 +68,8 @@ Dokumen lokal (`sync-board`, blueprint): `catenext doc save|get` — baca ringka
 `init` menulis config, entri MCP, `.gitignore`, **`CATENEXT.md`**, pointer platform, blok
 `AGENTS.md`, dan seed persona **yang cocok** dengan stack/repo. Tambah/hapus persona kapan saja:
 `catenext persona set|remove` — stub IDE di-regen otomatis (`--no-sync` untuk lewati;
-`--platform` untuk membatasi). Skill custom: `catenext skill list|create|set|remove|load`
+`--platform` untuk membatasi). Skill: `catenext skill list|create|set|remove|load`
+(tambah `--user-skills` untuk katalog global pengguna, read-only)
 ([detail](#orchestrator-dan-persona) · [skill](#dokumen-dan-skill) · [template](#template-lintas-proyek)).
 `catenext remove` membersihkan setup (file SQLite tetap, kecuali Anda hapus sendiri).
 
@@ -119,7 +126,7 @@ You are the **Catenext Orchestrator** for this repository. Never act as a worker
   2. Ask `--platform` (`cursor|claude-code|codex|antigravity|opencode|vscode`) and stack if unclear.
   3. Run `catenext init --platform <id> --dry-run`, apply `init`, run `catenext verify --platform <id>`, then tell the human to restart their IDE and trust the `catenext` MCP server.
 - Run `session_brief` (`catenext brief`) first — avoid dumping the full board unnecessarily.
-- If `pending_approvals` exist (`DRAFT` or `NEEDS_REVIEW`), stop and present each with `1) approve · 2) revise · 3) next` and wait. Approvals are CLI-human-only (`catenext task approve` / `catenext review approve`).
+- If `pending_approvals` exist, show one exact task UUID and transition (`DRAFT` to `TODO` or `NEEDS_REVIEW` to `DONE`) with evidence and options. Wait for an explicit direct human reply to that request. Then use the conditional CLI with the originally presented `approval_snapshot` and verify the exact task on the board. Follow `AGENTS.md`; if unavailable, ask the human to use the manual CLI. Never approve from MCP or infer authorization to merge, tag, or publish.
 
 ## 3. Context & Codebase Discipline
 - Read project docs (`blueprint`, `orchestrator`, `permissions`, `sync-board`) with `get_document` (`outline_only` / `section`) or `catenext doc get --outline|--section` to save tokens.
@@ -174,7 +181,7 @@ catenext done <task_id> --lease <lease_id> --notes "Exporter siap" --verify "pnp
 catenext review approve <task_id>        # manusia: NEEDS_REVIEW → DONE
 ```
 
-Persetujuan hanya lewat CLI manusia (`task approve` / `review approve`) — MCP agen tidak boleh approve.
+MCP tidak bisa menyetujui. Orchestrator boleh menjalankan `task approve` / `review approve` dengan `--if-snapshot <approval_snapshot>` dari kartu awal hanya setelah konfirmasi manusia yang eksplisit untuk tugas dan aksi itu. Verifikasi dengan `catenext board --task <id> --json`. Perintah manual tanpa flag tetap tersedia bagi manusia. Snapshot memeriksa perubahan state, bukan identitas; host harus mengendalikan akses shell dan SQLite worker. Izin merge, tag, atau publikasi tetap terpisah.
 Buntu: `catenext block <task_id> --category missing_env --reason "…"`.
 Lepas lease: `catenext release <task_id> --lease <lease_id>`.
 
@@ -273,6 +280,7 @@ sudah ada; `set` membuat atau memperbarui (field yang tidak diisi dipertahankan)
 
 ```bash
 catenext skill list
+catenext skill list --user-skills              # sertakan skill global pengguna (read-only)
 catenext skill create api-style --when-to-use "Saat menulis handler API" --file ./draft-api-style.md
 catenext skill set api-style --when-to-use "…"   # dan/atau --file
 catenext skill load cross-agent-sync
@@ -280,7 +288,22 @@ catenext skill load api-style --revision <sha>   # isi dari commit Git
 catenext skill remove api-style
 ```
 
+Katalog penemuan (`discoverSkillCatalog`) menyatukan `.catenext/skills`, skill native proyek,
+dan opsional skill global pengguna — tanpa menyalin, mengubah, atau mengeksekusi sumber.
 Portabilitas lintas repo: [template export/import](#template-lintas-proyek).
+
+**Epic run / arsip / review (v0.17.0):**
+
+```bash
+catenext epic run preview <epic_id>
+catenext epic run start <epic_id>
+catenext epic run resume <epic_id>
+catenext epic summary <epic_id> [--refresh]
+catenext epic archive <epic_id> [--dry-run]
+catenext epic restore <epic_id>
+catenext review claim <task_id> --include-context [--compact]
+catenext review refresh <task_id> --include-context [--compact]
+```
 
 - Jangan gabungkan `--outline` dengan `--section` pada `doc get`.
 - Arsip hanya set `archived_at`; isi tetap ada. Indeks default (`doc list`, `search`, konteks MCP)
@@ -308,8 +331,8 @@ catenext search "login handler" --code
 | Path | Isi |
 | --- | --- |
 | `.catenext/config.yaml` | Proyek, repo, layout, `state_file` |
-| `.catenext/catenext.sqlite` | Task, handoff, persona, dokumen, graf, indeks kode FTS5 (WAL bersih saat keluar) |
-| `.catenext/skills/` | Skill Markdown repo |
+| `.catenext/catenext.sqlite` | Task, handoff, persona, dokumen, graf, FTS5, `epic_runs`, ringkasan/arsip epic (**schema v9**; WAL bersih saat keluar) |
+| `.catenext/skills/` | Skill Markdown repo (+ katalog user-global opsional) |
 | `.catenext/cache/` | `cli-session-id` / indeks standalone (cache `*.json` lama dibersihkan otomatis) |
 | `CATENEXT.md` | Master prompt sesi baru |
 | `AGENTS.md` | Aturan orchestrator |
@@ -336,9 +359,10 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `task approve` / `review approve` | - (manusia) | Setujui rencana / handoff |
 | `revise` / `assign` | `manage_task` | Revisi / ganti penanggung jawab |
 | `persona list\|set\|remove` | `list_personas` / `upsert_persona` / `remove_persona` | Persona proyek (+ regen stub) |
-| `skill list\|create\|set\|remove\|load` | - | Skill Markdown di `.catenext/skills/` |
+| `skill list\|create\|set\|remove\|load` | - | Skill Markdown (+ `--user-skills` katalog global) |
 | `doc list\|get\|save\|archive\|restore` | `get_document` / `save_document` / `archive_document` / `restore_document` | Dokumen lokal (outline, section, arsip) |
-| `epic` / `task create\|update\|cancel\|deps` | planning tools (+ CRUD opt-in) | Rencana lokal |
+| `epic` / `epic run` / `epic summary\|archive\|restore` / `task …` | planning tools (+ CRUD opt-in) | Rencana, epic run berbatas, arsip lokal |
+| `review claim\|refresh --include-context` | review tools | Context pack reviewer hemat-token |
 | `doctor` | - | Diagnostik read-only |
 | `backup` / `restore` | - | Snapshot SQLite konsisten (`0600`) & pulihkan dengan cek integritas |
 | `mcp` | - | Stdio MCP (`--allow-crud` opt-in) |

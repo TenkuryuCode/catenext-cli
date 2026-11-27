@@ -9,6 +9,8 @@ import {
   type PlatformId,
   PlatformIdSchema,
   ReleaseTaskInput,
+  type SkillSourceId,
+  SkillSourceIdSchema,
   SUPPORTED_PLATFORMS,
 } from "@catenext/shared";
 import { Command, InvalidArgumentError } from "commander";
@@ -54,8 +56,11 @@ import {
   docList,
   docRestore,
   docSave,
+  epicArchive,
   epicCreate,
   epicList,
+  epicRestore,
+  epicSummary,
   epicTemplates,
   epicUpdate,
   PlanningInputError,
@@ -72,14 +77,11 @@ import {
   taskUpdate,
 } from "./planning.js";
 import {
-  listSkills,
-  loadSkill,
-  SkillError,
-  skillCreate,
-  skillList,
-  skillRemove,
-  skillSet,
-} from "./skills.js";
+  discoverSkillCatalog,
+  formatSkillCatalogSummary,
+  loadCatalogSkill,
+} from "./skill-catalog.js";
+import { SkillError, skillCreate, skillList, skillRemove, skillSet } from "./skills.js";
 import { planSubagents } from "./subagents.js";
 import {
   buildTemplateBundle,
@@ -186,6 +188,10 @@ program
   .option("--repo <name>", "repo_name untuk repo ini (default: nama folder)")
   .option("--mcp-command <cmd>", 'Perintah untuk menjalankan CLI ini, mis. "catenext"')
   .option("--no-agents-md", "Jangan tulis blok Catenext di AGENTS.md")
+  .option(
+    "--user-skills",
+    "Sertakan penemuan read-only skill global pengguna untuk platform pilihan",
+  )
   .option("--dry-run", "Tampilkan diff tanpa menulis ke disk")
   .option("-y, --yes", "Lewati interview TTY; pakai rekomendasi / flag")
   .addHelpText(
@@ -200,6 +206,7 @@ program
         repo?: string;
         mcpCommand?: string;
         agentsMd?: boolean;
+        userSkills?: boolean;
         dryRun?: boolean;
         yes?: boolean;
       } & PlatformOptions,
@@ -237,6 +244,7 @@ program
             platforms,
             personaSeed: answers.personaSeed,
             stack: answers.stack,
+            includeUserGlobalSkills: Boolean(opts.userSkills),
           });
           for (const line of formatInitDryRunPreview(preview)) console.log(line);
           console.log(`(dry-run) ${changes.length} file akan berubah. Tidak ada yang ditulis.`);
@@ -271,6 +279,12 @@ program
           for (const line of summarize(agentEdits)) console.log(line);
         }
 
+        const skillCatalog = await discoverSkillCatalog(root, {
+          platforms,
+          includeUserGlobal: Boolean(opts.userSkills),
+        });
+        for (const line of formatSkillCatalogSummary(skillCatalog)) console.log(line);
+
         console.log("");
         console.log(formatChecks(await verifySetup(root, config, platforms)));
         console.log(
@@ -282,12 +296,114 @@ program
 // --- Perencanaan lokal (memakai state yang sama dengan tool MCP) ---
 
 const epic = program.command("epic").description("Kelola epic proyek ini dari terminal");
+const epicRun = epic
+  .command("run")
+  .description("Bounded local run; needs a human or trusted host to drive each step");
+const runOutput = (result: unknown) => console.log(JSON.stringify(result, null, 2));
+for (const action of ["preview", "start"] as const) {
+  const cmd = epicRun
+    .command(action)
+    .argument("<epic_id>")
+    .requiredOption("--base <local-branch>")
+    .requiredOption(
+      "--check <command>",
+      "Trusted host's final verification command (not executed by Catenext)",
+    );
+  if (action === "start")
+    cmd.requiredOption("--if-snapshot <sha256>", "Digest from exact preview shown to human");
+  cmd.action((id: string, opts: { base: string; check: string; ifSnapshot: string }) =>
+    friendly(async () => {
+      const service = await cliService();
+      const { base, check } = opts;
+      const preview = await service.epicRun(id, { action: "preview", base, check });
+      if (action === "preview") return runOutput(preview);
+      if (!("max_worktrees" in preview) || preview.snapshot !== opts.ifSnapshot) {
+        throw new LocalServiceError(
+          "stale_approval",
+          "Plan changed since preview; inspect it and ask for new confirmation.",
+        );
+      }
+      console.error(JSON.stringify(preview, null, 2));
+      if (!(await confirm(`Authorize this exact local run (${opts.ifSnapshot})? [y/N] `))) {
+        throw new LocalServiceError(
+          "human_approval_required",
+          "Start requires interactive human confirmation; no non-interactive override.",
+        );
+      }
+      runOutput(
+        await service.epicRun(id, { action: "start", base, check, snapshot: opts.ifSnapshot }),
+      );
+    }),
+  );
+}
+for (const action of ["resume", "close"] as const) {
+  epicRun
+    .command(action)
+    .argument("<epic_id>")
+    .description(
+      action === "resume"
+        ? "Reconcile local progress and show eligible steps; does not dispatch workers"
+        : "End run governance; preserve tasks, branches and journal",
+    )
+    .action((id: string) =>
+      friendly(async () => runOutput(await (await cliService()).epicRun(id, { action }))),
+    );
+}
+epicRun
+  .command("pause")
+  .argument("<epic_id>")
+  .requiredOption("--reason <text>")
+  .action((id: string, { reason }: { reason: string }) =>
+    friendly(async () =>
+      runOutput(await (await cliService()).epicRun(id, { action: "pause", reason })),
+    ),
+  );
+epicRun
+  .command("review")
+  .argument("<epic_id>")
+  .requiredOption("--task <uuid>")
+  .requiredOption("--head <sha>")
+  .requiredOption("--reviewer <alias>")
+  .requiredOption("--decision <accept|request_changes>")
+  .requiredOption("--feedback <text>")
+  .description("Record trusted host's delegated review result; not human approval")
+  .action(
+    (
+      id: string,
+      opts: {
+        task: string;
+        head: string;
+        reviewer: string;
+        decision: "accept" | "request_changes";
+        feedback: string;
+      },
+    ) =>
+      friendly(async () =>
+        runOutput(await (await cliService()).epicRun(id, { action: "review", ...opts })),
+      ),
+  );
+epicRun
+  .command("verify")
+  .argument("<epic_id>")
+  .requiredOption("--head <sha>")
+  .requiredOption("--path <absolute-checkout>")
+  .requiredOption("--attempt <uuid>")
+  .requiredOption("--result <pass|fail>")
+  .description("Record trusted host's observed final check result at exact Git HEAD")
+  .action(
+    (id: string, opts: { head: string; path: string; attempt: string; result: "pass" | "fail" }) =>
+      friendly(async () =>
+        runOutput(await (await cliService()).epicRun(id, { action: "verify", ...opts })),
+      ),
+  );
+
 epic
   .command("list")
   .description("Daftar epic beserta jumlah task per status")
+  .option("--include-archived")
   .option("--json", "Keluaran JSON")
-  .action((opts: { json?: boolean }) =>
-    friendly(async () => epicList(await cliService(), Boolean(opts.json))),
+  .action((opts: { json?: boolean; includeArchived?: boolean }) =>
+    friendly(async () => epicList(await cliService(), Boolean(opts.json), opts)),
   );
 epic
   .command("templates")
@@ -321,6 +437,22 @@ epic
     friendly(async () => epicUpdate(await cliService(), epicId, opts)),
   );
 
+epic
+  .command("summary <id>")
+  .option("--refresh")
+  .option("--overview <text>")
+  .option("--expected-version <n>")
+  .option("--json")
+  .action((id, opts) => friendly(async () => epicSummary(await cliService(), id, opts)));
+epic
+  .command("archive <id>")
+  .option("--dry-run")
+  .option("--json")
+  .action((id, opts) => friendly(async () => epicArchive(await cliService(), id, opts)));
+epic
+  .command("restore <id>")
+  .option("--json")
+  .action((id, opts) => friendly(async () => epicRestore(await cliService(), id, opts)));
 const task = program.command("task").description("Ajukan dan kelola rencana task (masuk DRAFT)");
 task
   .command("create")
@@ -403,13 +535,15 @@ task
   .command("approve")
   .description("Setujui rencana satu task lokal (DRAFT menjadi TODO)")
   .argument("<task_id>")
+  .option("--if-snapshot <sha256>", "Tolak bila snapshot dari catenext brief sudah berubah")
   .option("--json", "Keluaran JSON")
-  .action((taskId: string, opts: { json?: boolean }) =>
+  .action((taskId: string, opts: { json?: boolean; ifSnapshot?: string }) =>
     friendly(async () =>
       taskManage(
         await cliService(),
         { action: "approve_plan", task_id: taskId },
         Boolean(opts.json),
+        opts.ifSnapshot,
       ),
     ),
   );
@@ -498,8 +632,10 @@ persona
 
 program
   .command("board")
+  .option("--include-archived")
   .description("Orchestrator: papan proyek lintas repo (task, status, persona, repo)")
   .option("--epic <id>", "Batasi ke satu epic")
+  .option("--task <id>", "Batasi ke satu task")
   .option(
     "--status <status>",
     "Filter status (boleh diulang)",
@@ -507,7 +643,7 @@ program
     [] as string[],
   )
   .option("--json", "Keluaran JSON")
-  .action((opts: { epic?: string; status: string[]; json?: boolean }) =>
+  .action((opts: { epic?: string; task?: string; status: string[]; json?: boolean }) =>
     friendly(async () => boardShow(await cliService(), opts)),
   );
 
@@ -1189,10 +1325,16 @@ review
     "Catat persetujuan akhir lokal (NEEDS_REVIEW menjadi DONE); tidak memverifikasi merge PR",
   )
   .argument("<task_id>")
+  .option("--if-snapshot <sha256>", "Tolak bila snapshot dari catenext brief sudah berubah")
   .option("--json", "Keluaran JSON")
-  .action((taskId: string, opts: { json?: boolean }) =>
+  .action((taskId: string, opts: { json?: boolean; ifSnapshot?: string }) =>
     friendly(async () =>
-      taskManage(await cliService(), { action: "approve", task_id: taskId }, Boolean(opts.json)),
+      taskManage(
+        await cliService(),
+        { action: "approve", task_id: taskId },
+        Boolean(opts.json),
+        opts.ifSnapshot,
+      ),
     ),
   );
 review
@@ -1208,25 +1350,67 @@ review
   .command("claim")
   .argument("<task_id>")
   .option("--as <alias>", "Persona reviewer")
+  .option("--sha <sha>", "Pastikan head SHA handoff masih cocok")
+  .option("--include-context", "Sertakan review_context_pack terikat batas byte")
+  .option("--compact", "Ringkas konteks dan catatan review")
   .option("--json")
-  .action((taskId: string, opts: { as?: string; json?: boolean }) =>
-    friendly(async () =>
-      taskReview(
-        await cliService(),
-        { action: "claim", task_id: taskId, agent_alias: opts.as },
-        Boolean(opts.json),
+  .action(
+    (
+      taskId: string,
+      opts: {
+        as?: string;
+        sha?: string;
+        includeContext?: boolean;
+        compact?: boolean;
+        json?: boolean;
+      },
+    ) =>
+      friendly(async () =>
+        taskReview(
+          await cliService(),
+          {
+            action: "claim",
+            task_id: taskId,
+            agent_alias: opts.as,
+            ...(opts.sha !== undefined ? { head_sha: opts.sha } : {}),
+            ...(opts.includeContext !== undefined ? { include_context: opts.includeContext } : {}),
+            ...(opts.compact !== undefined ? { compact: opts.compact } : {}),
+          },
+          Boolean(opts.json),
+        ),
       ),
-    ),
   );
 review
   .command("refresh")
   .description("Baca informasi PR yang tercatat lokal; tidak meminta status dari host Git")
   .argument("<task_id>")
+  .option("--sha <sha>", "Pastikan head SHA handoff masih cocok")
+  .option("--include-context", "Sertakan review_context_pack terikat batas byte")
+  .option("--compact", "Ringkas konteks dan catatan review")
   .option("--json")
-  .action((taskId: string, opts: { json?: boolean }) =>
-    friendly(async () =>
-      taskReview(await cliService(), { action: "refresh", task_id: taskId }, Boolean(opts.json)),
-    ),
+  .action(
+    (
+      taskId: string,
+      opts: {
+        sha?: string;
+        includeContext?: boolean;
+        compact?: boolean;
+        json?: boolean;
+      },
+    ) =>
+      friendly(async () =>
+        taskReview(
+          await cliService(),
+          {
+            action: "refresh",
+            task_id: taskId,
+            ...(opts.sha !== undefined ? { head_sha: opts.sha } : {}),
+            ...(opts.includeContext !== undefined ? { include_context: opts.includeContext } : {}),
+            ...(opts.compact !== undefined ? { compact: opts.compact } : {}),
+          },
+          Boolean(opts.json),
+        ),
+      ),
   );
 review
   .command("submit")
@@ -1266,13 +1450,21 @@ review
 
 const skill = program
   .command("skill")
-  .description("Kelola skill repo Markdown di .catenext/skills");
+  .description("Kelola skill repo Markdown di .catenext/skills dan temukan skill native");
 skill
   .command("list")
-  .description("Daftar skill valid di repo (indeks name + when_to_use)")
+  .description("Daftar skill valid di repo dan katalog skill native terpasang")
+  .option(...PLATFORM_OPT)
+  .option("--user-skills", "Sertakan penemuan read-only skill global pengguna")
   .option("--json", "Keluaran JSON")
-  .action((opts: { json?: boolean }) =>
-    friendly(async () => skillList(await requireRoot(), { json: opts.json })),
+  .action((opts: { json?: boolean; userSkills?: boolean } & PlatformOptions) =>
+    friendly(async () =>
+      skillList((await findProjectRoot()) ?? process.cwd(), {
+        json: opts.json,
+        platforms: opts.platform,
+        includeUserGlobal: Boolean(opts.userSkills),
+      }),
+    ),
   );
 skill
   .command("create")
@@ -1316,19 +1508,48 @@ skill
   );
 skill
   .command("load")
-  .description("Baca skill repo dari checkout atau revisi Git")
+  .description("Baca skill dari katalog lokal atau revisi Git (.catenext/skills)")
   .argument("<name>")
   .option("--revision <sha>", "SHA commit Git untuk paritas lintas perangkat")
+  .option("--source <id>", "Pilih source_id spesifik bila ada kolisi nama skill", (val: string) => {
+    const parsed = SkillSourceIdSchema.safeParse(val.trim());
+    if (!parsed.success) {
+      throw new InvalidArgumentError(`source_id tidak valid: ${JSON.stringify(val)}.`);
+    }
+    return parsed.data;
+  })
+  .option(...PLATFORM_OPT)
+  .option("--user-skills", "Izinkan memuat dari sumber skill global pengguna")
   .option("--json")
-  .action((name: string, opts: { revision?: string; json?: boolean }) =>
-    friendly(async () => {
-      const skillBody = await loadSkill(await requireRoot(), name, opts.revision);
-      console.log(
-        opts.json
-          ? JSON.stringify({ ...skillBody, revision: opts.revision }, null, 2)
-          : skillBody.content,
-      );
-    }),
+  .action(
+    (
+      name: string,
+      opts: {
+        revision?: string;
+        source?: SkillSourceId;
+        userSkills?: boolean;
+        json?: boolean;
+      } & PlatformOptions,
+    ) =>
+      friendly(async () => {
+        const root = (await findProjectRoot()) ?? process.cwd();
+        const config = await readConfig(root).catch(() => null);
+        const skillBody = await loadCatalogSkill(root, name, {
+          platforms: opts.platform?.length ? opts.platform : config?.platforms,
+          includeUserGlobal: Boolean(opts.userSkills),
+          sourceId: opts.source,
+          revision: opts.revision,
+        });
+        console.log(
+          opts.json
+            ? JSON.stringify(
+                { ...skillBody, ...(opts.revision ? { revision: opts.revision } : {}) },
+                null,
+                2,
+              )
+            : skillBody.content,
+        );
+      }),
   );
 
 const templateCmd = program
@@ -1403,12 +1624,13 @@ templateCmd
 function confirm(question: string): Promise<boolean> {
   if (!process.stdin.isTTY) return Promise.resolve(false);
   const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((res) =>
+  return new Promise((res) => {
+    rl.once("close", () => res(false));
     rl.question(question, (a) => {
-      rl.close();
       res(/^(y|ya|yes)$/i.test(a.trim()));
-    }),
-  );
+      rl.close();
+    });
+  });
 }
 
 program
@@ -1428,64 +1650,78 @@ program
   .command("sync")
   .description("Selaraskan entri MCP, .gitignore, dan petunjuk agen; periksa skill repo lokal")
   .option(...PLATFORM_OPT)
+  .option(
+    "--user-skills",
+    "Sertakan penemuan read-only skill global pengguna untuk platform pilihan",
+  )
   .option("--dry-run", "Tampilkan perubahan tanpa menulis ke disk")
   .option("--fix", "Perbaiki entri MCP yang duplikat, basi (path hilang), atau file yang rusak")
   .option("--force", "Paksa perbarui entri MCP, CATENEXT.md, pointer platform, dan stub agen")
-  .action((opts: { dryRun?: boolean; fix?: boolean; force?: boolean } & PlatformOptions) =>
-    friendly(async () => {
-      const root = await requireRoot();
-      const config = await readConfig(root);
-      const plan = await planSync({
-        root,
-        platforms: opts.platform,
-        fix: Boolean(opts.fix),
-        force: Boolean(opts.force),
-        defaultCommand: defaultMcpCommand,
-      });
-      for (const f of plan.findings) console.log(`${f.level === "ok" ? "•" : "!"} ${f.message}`);
-
-      const { skills, invalid } = await listSkills(root);
-      console.log(`• ${skills.length} skill lokal valid.`);
-      for (const i of invalid) console.log(`! Skill dilewati: ${i.error}`);
-      for (const l of summarize(plan.edits)) console.log(l);
-      if (opts.dryRun) {
-        console.log(`(dry-run) ${plan.edits.length} file akan berubah. Tidak ada yang ditulis.`);
-        return;
-      }
-      await applyFileEdits(root, plan.edits);
-      const fixable = plan.findings.some((f) => f.level === "fixable");
-      if (plan.edits.length === 0 && !fixable) console.log("✓ File lokal sudah selaras.");
-
-      {
+  .action(
+    (
+      opts: {
+        dryRun?: boolean;
+        fix?: boolean;
+        force?: boolean;
+        userSkills?: boolean;
+      } & PlatformOptions,
+    ) =>
+      friendly(async () => {
+        const root = await requireRoot();
+        const config = await readConfig(root);
         const platforms = opts.platform?.length ? opts.platform : configuredPlatforms(config);
-        const service = await cliService(root);
-        const { personas } = await service.callTool("list_personas", {});
-        const sub = await planSubagents(
+        const plan = await planSync({
           root,
-          personas,
+          platforms: opts.platform,
+          fix: Boolean(opts.fix),
+          force: Boolean(opts.force),
+          defaultCommand: defaultMcpCommand,
+        });
+        for (const f of plan.findings) console.log(`${f.level === "ok" ? "•" : "!"} ${f.message}`);
+
+        const skillCatalog = await discoverSkillCatalog(root, {
           platforms,
-          {
-            stack: config.stack ?? [],
-            repoName: config.repo_name,
-            layout: config.layout,
-          },
-          { force: Boolean(opts.force) },
-        );
-        const { planEntryPointers } = await import("./agents/entry-pointers.js");
-        const pointers = await planEntryPointers(root, platforms, { force: Boolean(opts.force) });
-        const agentEdits = [...sub.edits, ...pointers];
-        await applyFileEdits(root, agentEdits);
-        for (const l of summarize(agentEdits)) console.log(l);
-        for (const path of sub.skipped)
-          console.log(`! ${path} already exists and is not Catenext-managed; skipped.`);
-        console.log(
-          `✓ ${personas.length} persona(s) + orchestrator stubs for: ${platforms.join(", ") || "none"}. New session → CATENEXT.md then AGENTS.md.`,
-        );
-      }
-      const checks = await verifySetup(root, await readConfig(root), opts.platform);
-      console.log(`\n${formatChecks(checks)}`);
-      if (fixable || checks.some((check) => !check.ok)) process.exitCode = 1;
-    }),
+          includeUserGlobal: Boolean(opts.userSkills),
+        });
+        for (const line of formatSkillCatalogSummary(skillCatalog)) console.log(line);
+        for (const l of summarize(plan.edits)) console.log(l);
+        if (opts.dryRun) {
+          console.log(`(dry-run) ${plan.edits.length} file akan berubah. Tidak ada yang ditulis.`);
+          return;
+        }
+        await applyFileEdits(root, plan.edits);
+        const fixable = plan.findings.some((f) => f.level === "fixable");
+        if (plan.edits.length === 0 && !fixable) console.log("✓ File lokal sudah selaras.");
+
+        {
+          const service = await cliService(root);
+          const { personas } = await service.callTool("list_personas", {});
+          const sub = await planSubagents(
+            root,
+            personas,
+            platforms,
+            {
+              stack: config.stack ?? [],
+              repoName: config.repo_name,
+              layout: config.layout,
+            },
+            { force: Boolean(opts.force) },
+          );
+          const { planEntryPointers } = await import("./agents/entry-pointers.js");
+          const pointers = await planEntryPointers(root, platforms, { force: Boolean(opts.force) });
+          const agentEdits = [...sub.edits, ...pointers];
+          await applyFileEdits(root, agentEdits);
+          for (const l of summarize(agentEdits)) console.log(l);
+          for (const path of sub.skipped)
+            console.log(`! ${path} already exists and is not Catenext-managed; skipped.`);
+          console.log(
+            `✓ ${personas.length} persona(s) + orchestrator stubs for: ${platforms.join(", ") || "none"}. New session → CATENEXT.md then AGENTS.md.`,
+          );
+        }
+        const checks = await verifySetup(root, await readConfig(root), opts.platform);
+        console.log(`\n${formatChecks(checks)}`);
+        if (fixable || checks.some((check) => !check.ok)) process.exitCode = 1;
+      }),
   );
 
 program

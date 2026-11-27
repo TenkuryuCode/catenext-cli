@@ -6,9 +6,31 @@ export const SKILL_LIMITS = {
   maxWhenToUseLength: 160,
   /** Blok kode pendek (perintah, contoh nama) boleh; code dump tidak. */
   maxCodeBlockLines: 15,
+  maxCatalogEntries: 64,
+  maxNativeFileBytes: 65536,
+  maxDiscoveryDepth: 6,
+  maxEntriesPerRoot: 128,
 } as const;
 
 export const SkillNameSchema = SlugSchema.max(48);
+
+export const SKILL_SOURCE_KINDS = ["repo", "project", "user"] as const;
+export const SkillSourceKindSchema = z.enum(SKILL_SOURCE_KINDS);
+export type SkillSourceKind = z.infer<typeof SkillSourceKindSchema>;
+
+export const SkillSourceIdSchema = z
+  .string()
+  .min(4)
+  .max(64)
+  .regex(/^(?:repo|[a-z0-9-]+:(?:project|user)):[a-z0-9./_-]+$/);
+export type SkillSourceId = z.infer<typeof SkillSourceIdSchema>;
+
+export const SkillCatalogKeySchema = z
+  .string()
+  .min(6)
+  .max(120)
+  .regex(/^(?:repo|[a-z0-9-]+:(?:project|user)):[a-z0-9./_-]+:[a-z0-9]+(?:[-_][a-z0-9]+)*$/);
+export type SkillCatalogKey = z.infer<typeof SkillCatalogKeySchema>;
 
 export const SkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
@@ -53,6 +75,10 @@ export const SkillIndexEntrySchema = z.object({
   name: SkillNameSchema,
   when_to_use: z.string().min(1).max(SKILL_LIMITS.maxWhenToUseLength),
   repo_name: RepoNameSchema,
+  source_id: SkillSourceIdSchema.optional(),
+  source_kind: SkillSourceKindSchema.optional(),
+  source_path: z.string().min(1).max(240).optional(),
+  collision: z.boolean().optional(),
 });
 export type SkillIndexEntry = z.infer<typeof SkillIndexEntrySchema>;
 

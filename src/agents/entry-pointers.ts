@@ -64,7 +64,7 @@ export function renderMasterPrompt(): string {
     "## First 60 seconds",
     "",
     "1. Read **[AGENTS.md](./AGENTS.md)** and check project stack in `.catenext/config.yaml`.",
-    "2. Call `session_brief` (`catenext brief`); if `pending_approvals` exist, ask `1) approve · 2) revise · 3) next` first.",
+    "2. Call `session_brief` (`catenext brief`); if `pending_approvals` exist, present one exact task/action and wait for its explicit human reply. Follow the conditional CLI and board verification rules in AGENTS.md.",
     "3. Kickoff brainstorm with relevant personas → save `sync-board`, plan DRAFT tasks, await approval, then delegate.",
     "",
   ].join("\n");

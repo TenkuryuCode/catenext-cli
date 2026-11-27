@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AgentAliasSchema, IdSchema, RepoNameSchema } from "./common.js";
-import { TaskStatusSchema } from "./task.js";
+import { TaskStatusSchema, TaskVerifyCommandSchema } from "./task.js";
 
 /** Cap free-form strings in compact MCP payloads. */
 export const BRIEF_LIMITS = {
@@ -55,6 +55,17 @@ export const PendingApprovalSchema = z.object({
   status: TaskStatusSchema,
   summary: z.string().max(BRIEF_LIMITS.line),
   options: z.array(ApprovalOptionSchema).max(5),
+  /** Freshness guard for conditional CLI dispatch; not an authorization credential. */
+  approval_snapshot: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  branch: z.string().max(255).optional(),
+  commit: z
+    .string()
+    .regex(/^[a-f0-9]{7,64}$/)
+    .optional(),
+  verify_command: TaskVerifyCommandSchema.optional(),
 });
 
 export const WorkspaceRootSchema = z.object({

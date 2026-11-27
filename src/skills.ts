@@ -5,16 +5,20 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import {
   CommitShaSchema,
+  type PlatformId,
   SKILL_LIMITS,
   SkillContentSchema,
   SkillFrontmatterSchema,
   SkillNameSchema,
+  type SkillSourceId,
+  type SkillSourceKind,
   skillPath,
 } from "@catenext/shared";
 import { parse, stringify } from "yaml";
-import { isMissingFile } from "./config.js";
+import { isMissingFile, readConfig } from "./config.js";
 import { readRepoFile } from "./init/repo-files.js";
 import { scrubText } from "./scrubber.js";
+import { discoverSkillCatalog } from "./skill-catalog.js";
 
 /** Repository skills live in Markdown files; the index exposes only names and usage hints. */
 export const SKILLS_DIR = join(".catenext", "skills");
@@ -36,6 +40,10 @@ export interface Skill {
 export interface SkillIndexItem {
   name: string;
   when_to_use: string;
+  source_id?: SkillSourceId;
+  source_kind?: SkillSourceKind;
+  source_path?: string;
+  collision?: boolean;
 }
 
 const exec = promisify(execFile);
@@ -234,21 +242,72 @@ async function readSkillBody(file: string): Promise<string> {
 }
 
 /** `catenext skill list` */
-export async function skillList(root: string, opts: { json?: boolean }): Promise<void> {
-  const { skills, invalid } = await listSkills(root);
-  const index = skillIndex(skills);
+export async function skillList(
+  root: string,
+  opts: {
+    json?: boolean;
+    platforms?: readonly PlatformId[];
+    includeUserGlobal?: boolean;
+    homeDir?: string;
+  },
+): Promise<void> {
+  const config = await readConfig(root).catch(() => null);
+  const platforms = opts.platforms?.length ? opts.platforms : config?.platforms;
+  const [{ skills: repoSkills, invalid }, catalog] = await Promise.all([
+    listSkills(root),
+    discoverSkillCatalog(root, {
+      platforms,
+      includeUserGlobal: opts.includeUserGlobal,
+      homeDir: opts.homeDir,
+    }),
+  ]);
+  const hasNative = catalog.entries.some((e) => e.source_kind !== "repo");
+  const index: SkillIndexItem[] = hasNative
+    ? catalog.entries.map((e) => ({
+        name: e.name,
+        when_to_use: e.when_to_use,
+        source_id: e.source_id,
+        source_kind: e.source_kind,
+        source_path: e.source_path,
+        ...(e.collision ? { collision: true } : {}),
+      }))
+    : skillIndex(repoSkills);
+  const nativeInvalid = catalog.skipped
+    .filter((s) => s.source_id !== "repo:.catenext/skills")
+    .map((s) => ({ file: s.path, error: s.reason }));
+  const allInvalid = [...invalid, ...nativeInvalid];
   if (opts.json) {
-    console.log(JSON.stringify({ skills: index, invalid }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          skills: index,
+          invalid: allInvalid,
+          ...(hasNative || opts.includeUserGlobal
+            ? { sources: catalog.sources, collisions: catalog.collisions }
+            : {}),
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
-  if (index.length === 0 && invalid.length === 0) {
+  if (index.length === 0 && allInvalid.length === 0) {
     console.log(
       'Belum ada skill. Buat dengan: catenext skill create <name> --when-to-use "..." --file <path.md>',
     );
     return;
   }
-  for (const s of index) console.log(`${s.name}  ${s.when_to_use}`);
-  for (const i of invalid) console.log(`! Skill dilewati: ${i.error}`);
+  for (const s of index) {
+    const tag =
+      s.source_kind && s.source_kind !== "repo"
+        ? ` [${s.source_id}${s.collision ? ", collision" : ""}]`
+        : s.collision
+          ? ` [${s.source_id}, collision]`
+          : "";
+    console.log(`${s.name}${tag}  ${s.when_to_use}`);
+  }
+  for (const i of allInvalid) console.log(`! Skill dilewati: ${i.error}`);
 }
 
 /** `catenext skill create` — gagal bila file sudah ada. */

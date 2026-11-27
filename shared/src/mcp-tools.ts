@@ -45,6 +45,8 @@ import {
   SkillContentSchema,
   SkillIndexEntrySchema,
   SkillNameSchema,
+  SkillSourceIdSchema,
+  SkillSourceKindSchema,
 } from "./skill.js";
 import {
   BlockerCategorySchema,
@@ -143,12 +145,15 @@ export const GetProjectContextOutput = z.object({
 
 /** Tampilan seluruh proyek lintas repo untuk orchestrator: siapa memegang apa, apa berikutnya. */
 export const GetProjectBoardInput = z.object({
+  task_id: IdSchema.optional(),
   epic_id: IdSchema.optional(),
   /** Tanpa filter: semua status. */
   status: z.array(TaskStatusSchema).max(7).optional(),
   limit: z.number().int().min(1).max(200).default(100),
   /** Include longer blocker text; default compact. */
   verbose: z.boolean().optional(),
+  /** Sertakan epic dan task yang sudah diarsipkan; default hanya yang aktif. */
+  include_archived: z.boolean().optional(),
 });
 export const BoardTaskSchema = z.object({
   id: IdSchema,
@@ -166,6 +171,7 @@ export const BoardTaskSchema = z.object({
   /** Repo yang sedang memegang lease (IN_PROGRESS). */
   locked_by_repo: RepoNameSchema.nullable(),
   blocker_reason: z.string().nullable(),
+  archived_at: IsoDateTimeSchema.nullable().optional(),
 });
 export const GetProjectBoardOutput = z.object({
   epics: z.array(
@@ -173,6 +179,7 @@ export const GetProjectBoardOutput = z.object({
       id: IdSchema,
       title: z.string(),
       counts: z.record(z.string(), z.number().int()),
+      archived_at: IsoDateTimeSchema.nullable().optional(),
     }),
   ),
   /** Repo yang dikenal proyek (dari task, skill, dan persona) beserta persona pemegangnya. */
@@ -439,12 +446,17 @@ export const CreateTasksOutput = z.object({
 export const LoadSkillInput = z.object({
   name: SkillNameSchema,
   revision: CommitShaSchema.optional(),
+  source_id: SkillSourceIdSchema.optional(),
 });
 export const LoadSkillOutput = z.object({
   name: SkillNameSchema,
   revision: CommitShaSchema.optional(),
   when_to_use: z.string(),
   content: z.string(),
+  source_id: SkillSourceIdSchema.optional(),
+  source_kind: SkillSourceKindSchema.optional(),
+  source_path: z.string().optional(),
+  collision: z.boolean().optional(),
 });
 
 // --- save_repo_skill --------------------------------------------------------
@@ -467,9 +479,15 @@ const EpicSummarySchema = z.object({
   description: z.string().nullable(),
   /** Jumlah task per status, mis. { DRAFT: 3, TODO: 1 }. */
   task_counts: z.record(z.string(), z.number().int().min(0)),
+  archived_at: IsoDateTimeSchema.nullable().optional(),
+  summary_version: z.number().int().min(1).optional(),
+  summary_updated_at: IsoDateTimeSchema.nullable().optional(),
 });
 
-export const ListEpicsInput = z.object({});
+export const ListEpicsInput = z.object({
+  /** Sertakan epic yang sudah diarsipkan; default hanya epic aktif. */
+  include_archived: z.boolean().optional(),
+});
 export const ListEpicsOutput = z.object({
   epics: z.array(EpicSummarySchema),
 });
@@ -610,7 +628,7 @@ export const MCP_TOOLS = {
     RestoreDocumentOutput,
   ),
   manage_task: tool(
-    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; return_to_draft menarik kembali TODO; unblock mengembalikan BLOCKED -> TODO. Persetujuan hanya lewat CLI manusia: `catenext task approve <id>` atau `catenext review approve <id>`.",
+    "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; return_to_draft menarik kembali TODO; unblock mengembalikan BLOCKED -> TODO. MCP tidak dapat menyetujui. Setelah persetujuan eksplisit manusia, gunakan CLI bersyarat atau minta manusia menjalankan: `catenext task approve <id>` atau `catenext review approve <id>`.",
     ManageTaskInput,
     ManageTaskOutput,
   ),
@@ -645,7 +663,7 @@ export const MCP_TOOLS = {
     ReportBlockerOutput,
   ),
   create_tasks: tool(
-    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT; setujui lewat CLI manusia `catenext task approve`).",
+    "Ajukan rencana task berdependensi untuk sebuah epic (masuk sebagai DRAFT; persetujuan manusia diproses lewat CLI `catenext task approve`, bukan MCP).",
     CreateTasksInput,
     CreateTasksOutput,
   ),

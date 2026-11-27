@@ -51,3 +51,26 @@ it("honors persona seed none in preview output", async () => {
   expect(preview.personaAliases).toEqual([]);
   expect(formatInitDryRunPreview(preview).join("\n")).toContain("personas: (lewati)");
 });
+
+it("discovers pre-existing native skills during init dry-run preview without modifying them", async () => {
+  const claudeSkillDir = join(root, ".claude", "skills", "existing-audit");
+  await mkdir(claudeSkillDir, { recursive: true });
+  await writeFile(
+    join(claudeSkillDir, "SKILL.md"),
+    "---\ndescription: Existing audit skill before init\n---\nAudit instructions.\n",
+  );
+  const changes = await planInit({ root, platforms: ["claude-code"], mcpCommand: CMD });
+  const preview = await planInitDryRunPreview({
+    root,
+    changes,
+    platforms: ["claude-code"],
+    personaSeed: "matched",
+    stack: ["hono"],
+  });
+  expect(preview.skillCatalog.entries.map((e) => [e.name, e.source_id])).toEqual([
+    ["existing-audit", "claude-code:project:.claude/skills"],
+  ]);
+  expect(formatInitDryRunPreview(preview).join("\n")).toContain(
+    "1 skill terdeteksi (0 repo, 1 native: .claude/skills (1))",
+  );
+});

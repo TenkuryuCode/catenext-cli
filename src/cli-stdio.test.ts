@@ -272,6 +272,144 @@ function doctor(...flags: string[]) {
 }
 
 describe("CLI dan MCP stdio lokal", () => {
+  it("conditionally approves exactly the presented plan and handoff, with no MCP writer", async () => {
+    const manual = initWorktreeProject();
+    const manualId = manual("Manual baseline");
+    const { epic } = cliJson("create_epic", ["epic", "create", "Chat approval"]);
+    const {
+      created: [task],
+    } = cliJson("create_tasks", [
+      "task",
+      "create",
+      "--epic",
+      epic.id,
+      "--title",
+      "Chat task",
+      "--prompt",
+      "First plan",
+    ]);
+    if (!task) throw new Error("Missing chat task");
+    const id = task.task_id;
+    const status = () =>
+      cliJson("get_project_board", ["board", "--task", id]).tasks.map((row) => ({
+        id: row.id,
+        status: row.status,
+      }));
+    const snapshot = (brief: McpToolOutput<"session_brief">) => {
+      const card = brief.pending_approvals.find((row) => row.task_id === id);
+      if (!card?.approval_snapshot) throw new Error("Missing approval card snapshot");
+      return card.approval_snapshot;
+    };
+    const approve = (kind: "task" | "review", digest: string) => [
+      kind,
+      "approve",
+      id,
+      "--if-snapshot",
+      digest,
+    ];
+    const denied = (kind: "task" | "review", digest: string, code: string) => {
+      const res = runCli(approve(kind, digest));
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain(`[${code}]`);
+    };
+    const audit = (taskId: string) =>
+      z
+        .object({
+          events: z.array(
+            z.object({
+              event: z.string(),
+              actor: z.string(),
+              detail: z.record(z.string(), z.unknown()),
+            }),
+          ),
+        })
+        .parse(JSON.parse(cli(["log", taskId, "--actor", "human", "--json"]))).events;
+    const brief = () => cliJson("session_brief", ["brief"]);
+    let first = "";
+    await withMcp(["--role", "orchestrator", "--allow-crud"], async (client) => {
+      first = snapshot(await mcp(client, "session_brief"));
+      await expect(
+        mcp(client, "manage_task", {
+          task_id: id,
+          action: "approve_plan",
+          caller: "human",
+          confirmed: true,
+          approval_snapshot: first,
+        }),
+      ).rejects.toThrow(/catenext task approve/);
+      await mcp(client, "update_task", { task_id: id, prompt_instruction: "Changed plan" });
+    });
+    denied("task", first, "stale_approval");
+    denied("task", "bogus", "invalid_input");
+    expect(audit(id)).toEqual([]);
+    expect(status()).toEqual([{ id, status: "DRAFT" }]);
+    const plan = snapshot(brief());
+    denied("review", plan, "stale_approval");
+    expect(cliJson("manage_task", approve("task", plan)).status).toBe("TODO");
+    expect(status()).toEqual([{ id, status: "TODO" }]);
+    await withMcp(["--role", "orchestrator"], async (client) => {
+      await mcp(client, "manage_task", { task_id: id, action: "return_to_draft" });
+    });
+    denied("task", plan, "stale_approval");
+    expect(status()).toEqual([{ id, status: "DRAFT" }]);
+    expect(cliJson("manage_task", ["task", "approve", id]).status).toBe("TODO");
+    const submit = (taskId: string) => {
+      const { lease_id } = cliJson("claim_task", ["claim", taskId]);
+      expect(
+        cliJson("complete_handoff", [
+          "done",
+          taskId,
+          "--lease",
+          lease_id,
+          "--notes",
+          "Fixture handoff",
+          "--verify",
+          "pnpm test",
+        ]).status,
+      ).toBe("NEEDS_REVIEW");
+    };
+    submit(id);
+    const reviewCard = brief().pending_approvals.find((row) => row.task_id === id);
+    expect(reviewCard).toMatchObject({
+      branch: "main",
+      commit: expect.any(String),
+      verify_command: "pnpm test",
+    });
+    const review = snapshot(brief());
+    await withMcp(["--role", "worker", "--allow-crud"], async (client) => {
+      expect((await client.listTools()).tools.map(({ name }) => name)).not.toContain("manage_task");
+      for (const action of ["approve_plan", "approve"]) {
+        await expect(
+          mcp(client, "manage_task", {
+            action,
+            task_id: id,
+            caller: "human",
+            role: "orchestrator",
+            confirmed: true,
+            approval_snapshot: review,
+          }),
+        ).rejects.toThrow(/Tool manage_task not found/);
+      }
+    });
+    cli(["revise", id, "--feedback", "Review replacement handoff"]);
+    submit(id);
+    denied("review", review, "stale_approval");
+    denied("review", "bogus", "invalid_input");
+    expect(audit(id).filter(({ event }) => event === "approve")).toEqual([]);
+    expect(status()).toEqual([{ id, status: "NEEDS_REVIEW" }]);
+    const fresh = snapshot(brief());
+    expect(cliJson("manage_task", approve("review", fresh)).status).toBe("DONE");
+    denied("review", fresh, "stale_approval");
+    expect(status()).toEqual([{ id, status: "DONE" }]);
+    expect(audit(id).filter(({ detail }) => detail.dispatch === "conditional_cli")).toMatchObject([
+      { event: "approve", actor: "human", detail: { from: "NEEDS_REVIEW", to: "DONE" } },
+      { event: "approve_plan", actor: "human", detail: { from: "DRAFT", to: "TODO" } },
+    ]);
+    submit(manualId);
+    expect(cliJson("manage_task", ["review", "approve", manualId]).status).toBe("DONE");
+    expect(audit(manualId).every(({ detail }) => !("dispatch" in detail))).toBe(true);
+  }, 20_000);
+
   it("berbagi state antar proses tanpa kredensial, remote Git, atau PR", async () => {
     git("init", "-b", "work");
     cli(["init", "--platform", "claude-code"]);

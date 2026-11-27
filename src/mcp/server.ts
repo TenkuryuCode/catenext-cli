@@ -1,9 +1,11 @@
 import { MCP_TOOLS, type McpToolName } from "@catenext/shared";
 import type { z } from "zod";
 import { requireHumanApproval } from "../approval-policy.js";
+import { findProjectRoot, readConfig } from "../config.js";
 import type { LocalService } from "../local-service.js";
 import { describeRedactions, SCRUB_TOOL_FIELDS, scrubDeep } from "../scrubber.js";
-import { loadSkill, saveSkill } from "../skills.js";
+import { loadCatalogSkill } from "../skill-catalog.js";
+import { saveSkill } from "../skills.js";
 import { buildMcpToolCatalog, type McpRole, toolsForRole } from "./catalog.js";
 import {
   JSONRPC_VERSION,
@@ -36,7 +38,7 @@ export const SERVER_INSTRUCTIONS = [
   "Orchestrator: ask the user first in their language; agent stubs stay English; prefer session_brief and interview_setup (compact JSON, no essays).",
   "Delegate only — do not implement persona tasks. Use get_project_board when needed; keep payloads short.",
   "Workers: get_ready_tasks then claim_task (worktree required for monorepo). complete_handoff → NEEDS_REVIEW.",
-  "Human approve_plan/approve stays on the CLI. Revisions reuse the same task.",
+  "Approvals: ask first about one exact task and action. Only after its direct explicit human reply, use the conditional CLI with the snapshot shown before asking, then verify the board. MCP cannot approve or attest chat authorship. Ask separately for merge, tag, or publish. Revisions reuse the same task.",
   "External folders: manage_roots. Code graph: catenext index then graph_neighbors / symbol_search.",
   "Never publish credentials or critical secrets (handoffs/docs/git — paths only). No code dumps. Do not hand-edit .catenext/config.yaml or IDE MCP configs.",
 ].join(" ");
@@ -105,12 +107,22 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
     parsed: unknown,
   ): Promise<unknown> => {
     if (name === "load_skill") {
-      const { name: skillName, revision } = MCP_TOOLS.load_skill.input.parse(parsed);
-      const skill = await loadSkill(root, skillName, revision);
+      const { name: skillName, revision, source_id } = MCP_TOOLS.load_skill.input.parse(parsed);
+      const primaryRoot = (await findProjectRoot(root, { managedWorktree: true })) ?? root;
+      const config = await readConfig(primaryRoot).catch(() => null);
+      const skill = await loadCatalogSkill(root, skillName, {
+        platforms: config?.platforms,
+        sourceId: source_id,
+        revision,
+      });
       return {
         name: skill.name,
         when_to_use: skill.when_to_use,
         content: skill.content,
+        source_id: skill.source_id,
+        source_kind: skill.source_kind,
+        source_path: skill.source_path,
+        ...(skill.collision ? { collision: true } : {}),
         ...(revision ? { revision } : {}),
       };
     }

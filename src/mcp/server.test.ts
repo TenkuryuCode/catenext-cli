@@ -309,6 +309,52 @@ describe("server MCP catenext", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("loads native project skills and supports explicit source_id disambiguation via MCP load_skill", async () => {
+    const { client, root: dir } = await setup();
+    await client.callTool({
+      name: "save_repo_skill",
+      arguments: {
+        name: "deploy-flow",
+        when_to_use: "Repo deploy flow",
+        content: "Repo deploy steps.",
+      },
+    });
+    const claudeDir = join(dir, ".claude", "skills", "deploy-flow");
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, "SKILL.md"),
+      "---\ndescription: Claude native deploy flow\n---\nClaude deploy steps.\n",
+    );
+
+    const repoLoaded = await client.callTool({
+      name: "load_skill",
+      arguments: { name: "deploy-flow" },
+    });
+    expect(repoLoaded.isError).toBeFalsy();
+    expect(JSON.parse(textOf(repoLoaded))).toMatchObject({
+      name: "deploy-flow",
+      source_id: "repo:.catenext/skills",
+      content: "Repo deploy steps.",
+      collision: true,
+    });
+
+    const claudeLoaded = await client.callTool({
+      name: "load_skill",
+      arguments: {
+        name: "deploy-flow",
+        source_id: "claude-code:project:.claude/skills",
+      },
+    });
+    expect(claudeLoaded.isError).toBeFalsy();
+    expect(JSON.parse(textOf(claudeLoaded))).toMatchObject({
+      name: "deploy-flow",
+      source_id: "claude-code:project:.claude/skills",
+      source_kind: "project",
+      content: "Claude deploy steps.",
+      collision: true,
+    });
+  });
+
   it("load_skill memberi daftar skill bila nama tidak ada", async () => {
     const { client } = await setup();
     const res = await client.callTool({ name: "load_skill", arguments: { name: "nope" } });

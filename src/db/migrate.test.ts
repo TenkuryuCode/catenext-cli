@@ -241,7 +241,7 @@ describe("SQLite schema migrations", () => {
       expect(result1).toEqual({
         fromVersion: 1,
         toVersion: SCHEMA_VERSION,
-        applied: [2, 3, 4, 5, 6, 7],
+        applied: [2, 3, 4, 5, 6, 7, 8, 9],
       });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
@@ -256,7 +256,14 @@ describe("SQLite schema migrations", () => {
         }[]
       ).map((r) => r.name);
       expect(tables).toEqual(
-        expect.arrayContaining(["files", "symbols", "edges", "task_events", "code_search_files"]),
+        expect.arrayContaining([
+          "files",
+          "symbols",
+          "edges",
+          "task_events",
+          "code_search_files",
+          "epic_runs",
+        ]),
       );
 
       const indexes = (
@@ -477,7 +484,7 @@ describe("SQLite schema migrations", () => {
       db.exec("ALTER TABLE tasks ADD COLUMN verify_command TEXT");
 
       const res = runSchemaMigrations(db);
-      expect(res).toEqual({ fromVersion: 6, toVersion: SCHEMA_VERSION, applied: [7] });
+      expect(res).toEqual({ fromVersion: 6, toVersion: SCHEMA_VERSION, applied: [7, 8, 9] });
       expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
       const afterCols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
@@ -670,4 +677,60 @@ describe("SQLite schema migrations", () => {
       db.close();
     }
   });
+});
+
+it("upgrades partial retention columns from sibling v8 without losing epic data", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(
+      "CREATE TABLE epics(id TEXT,archived_at TEXT); INSERT INTO epics VALUES ('keep',NULL); CREATE TABLE tasks(id TEXT); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); PRAGMA user_version=8",
+    );
+    runSchemaMigrations(db);
+    runSchemaMigrations(db);
+    expect(db.prepare("SELECT id,summary_json FROM epics").get()).toEqual({
+      id: "keep",
+      summary_json: null,
+    });
+    expect(db.prepare("SELECT archived_at FROM tasks").all()).toEqual([]);
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]
+    ).map((r) => r.name);
+    expect(tables).toContain("epic_runs");
+  } finally {
+    db.close();
+  }
+});
+
+it("migrates v7 -> v8 -> v9 sequentially and upgrades an existing v8 epic_runs DB to v9 with retention columns", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    runSchemaMigrations(db, { targetVersion: 7 });
+    // Simulate a true v7 schema before v8/v9 additions
+    db.exec("DROP TABLE IF EXISTS epic_runs");
+    setSchemaVersion(db, 7);
+
+    const toV8 = runSchemaMigrations(db, { targetVersion: 8 });
+    expect(toV8).toEqual({ fromVersion: 7, toVersion: 8, applied: [8] });
+    expect(getSchemaVersion(db)).toBe(8);
+    expect(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'epic_runs'")
+        .get(),
+    ).toEqual({ name: "epic_runs" });
+
+    const toV9 = runSchemaMigrations(db);
+    expect(toV9).toEqual({ fromVersion: 8, toVersion: 9, applied: [9] });
+    expect(getSchemaVersion(db)).toBe(9);
+
+    const epicCols = (db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(epicCols).toEqual(expect.arrayContaining(["summary_json", "archived_at"]));
+    const taskCols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(taskCols).toContain("archived_at");
+  } finally {
+    db.close();
+  }
 });

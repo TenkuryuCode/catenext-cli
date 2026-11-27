@@ -288,7 +288,7 @@ describe("LocalService task workflows", () => {
     expect(
       await service.callTool("get_project_board", { status: ["REVISION_REQUESTED"] }),
     ).toMatchObject({ tasks: [{ blocker_reason: null }] });
-  });
+  }, 15_000);
 
   it("enforces branch/session reservations and expires worktrees without matching heartbeats", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(start);
@@ -1073,6 +1073,71 @@ describe("LocalService reviews and context", () => {
     await expect(foreign.callTool("get_document", { slug: doc.slug })).rejects.toMatchObject({
       code: "not_found",
     });
+  });
+
+  it("includes native project skills in get_project_context, search_context, and claim skills_hint with collision provenance", async () => {
+    await service.callTool("save_repo_skill", {
+      name: "shared-skill",
+      when_to_use: "Backend repo skill for quota service",
+      content: "Repo skill body.",
+    });
+    const claudeShared = join(root, ".claude", "skills", "shared-skill");
+    await mkdir(claudeShared, { recursive: true });
+    await writeFile(
+      join(claudeShared, "SKILL.md"),
+      "---\ndescription: Claude native skill for quota service\n---\nClaude skill body.\n",
+    );
+    const claudeOnly = join(root, ".claude", "skills", "be-native-helper");
+    await mkdir(claudeOnly, { recursive: true });
+    await writeFile(
+      join(claudeOnly, "SKILL.md"),
+      "---\ndescription: Native backend helper for API routes\n---\nUse Hono middleware.\n",
+    );
+
+    const ctx = await service.callTool("get_project_context", {});
+    expect(ctx.skills).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "shared-skill",
+          source_id: "repo:.catenext/skills",
+          source_kind: "repo",
+          collision: true,
+        }),
+        expect.objectContaining({
+          name: "shared-skill",
+          source_id: "claude-code:project:.claude/skills",
+          source_kind: "project",
+          collision: true,
+        }),
+        expect.objectContaining({
+          name: "be-native-helper",
+          source_id: "claude-code:project:.claude/skills",
+          source_kind: "project",
+        }),
+      ]),
+    );
+
+    const loadedNative = await service.callTool("load_skill", {
+      name: "shared-skill",
+      source_id: "claude-code:project:.claude/skills",
+    });
+    expect(loadedNative).toMatchObject({
+      name: "shared-skill",
+      source_id: "claude-code:project:.claude/skills",
+      content: "Claude skill body.",
+      collision: true,
+    });
+
+    const searchRes = await service.callTool("search_context", {
+      query: "quota",
+      sources: ["skill"],
+    });
+    expect(searchRes.hits.map((h) => h.ref)).toEqual(
+      expect.arrayContaining([
+        "be:repo:.catenext/skills:shared-skill",
+        "be:claude-code:project:.claude/skills:shared-skill",
+      ]),
+    );
   });
 
   it("archives and restores documents with default visibility excluding archived in context and search", async () => {

@@ -2,6 +2,11 @@ import type { PlatformId } from "@catenext/shared";
 import { CONFIG_PATH, parseConfig } from "../config.js";
 import { type FileEdit, summarize } from "../maintenance.js";
 import { type PersonaSeedMode, personasForSeed } from "../seed.js";
+import {
+  discoverSkillCatalog,
+  formatSkillCatalogSummary,
+  type SkillCatalogResult,
+} from "../skill-catalog.js";
 import { planSubagents } from "../subagents.js";
 import type { FileChange } from "./index.js";
 
@@ -10,6 +15,7 @@ export type InitDryRunPreview = {
   personaAliases: string[];
   stubEdits: FileEdit[];
   skipped: string[];
+  skillCatalog: SkillCatalogResult;
 };
 
 /** Plan SQLite seed + agent stubs after init without writing state or stub files. */
@@ -19,6 +25,8 @@ export async function planInitDryRunPreview(opts: {
   platforms: readonly PlatformId[];
   personaSeed: PersonaSeedMode;
   stack: string[];
+  includeUserGlobalSkills?: boolean;
+  homeDir?: string;
 }): Promise<InitDryRunPreview> {
   const configChange = opts.changes.find((c) => c.path === CONFIG_PATH);
   const config = configChange ? parseConfig(configChange.after) : null;
@@ -27,16 +35,24 @@ export async function planInitDryRunPreview(opts: {
     ...p,
     scope: "project" as const,
   }));
-  const sub = await planSubagents(opts.root, personas, opts.platforms, {
-    stack,
-    repoName: config?.repo_name,
-    layout: config?.layout,
-  });
+  const [sub, skillCatalog] = await Promise.all([
+    planSubagents(opts.root, personas, opts.platforms, {
+      stack,
+      repoName: config?.repo_name,
+      layout: config?.layout,
+    }),
+    discoverSkillCatalog(opts.root, {
+      platforms: opts.platforms,
+      includeUserGlobal: opts.includeUserGlobalSkills,
+      homeDir: opts.homeDir,
+    }),
+  ]);
   return {
     personaSeed: opts.personaSeed,
     personaAliases: personas.map((p) => p.alias),
     stubEdits: sub.edits,
     skipped: sub.skipped,
+    skillCatalog,
   };
 }
 
@@ -61,6 +77,9 @@ export function formatInitDryRunPreview(preview: InitDryRunPreview): string[] {
   }
   for (const path of preview.skipped) {
     lines.push(`! ${path} sudah ada dan bukan milik Catenext; dilewati.`);
+  }
+  for (const line of formatSkillCatalogSummary(preview.skillCatalog)) {
+    lines.push(line);
   }
   return lines;
 }

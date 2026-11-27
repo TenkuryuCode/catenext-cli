@@ -104,6 +104,28 @@ it("supports OpenCode workspace JSONC and VS Code editor-managed workspace confi
       catenext: { type: "stdio", command: "node", args: ["cli.js", "mcp", "--root", root] },
     },
   });
+  const pointers = [
+    "CLAUDE.md",
+    ".cursor/CATENEXT.md",
+    ".codex/CATENEXT.md",
+    ".agents/CATENEXT.md",
+    ".opencode/CATENEXT.md",
+    ".vscode/CATENEXT.md",
+  ];
+  for (const path of pointers) {
+    const pointer = await readFile(join(root, path), "utf8");
+    expect(pointer).toMatch(/\]\(\.{1,2}\/CATENEXT\.md\)/);
+    expect(pointer).toMatch(/\]\(\.{1,2}\/AGENTS\.md\)/);
+    expect(pointer).not.toContain("--if-snapshot");
+  }
+  const master = await readFile(join(root, "CATENEXT.md"), "utf8");
+  expect(master).toContain("wait for its explicit human reply");
+  const rules = await readFile(join(root, "AGENTS.md"), "utf8");
+  expect(rules).toContain("fresh, explicit approval in a direct human reply");
+  expect(rules).toContain("Never fall back to an unguarded command yourself");
+  expect(rules).toContain("Use the exact snapshot captured before asking");
+  expect(rules).toContain("board --task <id> --json");
+  expect(rules).toContain("never authorizes any PR, push, merge, tag, or publication");
   const vscodeEntry = await readFile(join(root, ".vscode/CATENEXT.md"), "utf8");
   expect(vscodeEntry).toContain("VS Code · Catenext entry");
   expect(vscodeEntry).toContain(".github/agents/");

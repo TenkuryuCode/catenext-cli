@@ -1,6 +1,14 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { ProjectDocument } from "@catenext/shared";
-import type { LocalPermission, LocalProject, LocalRoot, LocalTask } from "../local-state.js";
+import {
+  type LocalEpic,
+  type LocalPermission,
+  type LocalProject,
+  type LocalRoot,
+  type LocalTask,
+  type VersionedEpicSummary,
+  VersionedEpicSummarySchema,
+} from "../local-state.js";
 
 function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   if (raw == null || raw === "") return fallback;
@@ -11,6 +19,28 @@ function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   }
 }
 
+function tableColumnNames(db: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((col) => col.name),
+  );
+}
+
+function epicsSelectSql(db: DatabaseSync): string {
+  const columns = tableColumnNames(db, "epics");
+  const cols = ["id", "title", "description"];
+  if (columns.has("summary_json")) cols.push("summary_json");
+  if (columns.has("archived_at")) cols.push("archived_at");
+  return cols.join(", ");
+}
+
+function parseEpicSummary(raw: unknown): VersionedEpicSummary | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  const parsedJson = parseJson<unknown>(raw, null);
+  if (!parsedJson) return null;
+  const validated = VersionedEpicSummarySchema.safeParse(parsedJson);
+  return validated.success ? validated.data : null;
+}
+
 function documentsSelectSql(db: DatabaseSync): string {
   const columns = db.prepare("PRAGMA table_info(documents)").all() as { name: string }[];
   const base = "slug, title, kind, version, updated_by, updated_at, size, content";
@@ -18,9 +48,7 @@ function documentsSelectSql(db: DatabaseSync): string {
 }
 
 function tasksSelectSql(db: DatabaseSync): string {
-  const columns = new Set(
-    (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map((col) => col.name),
-  );
+  const columns = tableColumnNames(db, "tasks");
   const cols = [
     "id",
     "epic_id",
@@ -42,7 +70,12 @@ function tasksSelectSql(db: DatabaseSync): string {
     "integrated_commit_json",
     "position",
   ];
-  for (const optionalCol of ["scope_files_json", "verify_command", "doc_refs_json"]) {
+  for (const optionalCol of [
+    "scope_files_json",
+    "verify_command",
+    "doc_refs_json",
+    "archived_at",
+  ]) {
     if (columns.has(optionalCol)) cols.push(optionalCol);
   }
   return cols.join(", ");
@@ -122,6 +155,9 @@ function hydrateTaskRow(row: Record<string, unknown>, dependencies: string[]): L
     undefined,
   );
   if (Array.isArray(docRefs)) task.doc_refs = docRefs;
+  if (typeof row.archived_at === "string" && row.archived_at.length > 0) {
+    task.archived_at = row.archived_at;
+  }
   return task;
 }
 
@@ -143,15 +179,29 @@ export function loadProjectState(
     }[]
   ).map((row) => row.repo);
 
+  const epicSelect = epicsSelectSql(db);
   project.epics = (
     db
-      .prepare("SELECT id, title, description FROM epics WHERE project_id = ? ORDER BY title, id")
-      .all(projectId) as { id: string; title: string; description: string | null }[]
-  ).map((row) => ({
-    id: row.id,
-    title: row.title,
-    description: row.description,
-  }));
+      .prepare(`SELECT ${epicSelect} FROM epics WHERE project_id = ? ORDER BY title, id`)
+      .all(projectId) as {
+      id: string;
+      title: string;
+      description: string | null;
+      summary_json?: string | null;
+      archived_at?: string | null;
+    }[]
+  ).map((row): LocalEpic => {
+    const summary = parseEpicSummary(row.summary_json);
+    const archivedAt =
+      typeof row.archived_at === "string" && row.archived_at.length > 0 ? row.archived_at : null;
+    return {
+      id: row.id,
+      title: row.title,
+      description: row.description,
+      ...(summary ? { summary } : {}),
+      ...(archivedAt ? { archived_at: archivedAt } : {}),
+    };
+  });
 
   const personaRows = db
     .prepare("SELECT alias, role, rules_json FROM personas WHERE project_id = ? ORDER BY alias")
@@ -283,60 +333,120 @@ export function loadTask(
 /** Upsert a single task (and diff its dependencies) without touching other tasks or tables. */
 export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): void {
   const serialized = serializeTask(task);
-  db.prepare(
-    `INSERT INTO tasks
-      (id, project_id, epic_id, title, instruction, status, target, role, persona,
-       requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
-       scope_files_json, verify_command, doc_refs_json, position)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(project_id, id) DO UPDATE SET
-       epic_id = excluded.epic_id,
-       title = excluded.title,
-       instruction = excluded.instruction,
-       status = excluded.status,
-       target = excluded.target,
-       role = excluded.role,
-       persona = excluded.persona,
-       requires_approval = excluded.requires_approval,
-       revision = excluded.revision,
-       stale = excluded.stale,
-       feedback = excluded.feedback,
-       lease_json = excluded.lease_json,
-       branch_json = excluded.branch_json,
-       handoff_json = excluded.handoff_json,
-       review_json = excluded.review_json,
-       blocker_json = excluded.blocker_json,
-       integrated_commit_json = excluded.integrated_commit_json,
-       scope_files_json = excluded.scope_files_json,
-       verify_command = excluded.verify_command,
-       doc_refs_json = excluded.doc_refs_json,
-       position = excluded.position`,
-  ).run(
-    task.id,
-    projectId,
-    serialized.epicId,
-    serialized.title,
-    serialized.instruction,
-    serialized.status,
-    serialized.target,
-    serialized.role,
-    serialized.persona,
-    serialized.requiresApproval,
-    serialized.revision,
-    serialized.stale,
-    serialized.feedback,
-    serialized.leaseJson,
-    serialized.branchJson,
-    serialized.handoffJson,
-    serialized.reviewJson,
-    serialized.blockerJson,
-    serialized.integratedCommitJson,
-    serialized.scopeFilesJson,
-    serialized.verifyCommand,
-    serialized.docRefsJson,
-    serialized.position,
-  );
+  const hasArchivedAt = tableColumnNames(db, "tasks").has("archived_at");
+  if (hasArchivedAt) {
+    db.prepare(
+      `INSERT INTO tasks
+        (id, project_id, epic_id, title, instruction, status, target, role, persona,
+         requires_approval, revision, stale, feedback,
+         lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+         scope_files_json, verify_command, doc_refs_json, archived_at, position)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, id) DO UPDATE SET
+         epic_id = excluded.epic_id,
+         title = excluded.title,
+         instruction = excluded.instruction,
+         status = excluded.status,
+         target = excluded.target,
+         role = excluded.role,
+         persona = excluded.persona,
+         requires_approval = excluded.requires_approval,
+         revision = excluded.revision,
+         stale = excluded.stale,
+         feedback = excluded.feedback,
+         lease_json = excluded.lease_json,
+         branch_json = excluded.branch_json,
+         handoff_json = excluded.handoff_json,
+         review_json = excluded.review_json,
+         blocker_json = excluded.blocker_json,
+         integrated_commit_json = excluded.integrated_commit_json,
+         scope_files_json = excluded.scope_files_json,
+         verify_command = excluded.verify_command,
+         doc_refs_json = excluded.doc_refs_json,
+         archived_at = excluded.archived_at,
+         position = excluded.position`,
+    ).run(
+      task.id,
+      projectId,
+      serialized.epicId,
+      serialized.title,
+      serialized.instruction,
+      serialized.status,
+      serialized.target,
+      serialized.role,
+      serialized.persona,
+      serialized.requiresApproval,
+      serialized.revision,
+      serialized.stale,
+      serialized.feedback,
+      serialized.leaseJson,
+      serialized.branchJson,
+      serialized.handoffJson,
+      serialized.reviewJson,
+      serialized.blockerJson,
+      serialized.integratedCommitJson,
+      serialized.scopeFilesJson,
+      serialized.verifyCommand,
+      serialized.docRefsJson,
+      serialized.archivedAt,
+      serialized.position,
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO tasks
+        (id, project_id, epic_id, title, instruction, status, target, role, persona,
+         requires_approval, revision, stale, feedback,
+         lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+         scope_files_json, verify_command, doc_refs_json, position)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, id) DO UPDATE SET
+         epic_id = excluded.epic_id,
+         title = excluded.title,
+         instruction = excluded.instruction,
+         status = excluded.status,
+         target = excluded.target,
+         role = excluded.role,
+         persona = excluded.persona,
+         requires_approval = excluded.requires_approval,
+         revision = excluded.revision,
+         stale = excluded.stale,
+         feedback = excluded.feedback,
+         lease_json = excluded.lease_json,
+         branch_json = excluded.branch_json,
+         handoff_json = excluded.handoff_json,
+         review_json = excluded.review_json,
+         blocker_json = excluded.blocker_json,
+         integrated_commit_json = excluded.integrated_commit_json,
+         scope_files_json = excluded.scope_files_json,
+         verify_command = excluded.verify_command,
+         doc_refs_json = excluded.doc_refs_json,
+         position = excluded.position`,
+    ).run(
+      task.id,
+      projectId,
+      serialized.epicId,
+      serialized.title,
+      serialized.instruction,
+      serialized.status,
+      serialized.target,
+      serialized.role,
+      serialized.persona,
+      serialized.requiresApproval,
+      serialized.revision,
+      serialized.stale,
+      serialized.feedback,
+      serialized.leaseJson,
+      serialized.branchJson,
+      serialized.handoffJson,
+      serialized.reviewJson,
+      serialized.blockerJson,
+      serialized.integratedCommitJson,
+      serialized.scopeFilesJson,
+      serialized.verifyCommand,
+      serialized.docRefsJson,
+      serialized.position,
+    );
+  }
 
   const existingDeps = new Set(
     (
@@ -445,6 +555,7 @@ type SerializedTask = {
   scopeFilesJson: string | null;
   verifyCommand: string | null;
   docRefsJson: string | null;
+  archivedAt: string | null;
   position: number;
 };
 
@@ -471,6 +582,7 @@ function serializeTask(task: LocalTask): SerializedTask {
     scopeFilesJson: task.scope_files !== undefined ? JSON.stringify(task.scope_files) : null,
     verifyCommand: task.verify_command ?? null,
     docRefsJson: task.doc_refs !== undefined ? JSON.stringify(task.doc_refs) : null,
+    archivedAt: task.archived_at ?? null,
   };
 }
 
@@ -496,7 +608,8 @@ function serializedTaskEqual(a: SerializedTask, b: SerializedTask): boolean {
     a.integratedCommitJson === b.integratedCommitJson &&
     a.scopeFilesJson === b.scopeFilesJson &&
     a.verifyCommand === b.verifyCommand &&
-    a.docRefsJson === b.docRefsJson
+    a.docRefsJson === b.docRefsJson &&
+    a.archivedAt === b.archivedAt
   );
 }
 
@@ -541,6 +654,8 @@ export function saveProjectDiff(
   }
 
   // 2. epics
+  const epicCols = tableColumnNames(db, "epics");
+  const hasEpicRetentionCols = epicCols.has("summary_json") && epicCols.has("archived_at");
   const beforeEpics = new Map(before.epics.map((e) => [e.id, e]));
   const afterEpics = new Map(after.epics.map((e) => [e.id, e]));
   let delEpic: ReturnType<DatabaseSync["prepare"]> | undefined;
@@ -554,19 +669,53 @@ export function saveProjectDiff(
   }
   for (const epic of after.epics) {
     const prev = beforeEpics.get(epic.id);
+    const nextSummaryJson = epic.summary ? JSON.stringify(epic.summary) : null;
+    const nextArchivedAt = epic.archived_at ?? null;
+    const prevSummaryJson = prev?.summary ? JSON.stringify(prev.summary) : null;
+    const prevArchivedAt = prev?.archived_at ?? null;
     if (!prev) {
-      insEpic ??= db.prepare(
-        "INSERT INTO epics (id, project_id, title, description) VALUES (?, ?, ?, ?)",
-      );
-      insEpic.run(epic.id, projectId, epic.title, epic.description ?? null);
+      if (hasEpicRetentionCols) {
+        insEpic ??= db.prepare(
+          "INSERT INTO epics (id, project_id, title, description, summary_json, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
+        );
+        insEpic.run(
+          epic.id,
+          projectId,
+          epic.title,
+          epic.description ?? null,
+          nextSummaryJson,
+          nextArchivedAt,
+        );
+      } else {
+        insEpic ??= db.prepare(
+          "INSERT INTO epics (id, project_id, title, description) VALUES (?, ?, ?, ?)",
+        );
+        insEpic.run(epic.id, projectId, epic.title, epic.description ?? null);
+      }
     } else if (
       prev.title !== epic.title ||
-      (prev.description ?? null) !== (epic.description ?? null)
+      (prev.description ?? null) !== (epic.description ?? null) ||
+      prevSummaryJson !== nextSummaryJson ||
+      prevArchivedAt !== nextArchivedAt
     ) {
-      updEpic ??= db.prepare(
-        "UPDATE epics SET title = ?, description = ? WHERE project_id = ? AND id = ?",
-      );
-      updEpic.run(epic.title, epic.description ?? null, projectId, epic.id);
+      if (hasEpicRetentionCols) {
+        updEpic ??= db.prepare(
+          "UPDATE epics SET title = ?, description = ?, summary_json = ?, archived_at = ? WHERE project_id = ? AND id = ?",
+        );
+        updEpic.run(
+          epic.title,
+          epic.description ?? null,
+          nextSummaryJson,
+          nextArchivedAt,
+          projectId,
+          epic.id,
+        );
+      } else {
+        updEpic ??= db.prepare(
+          "UPDATE epics SET title = ?, description = ? WHERE project_id = ? AND id = ?",
+        );
+        updEpic.run(epic.title, epic.description ?? null, projectId, epic.id);
+      }
     }
   }
 
@@ -691,6 +840,7 @@ export function saveProjectDiff(
   }
 
   // 5. tasks + task_deps
+  const hasTaskArchivedCol = tableColumnNames(db, "tasks").has("archived_at");
   const beforeTasks = new Map(before.tasks.map((t) => [t.id, t]));
   const afterTasks = new Map(after.tasks.map((t) => [t.id, t]));
   let delTask: ReturnType<DatabaseSync["prepare"]> | undefined;
@@ -708,58 +858,53 @@ export function saveProjectDiff(
     const prev = beforeTasks.get(task.id);
     const nextSer = serializeTask(task);
     if (!prev) {
-      insTask ??= db.prepare(
-        `INSERT INTO tasks
-          (id, project_id, epic_id, title, instruction, status, target, role, persona,
-           requires_approval, revision, stale, feedback,
-           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
-           scope_files_json, verify_command, doc_refs_json, position)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      insTask.run(
-        task.id,
-        projectId,
-        nextSer.epicId,
-        nextSer.title,
-        nextSer.instruction,
-        nextSer.status,
-        nextSer.target,
-        nextSer.role,
-        nextSer.persona,
-        nextSer.requiresApproval,
-        nextSer.revision,
-        nextSer.stale,
-        nextSer.feedback,
-        nextSer.leaseJson,
-        nextSer.branchJson,
-        nextSer.handoffJson,
-        nextSer.reviewJson,
-        nextSer.blockerJson,
-        nextSer.integratedCommitJson,
-        nextSer.scopeFilesJson,
-        nextSer.verifyCommand,
-        nextSer.docRefsJson,
-        nextSer.position,
-      );
-      for (const dep of new Set(task.dependencies)) {
-        insDep ??= db.prepare(
-          "INSERT OR IGNORE INTO task_deps (project_id, task_id, depends_on) VALUES (?, ?, ?)",
+      if (hasTaskArchivedCol) {
+        insTask ??= db.prepare(
+          `INSERT INTO tasks
+            (id, project_id, epic_id, title, instruction, status, target, role, persona,
+             requires_approval, revision, stale, feedback,
+             lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+             scope_files_json, verify_command, doc_refs_json, archived_at, position)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
-        insDep.run(projectId, task.id, dep);
-      }
-    } else {
-      const prevSer = serializeTask(prev);
-      if (!serializedTaskEqual(prevSer, nextSer)) {
-        updTask ??= db.prepare(
-          `UPDATE tasks SET
-             epic_id = ?, title = ?, instruction = ?, status = ?, target = ?, role = ?, persona = ?,
-             requires_approval = ?, revision = ?, stale = ?, feedback = ?,
-             lease_json = ?, branch_json = ?, handoff_json = ?, review_json = ?, blocker_json = ?,
-             integrated_commit_json = ?, scope_files_json = ?, verify_command = ?, doc_refs_json = ?,
-             position = ?
-           WHERE project_id = ? AND id = ?`,
+        insTask.run(
+          task.id,
+          projectId,
+          nextSer.epicId,
+          nextSer.title,
+          nextSer.instruction,
+          nextSer.status,
+          nextSer.target,
+          nextSer.role,
+          nextSer.persona,
+          nextSer.requiresApproval,
+          nextSer.revision,
+          nextSer.stale,
+          nextSer.feedback,
+          nextSer.leaseJson,
+          nextSer.branchJson,
+          nextSer.handoffJson,
+          nextSer.reviewJson,
+          nextSer.blockerJson,
+          nextSer.integratedCommitJson,
+          nextSer.scopeFilesJson,
+          nextSer.verifyCommand,
+          nextSer.docRefsJson,
+          nextSer.archivedAt,
+          nextSer.position,
         );
-        updTask.run(
+      } else {
+        insTask ??= db.prepare(
+          `INSERT INTO tasks
+            (id, project_id, epic_id, title, instruction, status, target, role, persona,
+             requires_approval, revision, stale, feedback,
+             lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+             scope_files_json, verify_command, doc_refs_json, position)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        insTask.run(
+          task.id,
+          projectId,
           nextSer.epicId,
           nextSer.title,
           nextSer.instruction,
@@ -781,9 +926,89 @@ export function saveProjectDiff(
           nextSer.verifyCommand,
           nextSer.docRefsJson,
           nextSer.position,
-          projectId,
-          task.id,
         );
+      }
+      for (const dep of new Set(task.dependencies)) {
+        insDep ??= db.prepare(
+          "INSERT OR IGNORE INTO task_deps (project_id, task_id, depends_on) VALUES (?, ?, ?)",
+        );
+        insDep.run(projectId, task.id, dep);
+      }
+    } else {
+      const prevSer = serializeTask(prev);
+      if (!serializedTaskEqual(prevSer, nextSer)) {
+        if (hasTaskArchivedCol) {
+          updTask ??= db.prepare(
+            `UPDATE tasks SET
+               epic_id = ?, title = ?, instruction = ?, status = ?, target = ?, role = ?, persona = ?,
+               requires_approval = ?, revision = ?, stale = ?, feedback = ?,
+               lease_json = ?, branch_json = ?, handoff_json = ?, review_json = ?, blocker_json = ?,
+               integrated_commit_json = ?, scope_files_json = ?, verify_command = ?, doc_refs_json = ?,
+               archived_at = ?, position = ?
+             WHERE project_id = ? AND id = ?`,
+          );
+          updTask.run(
+            nextSer.epicId,
+            nextSer.title,
+            nextSer.instruction,
+            nextSer.status,
+            nextSer.target,
+            nextSer.role,
+            nextSer.persona,
+            nextSer.requiresApproval,
+            nextSer.revision,
+            nextSer.stale,
+            nextSer.feedback,
+            nextSer.leaseJson,
+            nextSer.branchJson,
+            nextSer.handoffJson,
+            nextSer.reviewJson,
+            nextSer.blockerJson,
+            nextSer.integratedCommitJson,
+            nextSer.scopeFilesJson,
+            nextSer.verifyCommand,
+            nextSer.docRefsJson,
+            nextSer.archivedAt,
+            nextSer.position,
+            projectId,
+            task.id,
+          );
+        } else {
+          updTask ??= db.prepare(
+            `UPDATE tasks SET
+               epic_id = ?, title = ?, instruction = ?, status = ?, target = ?, role = ?, persona = ?,
+               requires_approval = ?, revision = ?, stale = ?, feedback = ?,
+               lease_json = ?, branch_json = ?, handoff_json = ?, review_json = ?, blocker_json = ?,
+               integrated_commit_json = ?, scope_files_json = ?, verify_command = ?, doc_refs_json = ?,
+               position = ?
+             WHERE project_id = ? AND id = ?`,
+          );
+          updTask.run(
+            nextSer.epicId,
+            nextSer.title,
+            nextSer.instruction,
+            nextSer.status,
+            nextSer.target,
+            nextSer.role,
+            nextSer.persona,
+            nextSer.requiresApproval,
+            nextSer.revision,
+            nextSer.stale,
+            nextSer.feedback,
+            nextSer.leaseJson,
+            nextSer.branchJson,
+            nextSer.handoffJson,
+            nextSer.reviewJson,
+            nextSer.blockerJson,
+            nextSer.integratedCommitJson,
+            nextSer.scopeFilesJson,
+            nextSer.verifyCommand,
+            nextSer.docRefsJson,
+            nextSer.position,
+            projectId,
+            task.id,
+          );
+        }
       }
       if (!sameStringSet(prev.dependencies, task.dependencies)) {
         const prevDeps = new Set(prev.dependencies);
@@ -914,11 +1139,28 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
   const insertRepo = db.prepare("INSERT INTO project_repos (project_id, repo) VALUES (?, ?)");
   for (const repo of project.repos) insertRepo.run(projectId, repo);
 
-  const insertEpic = db.prepare(
-    "INSERT INTO epics (id, project_id, title, description) VALUES (?, ?, ?, ?)",
-  );
-  for (const epic of project.epics) {
-    insertEpic.run(epic.id, projectId, epic.title, epic.description ?? null);
+  const epicCols = tableColumnNames(db, "epics");
+  if (epicCols.has("summary_json") && epicCols.has("archived_at")) {
+    const insertEpic = db.prepare(
+      "INSERT INTO epics (id, project_id, title, description, summary_json, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const epic of project.epics) {
+      insertEpic.run(
+        epic.id,
+        projectId,
+        epic.title,
+        epic.description ?? null,
+        epic.summary ? JSON.stringify(epic.summary) : null,
+        epic.archived_at ?? null,
+      );
+    }
+  } else {
+    const insertEpic = db.prepare(
+      "INSERT INTO epics (id, project_id, title, description) VALUES (?, ?, ?, ?)",
+    );
+    for (const epic of project.epics) {
+      insertEpic.run(epic.id, projectId, epic.title, epic.description ?? null);
+    }
   }
 
   const insertPersona = db.prepare(
@@ -952,44 +1194,83 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
     );
   }
 
-  const insertTask = db.prepare(
-    `INSERT INTO tasks
-      (id, project_id, epic_id, title, instruction, status, target, role, persona,
-       requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
-       scope_files_json, verify_command, doc_refs_json, position)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
+  const hasTaskArchivedCol = tableColumnNames(db, "tasks").has("archived_at");
+  const insertTask = hasTaskArchivedCol
+    ? db.prepare(
+        `INSERT INTO tasks
+          (id, project_id, epic_id, title, instruction, status, target, role, persona,
+           requires_approval, revision, stale, feedback,
+           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+           scope_files_json, verify_command, doc_refs_json, archived_at, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+    : db.prepare(
+        `INSERT INTO tasks
+          (id, project_id, epic_id, title, instruction, status, target, role, persona,
+           requires_approval, revision, stale, feedback,
+           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+           scope_files_json, verify_command, doc_refs_json, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
   const insertDep = db.prepare(
     "INSERT INTO task_deps (project_id, task_id, depends_on) VALUES (?, ?, ?)",
   );
   for (const task of project.tasks) {
     const ser = serializeTask(task);
-    insertTask.run(
-      task.id,
-      projectId,
-      ser.epicId,
-      ser.title,
-      ser.instruction,
-      ser.status,
-      ser.target,
-      ser.role,
-      ser.persona,
-      ser.requiresApproval,
-      ser.revision,
-      ser.stale,
-      ser.feedback,
-      ser.leaseJson,
-      ser.branchJson,
-      ser.handoffJson,
-      ser.reviewJson,
-      ser.blockerJson,
-      ser.integratedCommitJson,
-      ser.scopeFilesJson,
-      ser.verifyCommand,
-      ser.docRefsJson,
-      ser.position,
-    );
+    if (hasTaskArchivedCol) {
+      insertTask.run(
+        task.id,
+        projectId,
+        ser.epicId,
+        ser.title,
+        ser.instruction,
+        ser.status,
+        ser.target,
+        ser.role,
+        ser.persona,
+        ser.requiresApproval,
+        ser.revision,
+        ser.stale,
+        ser.feedback,
+        ser.leaseJson,
+        ser.branchJson,
+        ser.handoffJson,
+        ser.reviewJson,
+        ser.blockerJson,
+        ser.integratedCommitJson,
+        ser.scopeFilesJson,
+        ser.verifyCommand,
+        ser.docRefsJson,
+        ser.archivedAt,
+        ser.position,
+      );
+    } else {
+      insertTask.run(
+        task.id,
+        projectId,
+        ser.epicId,
+        ser.title,
+        ser.instruction,
+        ser.status,
+        ser.target,
+        ser.role,
+        ser.persona,
+        ser.requiresApproval,
+        ser.revision,
+        ser.stale,
+        ser.feedback,
+        ser.leaseJson,
+        ser.branchJson,
+        ser.handoffJson,
+        ser.reviewJson,
+        ser.blockerJson,
+        ser.integratedCommitJson,
+        ser.scopeFilesJson,
+        ser.verifyCommand,
+        ser.docRefsJson,
+        ser.position,
+      );
+    }
     for (const dep of task.dependencies) insertDep.run(projectId, task.id, dep);
   }
 

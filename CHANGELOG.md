@@ -9,6 +9,17 @@ bagian itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workfl
 menolak tag yang versinya belum ada di file ini. Entri versi tidak berarti paket sudah terbit di npm.
 Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
 
+## [0.17.0] - 2026-11-28
+
+### Ditambahkan
+- **Epic run lokal berbatas:** perintah `catenext epic run` (preview/start/resume/pause/close/review/verify) dengan tabel SQLite `epic_runs` (**schema v8**, dipertahankan di **v9**) yang mengikat checkout worktree ke satu epic terbuka per repo.
+- **Katalog skill terpadu ber-provenance:** `discoverSkillCatalog` menyatukan skill proyek (`.catenext/skills` + native) dan, bila diizinkan, skill user-installed global tanpa menyalin, mengubah, atau mengeksekusi file sumber.
+- **Context pack reviewer kompak:** `review_context_pack` pada claim/refresh reviewer (terikat `head_sha`, batas byte UTF-8 JSON) agar delegasi review hemat-token tanpa memuat board penuh.
+- **Ringkasan epic berversi + arsip lokal dapat dibalik:** kolom `epics.summary_json` serta `archived_at` pada epic/task (**schema v9**) dengan alur archive/restore lokal yang dapat dibalik.
+
+### Diperbaiki
+- Windows `assertRunCheckout`: menyamakan path worktree lewat `git rev-parse --show-toplevel` dan mengeraskan kunci porcelain/path (termasuk bentuk `\\?\`, slash, serta short vs long) agar claim epic run tidak gagal false-negative di Git-for-Windows.
+
 ## [0.16.0] - 2026-11-27
 
 ### Ditambahkan
