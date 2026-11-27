@@ -8,7 +8,13 @@ import {
   RoleSchema,
 } from "./common.js";
 import { PullRequestStateSchema } from "./review.js";
-import { BlockerCategorySchema, TaskSchema } from "./task.js";
+import {
+  BlockerCategorySchema,
+  TaskDocRefsSchema,
+  TaskSchema,
+  TaskScopeFilesSchema,
+  TaskVerifyCommandSchema,
+} from "./task.js";
 
 /**
  * Kontrak domain & input lokal untuk CLI dan server MCP Catenext.
@@ -113,6 +119,9 @@ export const UpdateTaskInput = z.object({
     .optional()
     .describe("Display order within the project, ascending; ties keep insertion order."),
   is_stale: z.literal(false).optional(),
+  scope_files: TaskScopeFilesSchema.optional(),
+  verify_command: TaskVerifyCommandSchema.optional(),
+  doc_refs: TaskDocRefsSchema.optional(),
 });
 
 export const SetDependenciesInput = z.object({

@@ -468,10 +468,16 @@ describe("LocalStore read-only queries & partial diff persistence", () => {
       if (!loadedT2) throw new Error("Expected loadedT2");
       loadedT2.dependencies = [t1];
       loadedT2.title = "Updated via saveTask";
+      loadedT2.scope_files = ["apps/cli/src/db/project-codec.ts"];
+      loadedT2.verify_command = "pnpm --filter catenext test";
+      loadedT2.doc_refs = ["sync-board"];
       saveTask(verifyDb, projectId, loadedT2);
       expect(loadTask(verifyDb, projectId, t2)).toMatchObject({
         title: "Updated via saveTask",
         dependencies: [t1],
+        scope_files: ["apps/cli/src/db/project-codec.ts"],
+        verify_command: "pnpm --filter catenext test",
+        doc_refs: ["sync-board"],
       });
 
       const doc = loadDocument(verifyDb, projectId, "blueprint");
@@ -494,8 +500,54 @@ describe("LocalStore read-only queries & partial diff persistence", () => {
 
     const finalProject = await store.read(projectId, (p) => p);
     expect(finalProject.tasks.map((t) => t.id)).toEqual([t1, t2]);
+    expect(finalProject.tasks[1]).toMatchObject({
+      scope_files: ["apps/cli/src/db/project-codec.ts"],
+      verify_command: "pnpm --filter catenext test",
+      doc_refs: ["sync-board"],
+    });
     expect(finalProject.session_prefs).toEqual({ locale: "id" });
     expect(finalProject.platform_setup?.sort()).toEqual(["codex", "cursor"]);
+  });
+
+  it("persists and updates task scope_files, verify_command, and doc_refs via LocalStore diff", async () => {
+    const store = new LocalStore(dbPath);
+    const epicId = randomUUID();
+    const t1 = randomUUID();
+
+    await store.transaction(projectId, "catenext", (project, dirty) => {
+      project.epics.push({ id: epicId, title: "Epic", description: null });
+      project.tasks.push({
+        ...makeTask(t1, epicId, "Scoped Task"),
+        scope_files: ["packages/shared/src/task.ts"],
+        verify_command: "pnpm test",
+        doc_refs: ["blueprint"],
+      });
+      dirty();
+    });
+
+    const initial = await store.read(projectId, (p) => p.tasks[0]);
+    expect(initial).toMatchObject({
+      scope_files: ["packages/shared/src/task.ts"],
+      verify_command: "pnpm test",
+      doc_refs: ["blueprint"],
+    });
+
+    await store.transaction(projectId, "catenext", (project, dirty) => {
+      const target = project.tasks[0];
+      if (!target) throw new Error("missing task");
+      target.scope_files = ["packages/shared/src/task.ts", "apps/cli/src/db/schema.ts"];
+      delete target.verify_command;
+      target.doc_refs = ["sync-board", "erd"];
+      dirty();
+    });
+
+    const updated = await store.read(projectId, (p) => p.tasks[0]);
+    expect(updated?.scope_files).toEqual([
+      "packages/shared/src/task.ts",
+      "apps/cli/src/db/schema.ts",
+    ]);
+    expect(updated?.verify_command).toBeUndefined();
+    expect(updated?.doc_refs).toEqual(["sync-board", "erd"]);
   });
 
   it("combines audit filters before limiting and keeps project isolation", async () => {

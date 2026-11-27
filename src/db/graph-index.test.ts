@@ -1,21 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { CatenextConfigSchema } from "@catenext/shared";
+import { CatenextConfigSchema, GraphNeighborsOutput } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalService } from "../local-service.js";
 import { DEFAULT_MAX_FILE_BYTES } from "../workspace-walk.js";
 import {
   checkGraphFreshness,
+  GRAPH_PARSER_VERSION,
+  getGraphIndexFastPathState,
   graphNeighbors,
   indexProjectGraph,
   loadGoModule,
   loadWorkspacePackages,
   parseImports,
   parseSymbols,
+  queryClaimGraphSlice,
+  queryGraphNeighbors,
   resolveImport,
   symbolSearch,
 } from "./graph-index.js";
@@ -1495,7 +1499,7 @@ describe("workspace package, tsconfig alias, barrel re-export & freshness", () =
     ].join("\n");
 
     expect(parseSymbols(barrelCode, ".ts")).toEqual([
-      { name: "*", kind: "reexport", line: 1 },
+      { name: "* (./star)", kind: "reexport", line: 1 },
       { name: "ns", kind: "reexport", line: 2 },
       { name: "alpha", kind: "reexport", line: 3 },
       { name: "renamedBeta", kind: "reexport", line: 3 },
@@ -1526,8 +1530,391 @@ describe("workspace package, tsconfig alias, barrel re-export & freshness", () =
       { name: "renamedBeta", kind: "reexport", path: "src/index.ts", line: 3 },
     ]);
     expect(symbolSearch(dbPath, projectId, "*", 10)).toEqual([
-      { name: "*", kind: "reexport", path: "src/index.ts", line: 1 },
+      { name: "* (./star)", kind: "reexport", path: "src/index.ts", line: 1 },
     ]);
+  });
+
+  it("refreshes parser versions independently for projects sharing a DB with a legacy global marker", async () => {
+    const otherProjectId = randomUUID();
+    const firstRoot = join(root, "first");
+    const otherRoot = join(root, "other");
+    const db = openDatabaseAt(dbPath);
+    try {
+      ensureProject(db, otherProjectId);
+      for (const [id, dir] of [
+        [projectId, firstRoot],
+        [otherProjectId, otherRoot],
+      ] as const) {
+        await mkdir(dir);
+        await writeFile(join(dir, "star.ts"), "export const starVal = 1;\n");
+        await writeFile(join(dir, "index.ts"), 'export * from "./star";\n');
+        await indexProjectGraph(db, id, dir);
+        // Legacy symbols can exist even if the files' mtime and hash are unchanged.
+        db.prepare(
+          "UPDATE symbols SET name = '*' WHERE project_id = ? AND name = '* (./star)'",
+        ).run(id);
+      }
+      db.prepare("UPDATE meta SET value = ? WHERE key = ?").run(
+        String(GRAPH_PARSER_VERSION - 1),
+        `graph_parser_version:${projectId}`,
+      );
+      db.prepare("DELETE FROM meta WHERE key = ?").run(`graph_parser_version:${otherProjectId}`);
+      db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('graph_parser_version', ?)").run(
+        String(GRAPH_PARSER_VERSION),
+      );
+    } finally {
+      db.close();
+    }
+
+    const stale = { indexed_files: 2, stale: true, reason: "parser_version" };
+    const fresh = { indexed_files: 2, stale: false };
+    const firstDirs = [{ rootId: null, dir: firstRoot }];
+    const otherDirs = [{ rootId: null, dir: otherRoot }];
+    const query = { path: "index.ts", include_symbols: true };
+    expect(getGraphIndexFastPathState(dbPath, projectId, firstDirs)).toEqual(stale);
+    expect(getGraphIndexFastPathState(dbPath, otherProjectId, otherDirs)).toEqual(stale);
+
+    await indexProjectGraph(dbPath, projectId, firstRoot);
+    expect(getGraphIndexFastPathState(dbPath, projectId, firstDirs)).toEqual(fresh);
+    expect(symbolSearch(dbPath, projectId, "*", 10).map((hit) => hit.name)).toEqual(["* (./star)"]);
+    expect(getGraphIndexFastPathState(dbPath, otherProjectId, otherDirs)).toEqual(stale);
+    expect(queryGraphNeighbors(dbPath, otherProjectId, query, otherDirs)).toMatchObject({
+      stale: true,
+      stale_reason: "parser_version",
+      files: [{ symbols: ["*"] }],
+    });
+
+    await indexProjectGraph(dbPath, otherProjectId, otherRoot);
+    expect(getGraphIndexFastPathState(dbPath, otherProjectId, otherDirs)).toEqual(fresh);
+    const refreshed = queryGraphNeighbors(dbPath, otherProjectId, query, otherDirs);
+    expect(refreshed.stale).toBeUndefined();
+    expect(refreshed.files).toMatchObject([{ symbols: ["* (./star)"] }]);
+  });
+
+  it("rolls back graph writes and the parser marker when refreshing fails", async () => {
+    const barrel = join(root, "index.ts");
+    await writeFile(barrel, 'export * from "./old";\n');
+    await writeFile(join(root, "old.ts"), "export const oldValue = 1;\n");
+    await writeFile(join(root, "new.ts"), "export const newValue = 2;\n");
+    await indexProjectGraph(dbPath, projectId, root);
+    const oldEdges = graphNeighbors(dbPath, projectId, "index.ts", 10, 1);
+    const markerKey = `graph_parser_version:${projectId}`;
+    const db = openDatabaseAt(dbPath);
+    try {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(markerKey);
+      db.exec(`
+        CREATE TRIGGER fail_parser_refresh AFTER INSERT ON meta
+        WHEN NEW.key LIKE 'graph_parser_version:%'
+        BEGIN
+          SELECT RAISE(FAIL, 'parser marker write failed');
+        END;
+      `);
+    } finally {
+      db.close();
+    }
+    await writeFile(barrel, 'export * from "./new";\n');
+    const changed = new Date(Date.now() + 10_000);
+    await utimes(barrel, changed, changed);
+
+    await expect(indexProjectGraph(dbPath, projectId, root)).rejects.toThrow(
+      "parser marker write failed",
+    );
+    expect(graphNeighbors(dbPath, projectId, "index.ts", 10, 1)).toEqual(oldEdges);
+    expect(symbolSearch(dbPath, projectId, "*", 10).map((hit) => hit.name)).toEqual(["* (./old)"]);
+    const rootDirs = [{ rootId: null, dir: root }];
+    expect(getGraphIndexFastPathState(dbPath, projectId, rootDirs)).toEqual({
+      indexed_files: 3,
+      stale: true,
+      reason: "parser_version",
+    });
+
+    const retryDb = openDatabaseAt(dbPath);
+    try {
+      expect(
+        retryDb.prepare("SELECT value FROM meta WHERE key = ?").get(markerKey),
+      ).toBeUndefined();
+      retryDb.exec("DROP TRIGGER fail_parser_refresh");
+    } finally {
+      retryDb.close();
+    }
+    await indexProjectGraph(dbPath, projectId, root);
+    expect(graphNeighbors(dbPath, projectId, "index.ts", 10, 1)).toMatchObject([{ to: "new.ts" }]);
+    expect(symbolSearch(dbPath, projectId, "*", 10).map((hit) => hit.name)).toEqual(["* (./new)"]);
+    expect(getGraphIndexFastPathState(dbPath, projectId, rootDirs)).toEqual({
+      indexed_files: 3,
+      stale: false,
+    });
+  });
+
+  it("resolves tsconfig.json references[] safely across cycles and ignores outside roots", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "catenext-tsconfig-outside-"));
+    try {
+      await mkdir(join(root, "packages/core/src"), { recursive: true });
+      await mkdir(join(root, "apps/web/src"), { recursive: true });
+
+      await writeFile(
+        join(outside, "tsconfig.json"),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@leak/*": ["./*"] },
+          },
+        }),
+      );
+      await writeFile(join(outside, "secret.ts"), "export const secret = 1;\n");
+
+      await writeFile(
+        join(root, "tsconfig.json"),
+        JSON.stringify({
+          references: [
+            { path: "./packages/core" },
+            { path: "./tsconfig.app.json" },
+            { path: outside },
+          ],
+        }),
+      );
+      await writeFile(
+        join(root, "packages/core/tsconfig.json"),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@core/*": ["src/*"] },
+          },
+          references: [{ path: "../../tsconfig.json" }],
+        }),
+      );
+      await writeFile(
+        join(root, "tsconfig.app.json"),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@app/*": ["apps/web/src/*"] },
+          },
+        }),
+      );
+
+      await writeFile(join(root, "packages/core/src/util.ts"), "export const util = 1;\n");
+      const mainFile = join(root, "apps/web/src/main.ts");
+      await writeFile(
+        mainFile,
+        [
+          'import { util } from "@core/util";',
+          'import { helper } from "@app/helper";',
+          'import { secret } from "@leak/secret";',
+          "export const main = [util, helper, secret];",
+        ].join("\n"),
+      );
+      await writeFile(join(root, "apps/web/src/helper.ts"), "export const helper = 2;\n");
+
+      expect(resolveImport(mainFile, "@core/util", root)).toBe("packages/core/src/util.ts");
+      expect(resolveImport(mainFile, "@app/helper", root)).toBe("apps/web/src/helper.ts");
+      expect(resolveImport(mainFile, "@leak/secret", root)).toBeNull();
+
+      const res = await indexProjectGraph(dbPath, projectId, root);
+      expect(res.files).toBe(3);
+      expect(graphNeighbors(dbPath, projectId, "apps/web/src/main.ts", 10, 1)).toEqual([
+        {
+          kind: "imports",
+          from: "apps/web/src/main.ts",
+          to: "packages/core/src/util.ts",
+          label: "packages/core/src/util.ts",
+        },
+        {
+          kind: "imports",
+          from: "apps/web/src/main.ts",
+          to: "apps/web/src/helper.ts",
+          label: "apps/web/src/helper.ts",
+        },
+      ]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("supports queryGraphNeighbors batched paths[], include_symbols cap, and freshness", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    const manySymbols = Array.from({ length: 15 }, (_, i) => `export const s${i + 1} = ${i + 1};`);
+    const fileA = join(root, "src/a.ts");
+    await writeFile(fileA, ['import { bFn } from "./b.js";', ...manySymbols].join("\n"));
+    await writeFile(
+      join(root, "src/b.ts"),
+      ['import { cFn } from "./c.js";', "export function bFn() { return cFn(); }"].join("\n"),
+    );
+    await writeFile(join(root, "src/c.ts"), "export function cFn() { return 1; }\n");
+
+    await indexProjectGraph(dbPath, projectId, root);
+    const rootDirs = [{ rootId: null, dir: root }];
+
+    expect(checkGraphFreshness(dbPath, projectId, rootDirs)).toEqual({
+      stale: false,
+      checked_files: 3,
+    });
+
+    const batched = queryGraphNeighbors(
+      dbPath,
+      projectId,
+      {
+        paths: ["src/a.ts", "src/b.ts", "src/a.ts"],
+        depth: 1,
+        limit: 10,
+        include_symbols: true,
+      },
+      rootDirs,
+    );
+    expect(GraphNeighborsOutput.parse(batched)).toEqual(batched);
+    expect(batched.path).toBeUndefined();
+    expect(batched.stale).toBeUndefined();
+    expect(batched.edges).toEqual([
+      { kind: "imports", from: "src/a.ts", to: "src/b.ts", label: "src/b.ts" },
+      { kind: "imports", from: "src/b.ts", to: "src/c.ts", label: "src/c.ts" },
+    ]);
+    expect(batched.files).toEqual([
+      {
+        path: "src/a.ts",
+        edges: [{ kind: "imports", from: "src/a.ts", to: "src/b.ts", label: "src/b.ts" }],
+        symbols: Array.from({ length: 12 }, (_, i) => `s${i + 1}`),
+      },
+      {
+        path: "src/b.ts",
+        edges: [
+          { kind: "imports", from: "src/a.ts", to: "src/b.ts", label: "src/b.ts" },
+          { kind: "imports", from: "src/b.ts", to: "src/c.ts", label: "src/c.ts" },
+        ],
+        symbols: ["bFn"],
+      },
+    ]);
+
+    const future = new Date(Date.now() + 10_000);
+    await writeFile(fileA, "export const changed = 1;\n");
+    await utimes(fileA, future, future);
+
+    const staleQuery = queryGraphNeighbors(
+      dbPath,
+      projectId,
+      { path: "src/a.ts", depth: 1, limit: 1 },
+      rootDirs,
+    );
+    expect(staleQuery.path).toBe("src/a.ts");
+    expect(staleQuery.edges).toHaveLength(1);
+    expect(staleQuery.stale).toBe(true);
+    expect(staleQuery.stale_reason).toBe("modified_files");
+  });
+
+  it("prioritizes claim function locations past the legacy name cap and skips invalid lines", async () => {
+    const paths = ["priority.ts", "partial.ts", "unknown.ts"];
+    const variables = Array.from({ length: 13 }, (_, i) => `export const v${i + 1} = ${i + 1};`);
+    const functions = ["zFirst", "bSecond", "aThird", "cFourth"];
+    await writeFile(
+      join(root, "priority.ts"),
+      [...variables, "", ...functions.map((name) => `export function ${name}() {}`)].join("\n"),
+    );
+    await writeFile(
+      join(root, "partial.ts"),
+      "export const before = 1;\n\nexport function run() {}\n",
+    );
+    const invalid = [
+      { name: "nullLine", line: null },
+      { name: "zeroLine", line: 0 },
+      { name: "negativeLine", line: -1 },
+      { name: "fractionalLine", line: 1.5 },
+    ];
+    await writeFile(
+      join(root, "unknown.ts"),
+      invalid.map(({ name }) => `export function ${name}() {}`).join("\n"),
+    );
+    await indexProjectGraph(dbPath, projectId, root);
+
+    const db = openDatabaseAt(dbPath);
+    try {
+      const updateLine = db.prepare(
+        "UPDATE symbols SET line = ? WHERE project_id = ? AND name = ?",
+      );
+      for (const { name, line } of invalid) updateLine.run(line, projectId, name);
+    } finally {
+      db.close();
+    }
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    expect(queryClaimGraphSlice(dbPath, projectId, paths, rootDirs)).toEqual([
+      {
+        path: "priority.ts",
+        edges: [],
+        symbols: Array.from({ length: 12 }, (_, i) => `v${i + 1}`),
+        symbol_locations: [
+          { name: "zFirst", line: 15 },
+          { name: "bSecond", line: 16 },
+          { name: "aThird", line: 17 },
+        ],
+      },
+      {
+        path: "partial.ts",
+        edges: [],
+        symbols: ["before", "run"],
+        symbol_locations: [
+          { name: "run", line: 3 },
+          { name: "before", line: 1 },
+        ],
+      },
+      {
+        path: "unknown.ts",
+        edges: [],
+        symbols: ["negativeLine", "zeroLine", "fractionalLine", "nullLine"],
+      },
+    ]);
+  });
+
+  it("omits unverified locations per target even when the 100-file sample stays fresh", async () => {
+    const paths = ["changed.ts", "missing.ts", "linked/escaped.ts", "valid.ts"];
+    const original = "export function target() {}\n";
+    const older = new Date("2026-01-01T00:00:00Z");
+    const newer = new Date("2026-01-02T00:00:00Z");
+    await mkdir(join(root, "linked"));
+    for (const path of paths) {
+      await writeFile(join(root, path), original);
+      await utimes(join(root, path), older, older);
+    }
+    // Both sampling orders favor these files: newer mtime and a lower content hash.
+    await Promise.all(
+      Array.from({ length: 100 }, async (_, i) => {
+        const path = join(root, `sample-${i}.ts`);
+        await writeFile(path, "export const sample = 1;\n");
+        await utimes(path, newer, newer);
+      }),
+    );
+    expect((await indexProjectGraph(dbPath, projectId, root)).files).toBe(104);
+
+    const outside = await mkdtemp(`${root}-outside-`);
+    try {
+      await writeFile(join(root, "changed.ts"), `\n${original}`);
+      await utimes(join(root, "changed.ts"), newer, newer);
+      await rm(join(root, "missing.ts"));
+      // File keeps its indexed mtime; only canonical containment distinguishes it.
+      await rename(join(root, "linked"), join(outside, "linked"));
+      await symlink(join(outside, "linked"), join(root, "linked"), "junction");
+
+      const rootDirs = [{ rootId: null, dir: root }];
+      expect(checkGraphFreshness(dbPath, projectId, rootDirs)).toEqual({
+        stale: false,
+        checked_files: 100,
+      });
+      const legacy = queryGraphNeighbors(
+        dbPath,
+        projectId,
+        { paths, include_symbols: true },
+        rootDirs,
+      );
+      const legacyFiles = paths.map((path) => ({ path, edges: [], symbols: ["target"] }));
+      expect(legacy).toEqual({ edges: [], files: legacyFiles });
+      expect(queryClaimGraphSlice(dbPath, projectId, paths, rootDirs)).toEqual(
+        legacyFiles.map((file) =>
+          file.path === "valid.ts"
+            ? { ...file, symbol_locations: [{ name: "target", line: 1 }] }
+            : file,
+        ),
+      );
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("reports checkGraphFreshness accurately across empty, fresh, modified, and deleted states", async () => {

@@ -5,7 +5,10 @@ import { describe, expect, it } from "vitest";
 import { applyFileEdits, planRemove } from "./maintenance.js";
 import {
   planSubagents,
+  renderCodexOrchestrator,
   renderCodexSubagent,
+  renderOrchestratorAgent,
+  renderOrchestratorStub,
   renderSubagent,
   SUBAGENT_MARKER,
 } from "./subagents.js";
@@ -27,6 +30,42 @@ describe("subagent persona", () => {
     expect(md).toContain("- Hanya apps/api");
     expect(md).toContain("Owned repos: `be`");
     expect(md).toContain("Stack:");
+    expect(md).toContain("TASK_ID");
+    expect(md).toContain("claim_task");
+    expect(md).toContain("`compact: true`");
+    expect(md).toContain("`include_context: true`");
+    expect(md).toContain("skip `get_project_context` and `get_ready_tasks`");
+    expect(md).toContain("No `TASK_ID` in brief");
+    expect(md).toContain("get_document");
+    expect(md).toContain("outline_only");
+    expect(md).toContain("section");
+    expect(md).toContain("graph_neighbors");
+    expect(md).toContain("paths[]");
+    expect(md).toContain("notes_for_next_agent");
+  });
+
+  it("renders compact deterministic delegation brief template in orchestrator stubs", () => {
+    const ctx = { stack: ["ts"], personas: [adel] };
+    const opencode = renderOrchestratorAgent(ctx);
+    expect(opencode).toContain("## Delegation brief");
+    for (const key of [
+      "TASK_ID:",
+      "WORKTREE:",
+      "GOAL:",
+      "FILES:",
+      "CONTRACTS:",
+      "VERIFY:",
+      "CONSTRAINTS:",
+      "DONE WHEN:",
+    ]) {
+      expect(opencode).toContain(key);
+    }
+
+    const claude = renderOrchestratorStub(ctx, "claude-code");
+    expect(claude).toContain("TASK_ID/WORKTREE/GOAL/FILES/CONTRACTS/VERIFY/CONSTRAINTS/DONE WHEN");
+
+    const codex = renderCodexOrchestrator(ctx);
+    expect(codex).toContain("TASK_ID/WORKTREE/GOAL/FILES/CONTRACTS/VERIFY/CONSTRAINTS/DONE WHEN");
   });
 
   it("enriches cursor / antigravity / codex with native conventions", () => {

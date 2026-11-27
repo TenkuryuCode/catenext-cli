@@ -1,9 +1,24 @@
 import { createHash } from "node:crypto";
-import { type Dirent, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  type Dirent,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import {
+  type ClaimGraphFile,
+  GraphNeighborsInput,
+  type GraphNeighborsOutput,
+  MAX_CLAIM_SYMBOL_LOCATIONS,
+} from "@catenext/shared";
 import { type ParseError, parse as parseJsonc } from "jsonc-parser";
 import { parse as parseYaml } from "yaml";
+import type { z } from "zod";
 import { collectRootTargets } from "../workspace-roots.js";
 import {
   DEFAULT_MAX_FILE_BYTES,
@@ -14,6 +29,22 @@ import {
   walkWorkspaceFiles,
 } from "../workspace-walk.js";
 import { checkpointWalAndClose, openDatabaseAt } from "./open.js";
+
+export const GRAPH_PARSER_VERSION = 2;
+const MAX_INDEXED_FILE_SYMBOLS = 80;
+
+function graphParserVersionKey(projectId: string): string {
+  // The legacy DB-wide marker cannot prove freshness for any one project.
+  return `graph_parser_version:${projectId}`;
+}
+
+function isGraphParserCurrent(db: DatabaseSync, projectId: string): boolean {
+  const row = db
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(graphParserVersionKey(projectId));
+  const version = Number(row?.value);
+  return Number.isFinite(version) && version >= GRAPH_PARSER_VERSION;
+}
 
 const CODE_EXT = new Set([
   ".ts",
@@ -756,11 +787,16 @@ function parseTsJsReexportSymbols(
     results.push({ name, kind: "reexport", line: lineOffset + lineAtOffset(cleaned, offset) });
   }
 
-  const starRe = /(?:^|[;\n{}])\s*export\s+(?:type\s+)?\*\s+from\s*["'][^"']+["']/g;
+  const starRe = /(?:^|[;\n{}])\s*export\s+(?:type\s+)?\*\s+from\s*["']([^"']+)["']/g;
   for (const match of cleaned.matchAll(starRe)) {
+    const spec = match[1]?.trim();
     const exportIdx = match[0].indexOf("export");
     const offset = (match.index ?? 0) + Math.max(0, exportIdx);
-    results.push({ name: "*", kind: "reexport", line: lineOffset + lineAtOffset(cleaned, offset) });
+    results.push({
+      name: spec ? `* (${spec})` : "*",
+      kind: "reexport",
+      line: lineOffset + lineAtOffset(cleaned, offset),
+    });
   }
 
   const namedRe = /(?:^|[;\n{}])\s*export(?:\s+type)?\s*\{([^}]*)\}\s*from\s*["'][^"']+["']/g;
@@ -789,7 +825,15 @@ function parseTsJsReexportSymbols(
     }
   }
 
-  return results;
+  const seen = new Set<string>();
+  const deduped: Array<{ name: string; kind: string; line: number }> = [];
+  for (const sym of results.sort((a, b) => a.line - b.line)) {
+    const key = `${sym.kind}\0${sym.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(sym);
+  }
+  return deduped;
 }
 
 function parseTsJsSymbolsForBlock(
@@ -842,13 +886,13 @@ export function parseSymbols(
     const symbols: Array<{ name: string; kind: string; line: number }> = [];
     for (const block of extractSfcScriptBlocks(content)) {
       symbols.push(...parseTsJsSymbolsForBlock(block.code, block.startLine - 1));
-      if (symbols.length >= 80) return symbols.slice(0, 80);
+      if (symbols.length >= MAX_INDEXED_FILE_SYMBOLS) break;
     }
-    return symbols.slice(0, 80);
+    return symbols.slice(0, MAX_INDEXED_FILE_SYMBOLS);
   }
 
   if (normalizedExt && TS_JS_EXT.has(normalizedExt)) {
-    return parseTsJsSymbolsForBlock(content, 0).slice(0, 80);
+    return parseTsJsSymbolsForBlock(content, 0).slice(0, MAX_INDEXED_FILE_SYMBOLS);
   }
 
   const symbols: Array<{ name: string; kind: string; line: number }> = [];
@@ -868,7 +912,7 @@ export function parseSymbols(
     symbols.push(...parseTsJsReexportSymbols(content, 0));
     symbols.sort((a, b) => a.line - b.line);
   }
-  return symbols.slice(0, 80);
+  return symbols.slice(0, MAX_INDEXED_FILE_SYMBOLS);
 }
 
 function importCandidates(base: string, spec: string, fromExt?: string): string[] {
@@ -1329,6 +1373,7 @@ type TsconfigResolved = {
   configDir: string;
   baseUrlAbs: string | null;
   mappings: TsconfigPathMapping[];
+  references: string[];
 };
 
 export type TsResolutionContext = {
@@ -1771,6 +1816,9 @@ function resolveWorkspacePackageImport(
   return null;
 }
 
+const MAX_TSCONFIG_REF_DEPTH = 8;
+const MAX_TSCONFIG_FILES = 64;
+
 function resolveTsconfigExtendsPath(
   fromConfigDir: string,
   extSpec: string,
@@ -1785,6 +1833,26 @@ function resolveTsconfigExtendsPath(
     if (!toRelInsideRoot(realRoot, candidate)) continue;
     if (isSafeRegularFileSync(realRoot, candidate)) {
       return safeRealpathSync(candidate);
+    }
+  }
+  return null;
+}
+
+function resolveTsconfigReferencePath(
+  fromConfigDir: string,
+  refSpec: string,
+  realRoot: string,
+): string | null {
+  if (!refSpec) return null;
+  const rawBase = isAbsolute(refSpec) ? resolve(refSpec) : resolve(fromConfigDir, refSpec);
+  const candidates = rawBase.endsWith(".json")
+    ? [rawBase]
+    : [join(rawBase, "tsconfig.json"), rawBase, `${rawBase}.json`];
+  for (const candidate of candidates) {
+    if (!isWithinRoot(realRoot, candidate)) continue;
+    if (isSafeRegularFileSync(realRoot, candidate)) {
+      const realCandidate = safeRealpathSync(candidate);
+      if (isWithinRoot(realRoot, realCandidate)) return realCandidate;
     }
   }
   return null;
@@ -1818,7 +1886,7 @@ function loadTsconfigChain(
   nextVisited.add(realConfigPath);
 
   const configDir = dirname(realConfigPath);
-  const obj = parsed as { extends?: unknown; compilerOptions?: unknown };
+  const obj = parsed as { extends?: unknown; compilerOptions?: unknown; references?: unknown };
 
   let inheritedBaseUrl: string | null = null;
   let inheritedMappings: TsconfigPathMapping[] = [];
@@ -1883,7 +1951,20 @@ function loadTsconfigChain(
     mappings = inheritedMappings.map((m) => ({ ...m, baseDir: baseUrlAbs }));
   }
 
-  const resolved: TsconfigResolved = { configDir, baseUrlAbs, mappings };
+  const references: string[] = [];
+  if (Array.isArray(obj.references)) {
+    for (const ref of obj.references) {
+      if (!ref || typeof ref !== "object" || Array.isArray(ref)) continue;
+      const rawPath = (ref as { path?: unknown }).path;
+      if (typeof rawPath !== "string") continue;
+      const refPath = resolveTsconfigReferencePath(configDir, rawPath.trim(), realRoot);
+      if (refPath && !references.includes(refPath)) {
+        references.push(refPath);
+      }
+    }
+  }
+
+  const resolved: TsconfigResolved = { configDir, baseUrlAbs, mappings, references };
   cache.set(realConfigPath, resolved);
   return resolved;
 }
@@ -1896,14 +1977,28 @@ function findTsconfigsForDir(
   const configs: TsconfigResolved[] = [];
   const seen = new Set<string>();
   let cur = fromDirInRealRoot;
-  while (cur === realRoot || toRelInsideRoot(realRoot, cur) !== null) {
+  while (
+    (cur === realRoot || toRelInsideRoot(realRoot, cur) !== null) &&
+    configs.length < MAX_TSCONFIG_FILES
+  ) {
     const candidate = join(cur, "tsconfig.json");
     if (isSafeRegularFileSync(realRoot, candidate)) {
       const realCfg = safeRealpathSync(candidate);
-      if (!seen.has(realCfg)) {
-        seen.add(realCfg);
-        const loaded = loadTsconfigChain(realCfg, realRoot, cache);
-        if (loaded) configs.push(loaded);
+      const queue: Array<{ path: string; depth: number }> = [{ path: realCfg, depth: 0 }];
+      while (queue.length > 0 && configs.length < MAX_TSCONFIG_FILES) {
+        const item = queue.shift();
+        if (!item || seen.has(item.path)) continue;
+        seen.add(item.path);
+        const loaded = loadTsconfigChain(item.path, realRoot, cache);
+        if (!loaded) continue;
+        configs.push(loaded);
+        if (item.depth < MAX_TSCONFIG_REF_DEPTH) {
+          for (const refPath of loaded.references) {
+            if (!seen.has(refPath)) {
+              queue.push({ path: refPath, depth: item.depth + 1 });
+            }
+          }
+        }
       }
     }
     if (cur === realRoot) break;
@@ -2045,6 +2140,7 @@ export type GraphIndexResult = {
 
 export type GraphIndexOptions = {
   maxFileBytes?: number;
+  rebuildEdges?: boolean;
 };
 
 type WalkedEntry = {
@@ -2112,12 +2208,30 @@ export async function indexProjectGraph(
     }
 
     const knownFiles = new Set(entries.map((entry) => entry.rel));
-    const entryByRel = new Map(entries.map((entry) => [entry.rel, entry]));
 
     const existingRows = db
       .prepare("SELECT id, root_id, path, hash, mtime_ms FROM files WHERE project_id = ?")
       .all(projectId) as ExistingFileRow[];
     const existingByPath = new Map(existingRows.map((row) => [row.path, row]));
+
+    const needsParserUpgrade = !isGraphParserCurrent(db, projectId);
+
+    const legacyReexportFileIds = new Set<number>();
+    if (!needsParserUpgrade && existingRows.length > 0) {
+      const legacyRows = db
+        .prepare(
+          `SELECT DISTINCT e.from_file_id AS id
+           FROM edges e
+           WHERE e.project_id = ?
+             AND e.kind = 'reexport'
+             AND e.from_file_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM symbols s WHERE s.project_id = ? AND s.file_id = e.from_file_id
+             )`,
+        )
+        .all(projectId, projectId) as Array<{ id: number }>;
+      for (const row of legacyRows) legacyReexportFileIds.add(row.id);
+    }
 
     const deletedIds: number[] = [];
     for (const row of existingRows) {
@@ -2125,7 +2239,7 @@ export async function indexProjectGraph(
     }
 
     const edgeRefreshPaths = new Set<string>();
-    if (deletedIds.length > 0) {
+    if (!options.rebuildEdges && deletedIds.length > 0) {
       const placeholders = deletedIds.map(() => "?").join(", ");
       const affected = db
         .prepare(
@@ -2140,8 +2254,7 @@ export async function indexProjectGraph(
       }
     }
 
-    const addedCount = entries.filter((entry) => !existingByPath.has(entry.rel)).length;
-    if (addedCount > 0) {
+    if (!options.rebuildEdges && entries.some((entry) => !existingByPath.has(entry.rel))) {
       const unresolved = db
         .prepare(
           `SELECT DISTINCT f.path
@@ -2179,7 +2292,7 @@ export async function indexProjectGraph(
       symbols: Array<{ name: string; kind: string; line: number }>;
       imports: ResolvedEdgeTarget[];
     }> = [];
-    const refreshedEdges: Array<{ id: number; rel: string; imports: ResolvedEdgeTarget[] }> = [];
+    const refreshedEdges: Array<{ id: number; imports: ResolvedEdgeTarget[] }> = [];
 
     const psr4ByRoot = new Map<string, ComposerPsr4Entry[]>();
     const getPsr4ForRoot = (realRoot: string): ComposerPsr4Entry[] => {
@@ -2277,7 +2390,16 @@ export async function indexProjectGraph(
 
     for (const entry of entries) {
       const existing = existingByPath.get(entry.rel);
-      if (existing && existing.mtime_ms === entry.mtimeMs && existing.root_id === entry.rootId) {
+      const forceReparse =
+        existing !== undefined && (needsParserUpgrade || legacyReexportFileIds.has(existing.id));
+      const refreshEdges = options.rebuildEdges || edgeRefreshPaths.has(entry.rel);
+      if (
+        !forceReparse &&
+        !refreshEdges &&
+        existing &&
+        existing.mtime_ms === entry.mtimeMs &&
+        existing.root_id === entry.rootId
+      ) {
         idByPath.set(entry.rel, existing.id);
         continue;
       }
@@ -2288,9 +2410,14 @@ export async function indexProjectGraph(
         continue;
       }
       const contentHash = hash(content);
-      if (existing && existing.hash === contentHash) {
+      if (!forceReparse && existing && existing.hash === contentHash) {
         idByPath.set(entry.rel, existing.id);
-        mtimeOnlyUpdates.push({ id: existing.id, rootId: entry.rootId, mtimeMs: entry.mtimeMs });
+        if (existing.mtime_ms !== entry.mtimeMs || existing.root_id !== entry.rootId) {
+          mtimeOnlyUpdates.push({ id: existing.id, rootId: entry.rootId, mtimeMs: entry.mtimeMs });
+        }
+        if (refreshEdges) {
+          refreshedEdges.push({ id: existing.id, imports: resolveImportsForEntry(entry, content) });
+        }
         continue;
       }
 
@@ -2318,21 +2445,6 @@ export async function indexProjectGraph(
           imports,
         });
       }
-    }
-
-    const changedRels = new Set([
-      ...newFiles.map((f) => f.rel),
-      ...modifiedFiles.map((f) => f.rel),
-    ]);
-    for (const rel of edgeRefreshPaths) {
-      if (changedRels.has(rel)) continue;
-      const existing = existingByPath.get(rel);
-      const entry = entryByRel.get(rel);
-      if (!existing || !entry) continue;
-      const content = await readBoundedUtf8File(entry.full, entry.realRoot, maxFileBytes);
-      if (content === null) continue;
-      const imports = resolveImportsForEntry(entry, content);
-      refreshedEdges.push({ id: existing.id, rel, imports });
     }
 
     const useSavepoint = typeof dbOrPath !== "string";
@@ -2401,6 +2513,10 @@ export async function indexProjectGraph(
         insertEdge.run(projectId, edge.kind, edge.fromId, toId ?? null, edge.to);
       }
 
+      db.prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(graphParserVersionKey(projectId), String(GRAPH_PARSER_VERSION));
+
       db.exec(useSavepoint ? "RELEASE SAVEPOINT graph_index" : "COMMIT");
     } catch (error) {
       db.exec(
@@ -2411,24 +2527,34 @@ export async function indexProjectGraph(
       throw error;
     }
 
-    const totalFiles = (
-      db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
-        c: number;
-      }
-    ).c;
-    const totalSymbols = (
-      db.prepare("SELECT COUNT(*) AS c FROM symbols WHERE project_id = ?").get(projectId) as {
-        c: number;
-      }
-    ).c;
-    const totalEdges = (
-      db.prepare("SELECT COUNT(*) AS c FROM edges WHERE project_id = ?").get(projectId) as {
-        c: number;
-      }
-    ).c;
-
-    return { files: totalFiles, symbols: totalSymbols, edges: totalEdges };
+    return readGraphCounts(db, projectId);
   });
+}
+
+function readGraphCounts(db: DatabaseSync, projectId: string): GraphIndexResult {
+  const totalFiles = (
+    db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
+      c: number;
+    }
+  ).c;
+  const totalSymbols = (
+    db.prepare("SELECT COUNT(*) AS c FROM symbols WHERE project_id = ?").get(projectId) as {
+      c: number;
+    }
+  ).c;
+  const totalEdges = (
+    db.prepare("SELECT COUNT(*) AS c FROM edges WHERE project_id = ?").get(projectId) as {
+      c: number;
+    }
+  ).c;
+  return { files: totalFiles, symbols: totalSymbols, edges: totalEdges };
+}
+
+export function getGraphCounts(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+): GraphIndexResult {
+  return withDatabase(dbOrPath, (db) => readGraphCounts(db, projectId));
 }
 
 export function graphNeighbors(
@@ -2504,6 +2630,172 @@ export function graphNeighbors(
     }
 
     return results;
+  });
+}
+
+const MAX_NEIGHBOR_FILE_SYMBOLS = 12;
+
+type NeighborSymbolRow = { name: string; kind?: string; line?: number | null };
+type GraphRootDirs = Array<{ rootId: string | null; dir: string }>;
+type ClaimTargetRow = Pick<ExistingFileRow, "root_id" | "mtime_ms"> & {
+  registered_dir: string | null;
+};
+
+function isCurrentClaimTarget(path: string, row: ClaimTargetRow, rootDirs: GraphRootDirs): boolean {
+  if (row.mtime_ms === null) return false;
+  const root = rootDirs.find(({ rootId }) => rootId === row.root_id);
+  if (!root) return false;
+
+  try {
+    const absRoot = resolve(root.dir);
+    let relativePath = path;
+    if (row.root_id !== null) {
+      if (row.registered_dir === null || resolve(row.registered_dir) !== absRoot) return false;
+      const slash = path.indexOf("/");
+      if (!path.startsWith("@") || slash < 2) return false;
+      relativePath = path.slice(slash + 1);
+    }
+
+    const candidate = resolve(absRoot, relativePath);
+    if (toRelInsideRoot(absRoot, candidate) !== relativePath) return false;
+    if (!lstatSync(absRoot).isDirectory()) return false;
+    const realRoot = realpathSync(absRoot);
+    const stat = lstatSync(candidate);
+    if (!stat.isFile() || Math.floor(stat.mtimeMs) !== row.mtime_ms) return false;
+    const realCandidate = realpathSync(candidate);
+    if (!isWithinRoot(realRoot, realCandidate)) return false;
+    accessSync(realCandidate, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function prioritizeSymbolLocations(rows: NeighborSymbolRow[]): ClaimGraphFile["symbol_locations"] {
+  const functions: Array<{ name: string; line: number }> = [];
+  const others: Array<{ name: string; line: number }> = [];
+  // Rows come in source order, with ID breaking ties. Keep that order within each group.
+  for (const { name, kind, line } of rows) {
+    if (line == null || !Number.isSafeInteger(line) || line < 1) continue;
+    if (kind === "function" || kind === "method") {
+      functions.push({ name, line });
+      if (functions.length === MAX_CLAIM_SYMBOL_LOCATIONS) return functions;
+    } else if (others.length < MAX_CLAIM_SYMBOL_LOCATIONS) {
+      others.push({ name, line });
+    }
+  }
+  const locations = [
+    ...functions,
+    ...others.slice(0, MAX_CLAIM_SYMBOL_LOCATIONS - functions.length),
+  ];
+  return locations.length > 0 ? locations : undefined;
+}
+
+export function queryGraphNeighbors(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+  rawInput: z.input<typeof GraphNeighborsInput>,
+  rootDirs?: GraphRootDirs,
+): z.output<typeof GraphNeighborsOutput> {
+  return queryGraphNeighborsInternal(dbOrPath, projectId, rawInput, rootDirs, false);
+}
+
+export function queryClaimGraphSlice(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+  paths: string[],
+  rootDirs: GraphRootDirs,
+): ClaimGraphFile[] {
+  return queryGraphNeighborsInternal(
+    dbOrPath,
+    projectId,
+    { paths, depth: 1, limit: 15, include_symbols: true },
+    rootDirs,
+    true,
+  ).files;
+}
+
+function queryGraphNeighborsInternal(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+  rawInput: z.input<typeof GraphNeighborsInput>,
+  rootDirs: GraphRootDirs | undefined,
+  claimSlice: boolean,
+): Omit<z.output<typeof GraphNeighborsOutput>, "files"> & { files: ClaimGraphFile[] } {
+  const parsed = GraphNeighborsInput.parse(rawInput);
+  const rawTargets = parsed.paths ?? (parsed.path ? [parsed.path] : []);
+  const targetPaths = [...new Set(rawTargets)].slice(0, 5);
+
+  return withDatabase(dbOrPath, (db) => {
+    const freshness = rootDirs ? checkGraphFreshness(db, projectId, rootDirs) : undefined;
+    const includeLocations = claimSlice && freshness?.stale === false;
+    const claimTargetStmt = includeLocations
+      ? db.prepare(
+          `SELECT f.root_id, f.mtime_ms, r.path AS registered_dir
+           FROM files f
+           LEFT JOIN workspace_roots r ON r.project_id = f.project_id AND r.id = f.root_id
+           WHERE f.project_id = ? AND f.path = ?`,
+        )
+      : null;
+    const symbolStmt = parsed.include_symbols
+      ? db.prepare(
+          `SELECT s.name${includeLocations ? ", s.kind, s.line" : ""}
+           FROM symbols s
+           JOIN files f ON f.id = s.file_id
+           WHERE s.project_id = ? AND f.path = ?
+           ORDER BY COALESCE(s.line, 2147483647), s.id
+           LIMIT ?`,
+        )
+      : null;
+
+    const files: ClaimGraphFile[] = [];
+    const seenEdgeKeys = new Set<string>();
+    const aggregatedEdges: Array<{ kind: string; from: string; to: string; label?: string }> = [];
+
+    for (const targetPath of targetPaths) {
+      const fileEdges = graphNeighbors(db, projectId, targetPath, parsed.limit, parsed.depth);
+      for (const edge of fileEdges) {
+        if (aggregatedEdges.length >= parsed.limit) break;
+        const key = `${edge.kind}\0${edge.from}\0${edge.to}\0${edge.label ?? ""}`;
+        if (seenEdgeKeys.has(key)) continue;
+        seenEdgeKeys.add(key);
+        aggregatedEdges.push(edge);
+      }
+
+      if (symbolStmt) {
+        // Project sampling may miss this target or skip an unregistered root.
+        const target = claimTargetStmt?.get(projectId, targetPath) as ClaimTargetRow | undefined;
+        const targetCurrent =
+          target !== undefined &&
+          rootDirs !== undefined &&
+          isCurrentClaimTarget(targetPath, target, rootDirs);
+        const symbolLimit = targetCurrent ? MAX_INDEXED_FILE_SYMBOLS : MAX_NEIGHBOR_FILE_SYMBOLS;
+        const symRows = symbolStmt.all(projectId, targetPath, symbolLimit) as NeighborSymbolRow[];
+        const locations = targetCurrent ? prioritizeSymbolLocations(symRows) : undefined;
+        files.push({
+          path: targetPath,
+          edges: fileEdges,
+          symbols: symRows.slice(0, MAX_NEIGHBOR_FILE_SYMBOLS).map((row) => row.name),
+          ...(locations ? { symbol_locations: locations } : {}),
+        });
+      } else {
+        files.push({
+          path: targetPath,
+          edges: fileEdges,
+        });
+      }
+    }
+
+    const singlePath = parsed.path ?? (targetPaths.length === 1 ? targetPaths[0] : undefined);
+
+    return {
+      ...(singlePath !== undefined ? { path: singlePath } : {}),
+      edges: aggregatedEdges,
+      files,
+      ...(freshness?.stale
+        ? { stale: true, ...(freshness.reason ? { stale_reason: freshness.reason } : {}) }
+        : {}),
+    };
   });
 }
 
@@ -2608,101 +2900,134 @@ function hasAnyCodeFileBounded(absDir: string): boolean {
 }
 
 export function checkGraphFreshness(
-  db: DatabaseSync,
+  dbOrPath: DatabaseSync | string,
   projectId: string,
   rootDirs: Array<{ rootId: string | null; dir: string }>,
 ): GraphFreshnessResult {
-  const totalFiles = (
-    db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
-      c: number;
-    }
-  ).c;
+  return withDatabase(dbOrPath, (db) => {
+    const totalFiles = (
+      db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
+        c: number;
+      }
+    ).c;
 
-  if (totalFiles === 0) {
+    if (totalFiles === 0) {
+      for (const rootDir of rootDirs) {
+        if (hasAnyCodeFileBounded(resolve(rootDir.dir))) {
+          return { stale: true, reason: "not_indexed", checked_files: 0 };
+        }
+      }
+      return { stale: false, checked_files: 0 };
+    }
+
+    if (!isGraphParserCurrent(db, projectId)) {
+      return { stale: true, reason: "parser_version", checked_files: 0 };
+    }
+
+    const rootById = new Map<string | null, { absDir: string; realDir: string }>();
     for (const rootDir of rootDirs) {
-      if (hasAnyCodeFileBounded(resolve(rootDir.dir))) {
-        return { stale: true, reason: "not_indexed", checked_files: 0 };
+      const absDir = resolve(rootDir.dir);
+      const realDir = safeRealpathSync(absDir);
+      rootById.set(rootDir.rootId, { absDir, realDir });
+    }
+
+    type FreshnessRow = {
+      id: number;
+      root_id: string | null;
+      path: string;
+      mtime_ms: number | null;
+    };
+
+    let sampleRows: FreshnessRow[];
+    if (totalFiles <= MAX_FRESHNESS_CHECK_FILES) {
+      sampleRows = db
+        .prepare(
+          "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY id LIMIT ?",
+        )
+        .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
+    } else {
+      const half = Math.floor(MAX_FRESHNESS_CHECK_FILES / 2);
+      const recentRows = db
+        .prepare(
+          "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(mtime_ms, 0) DESC, id ASC LIMIT ?",
+        )
+        .all(projectId, half) as FreshnessRow[];
+      const spreadRows = db
+        .prepare(
+          "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(hash, ''), id ASC LIMIT ?",
+        )
+        .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
+      const byId = new Map<number, FreshnessRow>();
+      for (const row of recentRows) byId.set(row.id, row);
+      for (const row of spreadRows) {
+        if (byId.size >= MAX_FRESHNESS_CHECK_FILES) break;
+        if (!byId.has(row.id)) byId.set(row.id, row);
       }
-    }
-    return { stale: false, checked_files: 0 };
-  }
-
-  const rootById = new Map<string | null, { absDir: string; realDir: string }>();
-  for (const rootDir of rootDirs) {
-    const absDir = resolve(rootDir.dir);
-    const realDir = safeRealpathSync(absDir);
-    rootById.set(rootDir.rootId, { absDir, realDir });
-  }
-
-  type FreshnessRow = {
-    id: number;
-    root_id: string | null;
-    path: string;
-    mtime_ms: number | null;
-  };
-
-  let sampleRows: FreshnessRow[];
-  if (totalFiles <= MAX_FRESHNESS_CHECK_FILES) {
-    sampleRows = db
-      .prepare(
-        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY id LIMIT ?",
-      )
-      .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
-  } else {
-    const half = Math.floor(MAX_FRESHNESS_CHECK_FILES / 2);
-    const recentRows = db
-      .prepare(
-        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(mtime_ms, 0) DESC, id ASC LIMIT ?",
-      )
-      .all(projectId, half) as FreshnessRow[];
-    const spreadRows = db
-      .prepare(
-        "SELECT id, root_id, path, mtime_ms FROM files WHERE project_id = ? ORDER BY COALESCE(hash, ''), id ASC LIMIT ?",
-      )
-      .all(projectId, MAX_FRESHNESS_CHECK_FILES) as FreshnessRow[];
-    const byId = new Map<number, FreshnessRow>();
-    for (const row of recentRows) byId.set(row.id, row);
-    for (const row of spreadRows) {
-      if (byId.size >= MAX_FRESHNESS_CHECK_FILES) break;
-      if (!byId.has(row.id)) byId.set(row.id, row);
-    }
-    sampleRows = [...byId.values()];
-  }
-
-  let checked = 0;
-  for (const row of sampleRows) {
-    const rootEntry = rootById.get(row.root_id);
-    if (!rootEntry) continue;
-
-    let relInRoot = row.path;
-    if (row.root_id !== null && relInRoot.startsWith("@")) {
-      const slashIdx = relInRoot.indexOf("/");
-      if (slashIdx !== -1) relInRoot = relInRoot.slice(slashIdx + 1);
+      sampleRows = [...byId.values()];
     }
 
-    const candidate = resolve(rootEntry.absDir, relInRoot);
-    if (!toRelInsideRoot(rootEntry.absDir, candidate)) continue;
+    let checked = 0;
+    for (const row of sampleRows) {
+      const rootEntry = rootById.get(row.root_id);
+      if (!rootEntry) continue;
 
-    checked++;
-    let diskMtimeMs: number;
-    try {
-      const lst = lstatSync(candidate);
-      if (lst.isSymbolicLink() || !lst.isFile()) {
+      let relInRoot = row.path;
+      if (row.root_id !== null && relInRoot.startsWith("@")) {
+        const slashIdx = relInRoot.indexOf("/");
+        if (slashIdx !== -1) relInRoot = relInRoot.slice(slashIdx + 1);
+      }
+
+      const candidate = resolve(rootEntry.absDir, relInRoot);
+      if (!toRelInsideRoot(rootEntry.absDir, candidate)) continue;
+
+      checked++;
+      let diskMtimeMs: number;
+      try {
+        const lst = lstatSync(candidate);
+        if (lst.isSymbolicLink() || !lst.isFile()) {
+          return { stale: true, reason: "missing_files", checked_files: checked };
+        }
+        const realCandidate = realpathSync(candidate);
+        if (!isWithinRoot(rootEntry.realDir, realCandidate)) {
+          return { stale: true, reason: "missing_files", checked_files: checked };
+        }
+        diskMtimeMs = Math.floor(lst.mtimeMs);
+      } catch {
         return { stale: true, reason: "missing_files", checked_files: checked };
       }
-      const realCandidate = realpathSync(candidate);
-      if (!isWithinRoot(rootEntry.realDir, realCandidate)) {
-        return { stale: true, reason: "missing_files", checked_files: checked };
+
+      if (row.mtime_ms === null || diskMtimeMs !== row.mtime_ms) {
+        return { stale: true, reason: "modified_files", checked_files: checked };
       }
-      diskMtimeMs = Math.floor(lst.mtimeMs);
-    } catch {
-      return { stale: true, reason: "missing_files", checked_files: checked };
     }
 
-    if (row.mtime_ms === null || diskMtimeMs !== row.mtime_ms) {
-      return { stale: true, reason: "modified_files", checked_files: checked };
-    }
-  }
+    return { stale: false, checked_files: checked };
+  });
+}
 
-  return { stale: false, checked_files: checked };
+export type GraphFastPathState = {
+  indexed_files: number;
+  stale: boolean;
+  reason?: string;
+};
+
+export function getGraphIndexFastPathState(
+  dbPath: string,
+  projectId: string,
+  rootDirs: Array<{ rootId: string | null; dir: string }>,
+): GraphFastPathState {
+  return withDatabase(dbPath, (db) => {
+    const indexed_files = (
+      db.prepare("SELECT COUNT(*) AS c FROM files WHERE project_id = ?").get(projectId) as {
+        c: number;
+      }
+    ).c;
+
+    const freshness = checkGraphFreshness(db, projectId, rootDirs);
+    return {
+      indexed_files,
+      stale: freshness.stale,
+      ...(freshness.reason ? { reason: freshness.reason } : {}),
+    };
+  });
 }

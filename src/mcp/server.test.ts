@@ -1,10 +1,13 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { McpToolName } from "@catenext/shared";
+import { CatenextConfigSchema, type McpToolName } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { indexProjectGraph } from "../db/graph-index.js";
+import { LocalService } from "../local-service.js";
 import { ROLE_TOOLS } from "./catalog.js";
 import { createCatenextMcpServer, LOCAL_TOOLS, type ServerContext } from "./server.js";
 import type { McpTransport } from "./stdio.js";
@@ -423,5 +426,202 @@ describe("server MCP catenext", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(logs.some((l) => l.includes("EPIPE"))).toBe(true);
     await server.close();
+  });
+
+  it("melewati scrubbing scope_files/doc_refs/paths tetapi menyensor secret pada verify_command", async () => {
+    const { client, calls } = await setup();
+    const pathLike = "src/token_sk_live_abcdefghijklmnop.ts";
+    const res = await client.callTool({
+      name: "create_tasks",
+      arguments: {
+        epic_id: TASK,
+        tasks: [
+          {
+            ref: "t1",
+            title: "Scoped task",
+            prompt_instruction: "Implement feature",
+            scope_files: [pathLike],
+            doc_refs: ["doc_sk_live_abcdefghijklmnop"],
+            verify_command: "API_KEY=sk_live_abcdefghijklmnop pnpm test",
+          },
+        ],
+      },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toMatch(/secret scrubber menyensor/i);
+    expect(calls[0]?.body).toMatchObject({
+      tasks: [
+        {
+          ref: "t1",
+          scope_files: [pathLike],
+          doc_refs: ["doc_sk_live_abcdefghijklmnop"],
+          verify_command: "API_KEY=[REDACTED:stripe_key] pnpm test",
+        },
+      ],
+    });
+
+    await client.callTool({
+      name: "graph_neighbors",
+      arguments: { paths: [pathLike, "src/b.ts"], include_symbols: true },
+    });
+    expect(calls[1]?.body).toMatchObject({
+      paths: [pathLike, "src/b.ts"],
+      include_symbols: true,
+    });
+  });
+
+  it("menjalankan tools/call v0.16 via LocalService (claim_task include_context, batched graph_neighbors, graph_summary prefix, session_brief hints)", async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-mcp-e2e-"));
+    const repoRoot = root;
+    const projectId = randomUUID();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: projectId,
+      project_name: "McpE2E",
+      repo_name: "be",
+    });
+    const human = new LocalService(repoRoot, config, "human");
+    const agent = new LocalService(repoRoot, config, "agent");
+
+    await mkdir(join(repoRoot, "src/mod"), { recursive: true });
+    await mkdir(join(repoRoot, "src/other"), { recursive: true });
+    const modA = join(repoRoot, "src/mod/a.ts");
+    const modB = join(repoRoot, "src/mod/b.ts");
+    const otherC = join(repoRoot, "src/other/c.ts");
+    await writeFile(
+      modA,
+      `import { bFn } from "./b.js";\nexport function aFn() { return bFn(); }\n`,
+    );
+    await writeFile(modB, `export function bFn() { return 1; }\n`);
+    await writeFile(otherC, `export function cFn() { return 2; }\n`);
+
+    await human.callTool("upsert_persona", { alias: "be", role: "backend", repos: ["be"] });
+    await human.callTool("save_document", {
+      slug: "sync-board",
+      title: "Sync Board",
+      kind: "other",
+      content: "## DECISIONS\n- Compact MCP responses\n## OTHER\n- Ignored",
+    });
+    const { epic } = await human.callTool("create_epic", {
+      title: "MCP v0.16",
+      description: "E2E verification",
+    });
+    const { created } = await human.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [
+        {
+          ref: "t1",
+          title: "Wire MCP tools",
+          prompt_instruction: "Check MCP tools.",
+          persona: "be",
+          scope_files: ["src/mod/a.ts"],
+          verify_command: "pnpm test",
+          doc_refs: ["sync-board"],
+        },
+      ],
+    });
+    const [first] = created;
+    if (!first) throw new Error("Expected created task");
+    const taskId = first.task_id;
+    await human.callTool("manage_task", { action: "approve_plan", task_id: taskId });
+    await indexProjectGraph(human.stateFile, projectId, repoRoot);
+
+    const server = createCatenextMcpServer({
+      version: "test",
+      context: async () => ({ ok: true, service: agent, root: repoRoot }),
+    });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "claude-code", version: "1.0.0" });
+    const transport: McpTransport = {
+      async start() {
+        a.onmessage = transport.onmessage;
+        a.onclose = transport.onclose;
+        await a.start();
+      },
+      close: () => a.close(),
+      send: (msg) => a.send("error" in msg ? { ...msg, id: msg.id ?? undefined } : msg),
+    };
+    await Promise.all([server.connect(transport), client.connect(b)]);
+    close = async () => {
+      await client.close();
+      await server.close();
+    };
+
+    const briefClean = await client.callTool({ name: "session_brief", arguments: {} });
+    expect(briefClean.isError).toBeFalsy();
+    expect(JSON.parse(textOf(briefClean)).hints).toBeUndefined();
+
+    const neighborsRes = await client.callTool({
+      name: "graph_neighbors",
+      arguments: { paths: ["src/mod/a.ts", "src/mod/b.ts"], include_symbols: true },
+    });
+    expect(neighborsRes.isError).toBeFalsy();
+    const edge = {
+      kind: "imports",
+      from: "src/mod/a.ts",
+      to: "src/mod/b.ts",
+      label: "src/mod/b.ts",
+    };
+    expect(JSON.parse(textOf(neighborsRes))).toEqual({
+      edges: [edge],
+      files: [
+        { path: "src/mod/a.ts", edges: [edge], symbols: ["aFn"] },
+        { path: "src/mod/b.ts", edges: [edge], symbols: ["bFn"] },
+      ],
+    });
+
+    const legacyNeighborsRes = await client.callTool({
+      name: "graph_neighbors",
+      arguments: { path: "src/mod/a.ts" },
+    });
+    expect(legacyNeighborsRes.isError).toBeFalsy();
+    expect(JSON.parse(textOf(legacyNeighborsRes))).toEqual({
+      path: "src/mod/a.ts",
+      edges: [edge],
+      files: [{ path: "src/mod/a.ts", edges: [edge] }],
+    });
+
+    const summaryRes = await client.callTool({
+      name: "graph_summary",
+      arguments: { prefix: "src/mod", depth: 5 },
+    });
+    expect(summaryRes.isError).toBeFalsy();
+    expect(JSON.parse(textOf(summaryRes)).totals).toEqual({ files: 2, symbols: 2, edges: 1 });
+
+    const claimRes = await client.callTool({
+      name: "claim_task",
+      arguments: { task_id: taskId, agent_alias: "be", include_context: true },
+    });
+    expect(claimRes.isError).toBeFalsy();
+    expect(JSON.parse(textOf(claimRes))).toMatchObject({
+      task: {
+        id: taskId,
+        scope_files: ["src/mod/a.ts"],
+        verify_command: "pnpm test",
+        doc_refs: ["sync-board"],
+      },
+      context_pack: {
+        epic_summary: "MCP v0.16: E2E verification",
+        sync_board_excerpt: "## DECISIONS\n- Compact MCP responses",
+        graph_slice: [
+          {
+            path: "src/mod/a.ts",
+            edges: [edge],
+            symbols: ["aFn"],
+            symbol_locations: [{ name: "aFn", line: 2 }],
+          },
+        ],
+      },
+    });
+
+    await writeFile(modA, `export function aFn() { return 99; }\n`);
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(modA, shifted, shifted);
+
+    const briefStale = await client.callTool({ name: "session_brief", arguments: {} });
+    expect(briefStale.isError).toBeFalsy();
+    expect(JSON.parse(textOf(briefStale)).hints).toEqual([
+      expect.stringContaining("Code graph index is stale (modified_files)"),
+    ]);
   });
 });

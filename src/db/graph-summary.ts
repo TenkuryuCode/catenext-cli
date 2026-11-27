@@ -103,6 +103,16 @@ function renderMermaid(
   return lines.join("\n");
 }
 
+function normalizePrefix(raw: string | undefined): string {
+  if (!raw) return "";
+  const normalized = raw
+    .replaceAll("\\", "/")
+    .trim()
+    .replace(/^(?:\.\/)+/, "")
+    .replace(/^\/+|\/+$/g, "");
+  return normalized === "." ? "" : normalized;
+}
+
 export function summarizeProjectGraph(
   dbOrPath: DatabaseSync | string,
   projectId: string,
@@ -110,6 +120,7 @@ export function summarizeProjectGraph(
   rootDirs?: GraphRootDir[],
 ): GraphSummaryOutputType {
   const parsed = GraphSummaryInput.parse(opts);
+  const prefix = normalizePrefix(parsed.prefix);
   return withDatabase(dbOrPath, (db) => {
     const freshness = freshnessFields(db, projectId, rootDirs);
     const fileRows = db
@@ -127,9 +138,14 @@ export function summarizeProjectGraph(
       };
     }
 
-    const activeFileRows = parsed.include_tests
+    const testFilteredRows = parsed.include_tests
       ? fileRows
       : fileRows.filter((file) => !isTestFilePath(file.path));
+    const activeFileRows = prefix
+      ? testFilteredRows.filter(
+          (file) => file.path === prefix || file.path.startsWith(`${prefix}/`),
+        )
+      : testFilteredRows;
 
     if (activeFileRows.length === 0) {
       return {
@@ -433,7 +449,7 @@ function escapeCell(text: string): string {
 
 export function renderArchitectureMarkdown(
   summary: GraphSummaryOutputType,
-  opts: { title?: string; depth?: number; includeTests?: boolean } = {},
+  opts: { title?: string; depth?: number; includeTests?: boolean; prefix?: string } = {},
 ): string {
   const title = opts.title ?? "Project architecture";
   const lines: string[] = [`# ${title}`, ""];
@@ -445,7 +461,11 @@ export function renderArchitectureMarkdown(
     return `${lines.join("\n")}\n`;
   }
 
-  const depthNote = opts.depth !== undefined ? ` (depth=${opts.depth})` : "";
+  const normalizedPrefix = normalizePrefix(opts.prefix);
+  const scopeNotes: string[] = [];
+  if (opts.depth !== undefined) scopeNotes.push(`depth=${opts.depth}`);
+  if (normalizedPrefix) scopeNotes.push(`prefix=${escapeCell(normalizedPrefix)}`);
+  const depthNote = scopeNotes.length > 0 ? ` (${scopeNotes.join(", ")})` : "";
   lines.push(
     `Auto-generated from local SQLite code graph${depthNote}: **${summary.totals.files}** files, **${summary.totals.symbols}** symbols, **${summary.totals.edges}** import edges across **${summary.groups.length}** module groups.`,
   );

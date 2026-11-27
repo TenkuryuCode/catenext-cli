@@ -173,6 +173,10 @@ export function lockScopeKey(projectId: string, repoName: string): string {
 // Entitas task
 // ---------------------------------------------------------------------------
 
+export const TaskScopeFilesSchema = z.array(z.string().trim().min(1).max(300)).max(20);
+export const TaskVerifyCommandSchema = z.string().trim().min(1).max(300);
+export const TaskDocRefsSchema = z.array(z.string().trim().min(1).max(160)).max(10);
+
 export const TaskSchema = z.object({
   id: IdSchema,
   project_id: IdSchema,
@@ -195,6 +199,9 @@ export const TaskSchema = z.object({
   /** Ditandai bila dependensi hulu dibuka ulang setelah task ini berjalan. */
   is_stale: z.boolean().default(false),
   depends_on: z.array(IdSchema).default([]),
+  scope_files: TaskScopeFilesSchema.optional(),
+  verify_command: TaskVerifyCommandSchema.optional(),
+  doc_refs: TaskDocRefsSchema.optional(),
   created_at: IsoDateTimeSchema,
   updated_at: IsoDateTimeSchema,
 });

@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  ClaimContextPackSchema,
   ClaimTaskInput,
+  ClaimTaskOutput,
   CompleteHandoffInput,
   CreateTasksInput,
   findCycle,
   GetReadyTasksInput,
   GraphImpactInput,
   GraphImpactOutput,
+  GraphNeighborsInput,
   GraphNeighborsOutput,
   GraphSummaryInput,
   ManageTaskInput,
   MCP_TOOL_NAMES,
+  PlannedTaskSchema,
   SearchContextInput,
   SymbolSearchOutput,
   UpsertPersonaInput,
@@ -147,6 +151,58 @@ describe("registry tool MCP", () => {
     expect(GraphSummaryInput.safeParse({ max_hubs: 0 }).success).toBe(false);
     expect(GraphSummaryInput.safeParse({ max_hubs: 31 }).success).toBe(false);
     expect(GraphSummaryInput.parse({ include_tests: true }).include_tests).toBe(true);
+    expect(GraphSummaryInput.parse({ prefix: "apps/cli/src" }).prefix).toBe("apps/cli/src");
+    expect(GraphSummaryInput.safeParse({ prefix: "" }).success).toBe(false);
+    expect(GraphSummaryInput.safeParse({ prefix: "a".repeat(301) }).success).toBe(false);
+  });
+
+  it("graph_neighbors supports single path, batched paths (1..5), include_symbols, and files output", () => {
+    expect(GraphNeighborsInput.parse({ path: "src/a.ts" })).toEqual({
+      path: "src/a.ts",
+      depth: 1,
+      limit: 20,
+    });
+    expect(
+      GraphNeighborsInput.parse({
+        paths: ["src/a.ts", "src/b.ts"],
+        include_symbols: true,
+        depth: 2,
+        limit: 10,
+      }),
+    ).toEqual({
+      paths: ["src/a.ts", "src/b.ts"],
+      include_symbols: true,
+      depth: 2,
+      limit: 10,
+    });
+    expect(GraphNeighborsInput.safeParse({}).success).toBe(false);
+    expect(GraphNeighborsInput.safeParse({ paths: [] }).success).toBe(false);
+    expect(
+      GraphNeighborsInput.safeParse({
+        paths: ["1.ts", "2.ts", "3.ts", "4.ts", "5.ts", "6.ts"],
+      }).success,
+    ).toBe(false);
+    expect(GraphNeighborsInput.safeParse({ path: "src/a.ts", paths: ["src/b.ts"] }).success).toBe(
+      false,
+    );
+    expect(
+      GraphNeighborsInput.safeParse({ path: "src/a.ts", paths: ["src/a.ts", "src/b.ts"] }).success,
+    ).toBe(true);
+
+    expect(
+      GraphNeighborsOutput.parse({
+        edges: [],
+        files: [
+          {
+            path: "src/a.ts",
+            edges: [{ kind: "imports", from: "src/a.ts", to: "src/b.ts" }],
+            symbols: ["Alpha"],
+          },
+        ],
+      }),
+    ).toMatchObject({
+      files: [{ path: "src/a.ts", symbols: ["Alpha"] }],
+    });
   });
 
   it("graph_impact validates input bounds and output freshness hints", () => {
@@ -228,6 +284,109 @@ describe("registry tool MCP", () => {
       ClaimTaskInput.safeParse({
         task_id: EXISTING,
         worktree: { session_id, branch: "feat/e1", base_branch: "HEAD" },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      ClaimTaskInput.parse({
+        task_id: EXISTING,
+        include_context: true,
+      }),
+    ).toEqual({
+      task_id: EXISTING,
+      include_context: true,
+    });
+
+    const out = ClaimTaskOutput.parse({
+      task: {
+        id: EXISTING,
+        title: "Scoped task",
+        prompt_instruction: "Do work",
+        status: "IN_PROGRESS",
+        revision_count: 0,
+        scope_files: [" packages/shared/src/task.ts "],
+        verify_command: " pnpm test ",
+        doc_refs: [" blueprint "],
+      },
+      lease_id: session_id,
+      lease_expires_at: "2026-11-27T12:00:00.000Z",
+      dependencies: [],
+      context_pack: {
+        epic_summary: "Zero-waste delegation",
+        sync_board_excerpt: "DECISIONS: Wave 1",
+        skills_hint: ["be-node"],
+        graph_slice: [
+          {
+            path: "packages/shared/src/task.ts",
+            edges: [{ kind: "imports", from: "a.ts", to: "b.ts" }],
+            symbols: ["TaskSchema"],
+            symbol_locations: [{ name: "TaskSchema", line: 12 }],
+          },
+        ],
+      },
+    });
+    expect(out.task.scope_files).toEqual(["packages/shared/src/task.ts"]);
+    expect(out.task.verify_command).toBe("pnpm test");
+    expect(out.task.doc_refs).toEqual(["blueprint"]);
+    expect(out.context_pack?.skills_hint).toEqual(["be-node"]);
+    expect(out.context_pack?.graph_slice?.[0]?.symbol_locations).toEqual([
+      { name: "TaskSchema", line: 12 },
+    ]);
+  });
+
+  it("validates start lines and location count in claim only", () => {
+    const legacyFile = { path: "src/a.ts", edges: [], symbols: ["run"] };
+    const parseClaim = (symbol_locations: unknown) =>
+      ClaimContextPackSchema.safeParse({ graph_slice: [{ ...legacyFile, symbol_locations }] });
+    const location = { name: "run", line: 1 };
+    expect(parseClaim([location]).success).toBe(true);
+    expect(parseClaim(Array(4).fill(location)).success).toBe(false);
+    for (const line of [undefined, null, 0, -1, 1.5]) {
+      expect(parseClaim([{ ...location, line }]).success).toBe(false);
+    }
+    expect(
+      GraphNeighborsOutput.parse({
+        edges: [],
+        files: [{ ...legacyFile, symbol_locations: [location] }],
+      }),
+    ).toEqual({ edges: [], files: [legacyFile] });
+  });
+
+  it("PlannedTaskSchema validates optional scope_files, verify_command, and doc_refs", () => {
+    const valid = PlannedTaskSchema.parse({
+      ref: "t1",
+      title: "Contracts",
+      prompt_instruction: "Extend Zod",
+      scope_files: [" packages/shared/src/task.ts "],
+      verify_command: " pnpm test ",
+      doc_refs: [" sync-board "],
+    });
+    expect(valid.scope_files).toEqual(["packages/shared/src/task.ts"]);
+    expect(valid.verify_command).toBe("pnpm test");
+    expect(valid.doc_refs).toEqual(["sync-board"]);
+
+    expect(
+      PlannedTaskSchema.safeParse({
+        ref: "t1",
+        title: "Bad",
+        prompt_instruction: "Too many files",
+        scope_files: Array.from({ length: 21 }, (_, i) => `f${i}.ts`),
+      }).success,
+    ).toBe(false);
+    expect(
+      PlannedTaskSchema.safeParse({
+        ref: "t1",
+        title: "Bad",
+        prompt_instruction: "Too many doc_refs",
+        doc_refs: Array.from({ length: 11 }, (_, i) => `doc-${i}`),
+      }).success,
+    ).toBe(false);
+    expect(
+      PlannedTaskSchema.safeParse({
+        ref: "t1",
+        title: "Bad",
+        prompt_instruction: "Empty verify",
+        verify_command: "   ",
       }).success,
     ).toBe(false);
   });

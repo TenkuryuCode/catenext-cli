@@ -6,6 +6,8 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   briefText,
   type CatenextConfig,
+  CLAIM_CONTEXT_PACK_MAX_BYTES,
+  type ClaimContextPack,
   DOCUMENT_LIMITS,
   type DocumentHeading,
   DocumentIndexEntrySchema,
@@ -33,7 +35,13 @@ import {
 import type { z } from "zod";
 import { HUMAN_APPROVAL_COMMANDS, requireHumanApproval } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
-import { checkGraphFreshness, graphNeighbors, symbolSearch } from "./db/graph-index.js";
+import {
+  checkGraphFreshness,
+  getGraphCounts,
+  queryClaimGraphSlice,
+  queryGraphNeighbors,
+  symbolSearch,
+} from "./db/graph-index.js";
 import {
   analyzeGraphImpact,
   type GraphRootDir,
@@ -59,17 +67,27 @@ import {
 } from "./local-state.js";
 import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep } from "./scrubber.js";
 import { applyProjectSeed } from "./seed.js";
-import { listSkills, loadSkill, saveSkill } from "./skills.js";
+import { listSkills, loadSkill, type Skill, saveSkill } from "./skills.js";
+import {
+  type ActiveWorktreeLease,
+  readWorktreeOverlapHint,
+  snapshotWorktreeLeases,
+} from "./worktree-status.js";
 
 export type { ReadTaskEventsOptions, TaskEventRecord } from "./db/task-events.js";
 export { LocalServiceError } from "./errors.js";
 
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
-  [N in Exclude<McpToolName, McpCrudToolName>]: (
+  [N in Exclude<McpToolName, McpCrudToolName | "session_brief">]: (
     input: Parsed<N>,
   ) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
+
+interface SessionBriefHintSnapshot {
+  graphRoots: GraphRootDir[];
+  worktreeLeases?: ActiveWorktreeLease[];
+}
 const offlineReview = "Review lokal saja. Status, head SHA, dan merge PR di host tidak diperiksa.";
 const directives = [
   ...GENERAL_RULES,
@@ -205,6 +223,132 @@ function extractMarkdownSection(
     content: slice,
     truncated: slice.length < content.length,
   };
+}
+
+function sameStringList(a?: readonly string[], b?: readonly string[]): boolean {
+  if (a === undefined && b === undefined) return true;
+  if (a === undefined || b === undefined) return false;
+  return a.length === b.length && a.every((item, idx) => item === b[idx]);
+}
+
+function extractSyncBoardExcerpt(
+  content: string,
+  taskId: string,
+  persona: string | null,
+): string | undefined {
+  const trimmed = content.trim();
+  if (!trimmed) return undefined;
+
+  const lines = trimmed.split(/\r?\n/);
+  const blocks: Array<{ heading?: string; body: string[] }> = [];
+  let current: { heading?: string; body: string[] } = { body: [] };
+  for (const line of lines) {
+    if (/^#{1,6}\s+/.test(line)) {
+      if (current.heading || current.body.length > 0) blocks.push(current);
+      current = { heading: line, body: [] };
+    } else {
+      current.body.push(line);
+    }
+  }
+  if (current.heading || current.body.length > 0) blocks.push(current);
+
+  const taskNeedle = taskId.toLowerCase();
+  const personaNeedle = persona?.toLowerCase();
+  const lineMatches = (line: string): boolean => {
+    const low = line.toLowerCase();
+    if (low.includes(taskNeedle)) return true;
+    if (personaNeedle && low.includes(personaNeedle)) return true;
+    return /\b(?:decisions|open\s+asks)\b/i.test(line);
+  };
+
+  const picked: string[] = [];
+  for (const block of blocks) {
+    const heading = block.heading;
+    const body = block.body.filter((line) => line.trim().length > 0);
+    if (heading && /\b(?:decisions|open\s+asks)\b/i.test(heading)) {
+      picked.push(heading, ...body);
+      continue;
+    }
+    const matchingLines = body.filter(lineMatches);
+    if (matchingLines.length > 0) {
+      if (heading) picked.push(heading);
+      picked.push(...matchingLines);
+    }
+  }
+
+  let excerpt = (picked.length > 0 ? picked : lines.filter((line) => line.trim().length > 0)).join(
+    "\n",
+  );
+  excerpt = excerpt.trim();
+  if (!excerpt) return undefined;
+  if (excerpt.length > 800) excerpt = `${excerpt.slice(0, 799)}…`;
+  return excerpt;
+}
+
+function prioritizeSkills(skills: readonly Skill[], task: LocalTask): string[] {
+  const docNeedles = new Set((task.doc_refs ?? []).map((ref) => ref.toLowerCase()));
+  const roleNeedles = [task.role, task.persona]
+    .filter((v): v is string => typeof v === "string" && v.length > 0)
+    .map((v) => v.toLowerCase());
+
+  const matches = (skill: Skill): boolean => {
+    const nameLow = skill.name.toLowerCase();
+    if (docNeedles.has(nameLow)) return true;
+    for (const ref of docNeedles) {
+      if (ref.includes(nameLow) || nameLow.includes(ref)) return true;
+    }
+    const hay = `${nameLow} ${skill.when_to_use.toLowerCase()}`;
+    return roleNeedles.some((needle) => hay.includes(needle));
+  };
+
+  const prioritized: string[] = [];
+  const rest: string[] = [];
+  for (const skill of skills) {
+    if (matches(skill)) prioritized.push(skill.name);
+    else rest.push(skill.name);
+  }
+  return [...prioritized, ...rest].slice(0, 5);
+}
+
+function boundClaimContextPack(pack: ClaimContextPack): ClaimContextPack {
+  const fits = (candidate: ClaimContextPack) =>
+    Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CLAIM_CONTEXT_PACK_MAX_BYTES;
+  if (fits(pack)) return pack;
+
+  const bounded: ClaimContextPack = { ...pack, truncated: true };
+  if (pack.graph_slice?.some((file) => file.symbol_locations)) {
+    // Preserve the original slice when only the added locations exceed the budget.
+    bounded.graph_slice = pack.graph_slice.map(({ symbol_locations: _locations, ...file }) => file);
+    if (fits(bounded)) return bounded;
+  }
+  delete bounded.graph_slice;
+  if (fits(bounded)) return bounded;
+
+  const excerpt = bounded.sync_board_excerpt;
+  delete bounded.sync_board_excerpt;
+  if (excerpt && fits(bounded)) {
+    // Find longest excerpt prefix that fits, including JSON escaping and the truncation marker.
+    const chars = Array.from(excerpt);
+    let low = 1;
+    let high = chars.length - 1;
+    let best: string | undefined;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const prefix = `${chars.slice(0, mid).join("")}…`;
+      if (fits({ ...bounded, sync_board_excerpt: prefix })) {
+        best = prefix;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    if (best !== undefined) bounded.sync_board_excerpt = best;
+  }
+
+  // Defensive fallback if non-excerpt context ever grows beyond current field limits.
+  if (!fits(bounded)) delete bounded.skills_hint;
+  if (!fits(bounded)) delete bounded.epic_summary;
+  return bounded;
 }
 
 /** Shared local orchestration boundary for standalone CLI and MCP processes. */
@@ -582,6 +726,18 @@ export class LocalService {
           task.stale = false;
           changedFields.push("is_stale");
         }
+        if (data.scope_files !== undefined && !sameStringList(data.scope_files, task.scope_files)) {
+          task.scope_files = data.scope_files;
+          changedFields.push("scope_files");
+        }
+        if (data.verify_command !== undefined && data.verify_command !== task.verify_command) {
+          task.verify_command = data.verify_command;
+          changedFields.push("verify_command");
+        }
+        if (data.doc_refs !== undefined && !sameStringList(data.doc_refs, task.doc_refs)) {
+          task.doc_refs = data.doc_refs;
+          changedFields.push("doc_refs");
+        }
 
         if (changedFields.length > 0) {
           dirty();
@@ -782,6 +938,49 @@ export class LocalService {
     }
   }
 
+  private async sessionBriefHints(snapshot: SessionBriefHintSnapshot): Promise<string[]> {
+    const hints: string[] = [];
+    try {
+      const projectId = this.config.project_id;
+      const freshness = await this.store.inspect((db) => {
+        // Avoid waiting on SQLite lock contention for optional output.
+        db.exec("PRAGMA busy_timeout = 0");
+        const indexed = db
+          .prepare("SELECT 1 FROM files WHERE project_id = ? LIMIT 1")
+          .get(projectId);
+        return indexed ? checkGraphFreshness(db, projectId, snapshot.graphRoots) : undefined;
+      });
+      if (freshness?.stale) {
+        hints.push(
+          briefText(
+            `Code graph index is stale (${freshness.reason ?? "changed"}) — run \`catenext index\`.`,
+            160,
+          ),
+        );
+      }
+    } catch {
+      // Unavailable graph: still attempt the worktree hint.
+    }
+    if (snapshot.worktreeLeases) {
+      try {
+        const overlaps = await readWorktreeOverlapHint(this.repoRoot, snapshot.worktreeLeases);
+        if (overlaps.length > 0) {
+          const files = overlaps.slice(0, 3).map((o) => o.file);
+          const more = overlaps.length > 3 ? `, +${overlaps.length - 3} more` : "";
+          hints.push(
+            briefText(
+              `Worktree file overlap detected (${overlaps.length}): ${files.join(", ")}${more} — run \`catenext worktree status\`.`,
+              160,
+            ),
+          );
+        }
+      } catch {
+        // Worktree hints are optional, even if the scanner fails unexpectedly.
+      }
+    }
+    return hints.slice(0, 6);
+  }
+
   async callTool<K extends McpToolName>(
     name: K,
     input: unknown,
@@ -806,7 +1005,7 @@ export class LocalService {
       requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
     }
     const existed = existsSync(this.stateFile);
-    const out = await this.store.transaction(
+    const { out, hintSnapshot } = await this.store.transaction(
       this.config.project_id,
       this.config.repo_name,
       async (project, dirty, db, afterSave) => {
@@ -823,6 +1022,11 @@ export class LocalService {
         );
         const leaseId = "lease_id" in parsed.data ? parsed.data.lease_id : undefined;
         tools.tick(leaseId, name);
+        if (toolName === "session_brief") {
+          const { verbose } = MCP_TOOLS.session_brief.input.parse(parsed.data);
+          const { brief, hintSnapshot } = tools.sessionBrief(Boolean(verbose));
+          return { out: contract.output.parse(brief) as McpToolOutput<K>, hintSnapshot };
+        }
         // Registry key correlates parser, handler, and output. TS cannot retain that correlation
         // on a generic indexed access; output validation happens before the transaction commits.
         const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
@@ -833,11 +1037,16 @@ export class LocalService {
             insertTaskEvents(txDb, this.config.project_id, events);
           });
         }
-        return result as McpToolOutput<K>;
+        return { out: result as McpToolOutput<K> };
       },
     );
     if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
       await chmod(this.stateFile, 0o600);
+    }
+    // transaction() has committed and released the writer lock before any hint I/O.
+    if (hintSnapshot) {
+      const hints = await this.sessionBriefHints(hintSnapshot);
+      if (hints.length > 0) return { ...out, hints };
     }
     return out;
   }
@@ -906,22 +1115,9 @@ class LocalWorkflow {
     },
     save_repo_skill: (input) => saveSkill(this.root, input, new Date(this.now)),
     interview_setup: (input) => buildInterviewSetup(this.root, input.step, this.config.stack ?? []),
-    session_brief: (input) => this.sessionBrief(Boolean(input.verbose)),
     manage_roots: (input) => this.manageRoots(input),
-    graph_neighbors: (input) => {
-      const rootDirs = this.graphRootDirs();
-      return {
-        path: input.path,
-        edges: graphNeighbors(
-          this.db,
-          this.config.project_id,
-          input.path,
-          input.limit,
-          input.depth,
-        ),
-        ...this.graphFreshness(rootDirs),
-      };
-    },
+    graph_neighbors: (input) =>
+      queryGraphNeighbors(this.db, this.config.project_id, input, this.graphRootDirs()),
     symbol_search: (input) => {
       const rootDirs = this.graphRootDirs();
       return {
@@ -1110,6 +1306,9 @@ class LocalWorkflow {
         requiresApproval: item.requires_approval,
         stale: false,
         revision: 0,
+        ...(item.scope_files !== undefined ? { scope_files: item.scope_files } : {}),
+        ...(item.verify_command !== undefined ? { verify_command: item.verify_command } : {}),
+        ...(item.doc_refs !== undefined ? { doc_refs: item.doc_refs } : {}),
       };
       this.owner(task, persona, role);
       this.project.tasks.push(task);
@@ -1227,7 +1426,10 @@ class LocalWorkflow {
     };
   }
 
-  private sessionBrief(verbose: boolean): McpToolOutput<"session_brief"> {
+  sessionBrief(verbose: boolean): {
+    brief: McpToolOutput<"session_brief">;
+    hintSnapshot: SessionBriefHintSnapshot;
+  } {
     const lines: McpToolOutput<"session_brief">["lines"] = [];
     const ready = this.project.tasks.filter((task) => this.readyByDeps(task));
     const blocked = this.project.tasks.filter((task) => task.status === "BLOCKED");
@@ -1354,14 +1556,24 @@ class LocalWorkflow {
       lines.push({ kind: "info", text: "No ready tasks. Plan or unblock next." });
     }
     return {
-      lines: lines.slice(0, 24),
-      ready_count: ready.length,
-      blocked_count: blocked.length,
-      draft_count: draft.length,
-      pending_approvals,
-      workspace_roots: workspaceRoots,
-      read_first: "CATENEXT.md",
-      ...(this.project.session_prefs?.locale ? { locale: this.project.session_prefs.locale } : {}),
+      brief: {
+        lines: lines.slice(0, 24),
+        ready_count: ready.length,
+        blocked_count: blocked.length,
+        draft_count: draft.length,
+        pending_approvals,
+        workspace_roots: workspaceRoots,
+        read_first: "CATENEXT.md",
+        ...(this.project.session_prefs?.locale
+          ? { locale: this.project.session_prefs.locale }
+          : {}),
+      },
+      hintSnapshot: {
+        graphRoots: this.graphRootDirs(),
+        ...(activeWorktrees.length > 1
+          ? { worktreeLeases: snapshotWorktreeLeases(this.project.tasks, this.repo) }
+          : {}),
+      },
     };
   }
 
@@ -1535,7 +1747,7 @@ class LocalWorkflow {
     };
   }
 
-  private claim(input: Parsed<"claim_task">): McpToolOutput<"claim_task"> {
+  private async claim(input: Parsed<"claim_task">): Promise<McpToolOutput<"claim_task">> {
     const task = this.task(input.task_id);
     const { worktree } = input;
     const alias = input.agent_alias ?? this.config.overrides?.default_agent_alias;
@@ -1654,6 +1866,39 @@ class LocalWorkflow {
         ...(worktree ? { branch: worktree.branch, session: worktree.session_id } : {}),
       },
     });
+    let contextPack: ClaimContextPack | undefined;
+    if (input.include_context === true) {
+      const pack: ClaimContextPack = {};
+      const epic = this.project.epics.find((item) => item.id === task.epicId);
+      if (epic) {
+        pack.epic_summary = briefText(
+          `${epic.title}${epic.description ? `: ${epic.description}` : ""}`,
+          240,
+        );
+      }
+      const syncDoc = this.project.documents.find((d) => d.slug === "sync-board" && !d.archived_at);
+      if (syncDoc) {
+        const excerpt = extractSyncBoardExcerpt(syncDoc.content, task.id, task.persona);
+        if (excerpt) pack.sync_board_excerpt = excerpt;
+      }
+      const { skills } = await listSkills(this.root);
+      if (skills.length > 0) {
+        const hint = prioritizeSkills(skills, task);
+        if (hint.length > 0) pack.skills_hint = hint;
+      }
+      if (task.scope_files?.length && getGraphCounts(this.db, this.config.project_id).files > 0) {
+        const files = queryClaimGraphSlice(
+          this.db,
+          this.config.project_id,
+          task.scope_files.slice(0, 5),
+          this.graphRootDirs(),
+        );
+        if (files.length > 0) pack.graph_slice = files;
+      }
+      if (Object.keys(pack).length > 0) {
+        contextPack = boundClaimContextPack(pack);
+      }
+    }
     this.dirty();
     return {
       task: {
@@ -1664,6 +1909,9 @@ class LocalWorkflow {
         revision_count: task.revision,
         ...(task.role ? { role: task.role } : {}),
         ...(task.target ? { target_repo: task.target } : {}),
+        ...(task.scope_files !== undefined ? { scope_files: task.scope_files } : {}),
+        ...(task.verify_command !== undefined ? { verify_command: task.verify_command } : {}),
+        ...(task.doc_refs !== undefined ? { doc_refs: task.doc_refs } : {}),
       },
       ...(persona ? { persona } : {}),
       lease_id: leaseId,
@@ -1671,6 +1919,7 @@ class LocalWorkflow {
       dependencies: this.claimDependencyHandoffs(task, Boolean(input.compact)),
       ...(revision ? { revision } : {}),
       warnings: [],
+      ...(contextPack ? { context_pack: contextPack } : {}),
     };
   }
 

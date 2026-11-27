@@ -11,8 +11,11 @@ import {
   RepoNameSchema,
   ReviewDecisionSchema,
   RoleSchema,
+  TaskDocRefsSchema,
+  TaskScopeFilesSchema,
   TaskStatusSchema,
   TaskSummarySchema,
+  TaskVerifyCommandSchema,
 } from "@catenext/shared";
 import { z } from "zod";
 
@@ -90,6 +93,9 @@ const task = z.strictObject({
   blocker: z
     .strictObject({ category: BlockerCategorySchema, reason: z.string().min(10).max(1000) })
     .optional(),
+  scope_files: TaskScopeFilesSchema.optional(),
+  verify_command: TaskVerifyCommandSchema.optional(),
+  doc_refs: TaskDocRefsSchema.optional(),
 });
 
 export const PERMISSION_ACTIONS = [

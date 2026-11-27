@@ -1,6 +1,6 @@
-/** SQLite DDL for local Catenext orchestration (schema version 6). */
+/** SQLite DDL for local Catenext orchestration (schema version 7). */
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const CODE_SEARCH_FILES_SQL = `
 CREATE TABLE IF NOT EXISTS code_search_files (
@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_json TEXT,
   blocker_json TEXT,
   integrated_commit_json TEXT,
+  scope_files_json TEXT,
+  verify_command TEXT,
+  doc_refs_json TEXT,
   position REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (project_id, id)
 );

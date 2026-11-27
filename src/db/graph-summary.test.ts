@@ -487,6 +487,62 @@ describe("summarizeProjectGraph depth 4/5, include_tests, and stale flag", () =>
     expect(missing.stale).toBe(true);
     expect(missing.stale_reason).toBe("missing_files");
   });
+
+  it("scopes totals, groups, group_edges, hubs, and markdown to prefix", async () => {
+    await mkdir(join(root, "apps/api/src"), { recursive: true });
+    await mkdir(join(root, "apps/web/src"), { recursive: true });
+    await mkdir(join(root, "packages/shared/src"), { recursive: true });
+
+    await writeFile(join(root, "packages/shared/src/types.ts"), "export interface SharedType {}\n");
+    await writeFile(
+      join(root, "apps/api/src/db.ts"),
+      `import type { SharedType } from "../../../packages/shared/src/types.js";\nexport function queryDb(x: SharedType) { return x; }\n`,
+    );
+    await writeFile(
+      join(root, "apps/api/src/routes.ts"),
+      `import { queryDb } from "./db.js";\nexport function registerRoutes() { return queryDb; }\n`,
+    );
+    await writeFile(
+      join(root, "apps/web/src/app.ts"),
+      `import type { SharedType } from "../../../packages/shared/src/types.js";\nexport function renderApp(x: SharedType) { return x; }\n`,
+    );
+
+    await indexProjectGraph(dbPath, projectId, root);
+
+    const apiSummary = summarizeProjectGraph(dbPath, projectId, {
+      depth: 3,
+      prefix: "./apps/api/",
+      include_mermaid: true,
+    });
+    expect(GraphSummaryOutput.parse(apiSummary)).toEqual(apiSummary);
+    expect(apiSummary.indexed).toBe(true);
+    expect(apiSummary.totals).toEqual({ files: 2, symbols: 2, edges: 1 });
+    expect(apiSummary.groups).toEqual([
+      { group: "apps/api/src", files: 2, symbols: 2, edges_in: 0, edges_out: 0 },
+    ]);
+    expect(apiSummary.group_edges).toEqual([]);
+    expect(apiSummary.hubs.map((h) => h.path)).toEqual([
+      "apps/api/src/db.ts",
+      "apps/api/src/routes.ts",
+    ]);
+
+    const md = renderArchitectureMarkdown(apiSummary, {
+      depth: 3,
+      prefix: "./apps/api/",
+    });
+    expect(md).toContain(
+      "Auto-generated from local SQLite code graph (depth=3, prefix=apps/api): **2** files, **2** symbols, **1** import edges across **1** module groups.",
+    );
+
+    const emptyPrefix = summarizeProjectGraph(dbPath, projectId, {
+      prefix: "apps/nonexistent",
+      include_mermaid: true,
+    });
+    expect(emptyPrefix.indexed).toBe(true);
+    expect(emptyPrefix.totals).toEqual({ files: 0, symbols: 0, edges: 0 });
+    expect(emptyPrefix.groups).toEqual([]);
+    expect(emptyPrefix.hubs).toEqual([]);
+  });
 });
 
 describe("analyzeGraphImpact", () => {

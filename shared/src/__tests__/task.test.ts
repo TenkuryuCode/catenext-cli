@@ -10,6 +10,7 @@ import {
   lockScopeKey,
   nextStatus,
   TASK_STATUSES,
+  TaskSchema,
   transition,
 } from "../index.js";
 
@@ -117,5 +118,44 @@ describe("lock & lease", () => {
   it("scope lock per (project, repo)", () => {
     expect(lockScopeKey("p1", "backend")).not.toBe(lockScopeKey("p1", "frontend"));
     expect(lockScopeKey("p1", "backend")).toBe("p1:backend");
+  });
+});
+
+describe("TaskSchema scoping metadata", () => {
+  const baseTask = {
+    id: "11111111-2222-4333-8444-555555555555",
+    project_id: "11111111-2222-4333-8444-555555555556",
+    epic_id: "11111111-2222-4333-8444-555555555557",
+    title: "Task",
+    prompt_instruction: "Do work",
+    status: "TODO" as const,
+    target_repo: "catenext",
+    role: "backend" as const,
+    persona_id: null,
+    locked_by: null,
+    locked_at: null,
+    lease_expires_at: null,
+    handoff_summary: null,
+    review_feedback: null,
+    blocker_reason: null,
+    created_at: "2026-11-27T00:00:00.000Z",
+    updated_at: "2026-11-27T00:00:00.000Z",
+  };
+
+  it("keeps scope_files, verify_command, and doc_refs optional and trims values", () => {
+    const omitted = TaskSchema.parse(baseTask);
+    expect(omitted.scope_files).toBeUndefined();
+    expect(omitted.verify_command).toBeUndefined();
+    expect(omitted.doc_refs).toBeUndefined();
+
+    const populated = TaskSchema.parse({
+      ...baseTask,
+      scope_files: [" packages/shared/src/task.ts "],
+      verify_command: " pnpm test ",
+      doc_refs: [" sync-board "],
+    });
+    expect(populated.scope_files).toEqual(["packages/shared/src/task.ts"]);
+    expect(populated.verify_command).toBe("pnpm test");
+    expect(populated.doc_refs).toEqual(["sync-board"]);
   });
 });

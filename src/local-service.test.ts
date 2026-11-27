@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,8 +14,9 @@ import {
   type McpToolInput,
 } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { indexProjectGraph } from "./db/graph-index.js";
+import * as graphIndex from "./db/graph-index.js";
 import { LocalService } from "./local-service.js";
+import * as worktreeStatus from "./worktree-status.js";
 
 function readTaskJsonField(
   stateFile: string,
@@ -726,6 +727,76 @@ describe("LocalService lease expiry", () => {
     expect(await mono.callTool("get_project_board", {})).toMatchObject({
       tasks: [{ id: id("wt"), status: "IN_PROGRESS", locked_by_repo: null }],
     });
+  });
+
+  it("allows another claim to commit while session_brief awaits its worktree hint", async () => {
+    const mono = new LocalService(root, { ...config, layout: "monorepo" });
+    const { id } = await draft([plan("first"), plan("second"), plan("parallel")], mono);
+    const claim = (ref: string, client = mono) =>
+      client.callTool("claim_task", {
+        task_id: id(ref),
+        worktree: { session_id: randomUUID(), branch: `feat/${ref}` },
+      });
+    for (const ref of ["first", "second", "parallel"]) {
+      await manage("approve_plan", id(ref), {}, mono);
+    }
+    await claim("first");
+    await claim("second");
+
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let finish!: (overlaps: worktreeStatus.WorktreeFileOverlap[]) => void;
+    const pendingHint = new Promise<worktreeStatus.WorktreeFileOverlap[]>((resolve) => {
+      finish = resolve;
+    });
+    const scanner = vi.spyOn(worktreeStatus, "readWorktreeOverlapHint").mockImplementation(() => {
+      markStarted();
+      return pendingHint;
+    });
+    const pendingBrief = mono.callTool("session_brief", {});
+    try {
+      await Promise.race([
+        started,
+        pendingBrief.then(() => {
+          throw new Error("Brief returned before the scanner started");
+        }),
+      ]);
+      await expect(access(`${mono.stateFile}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(scanner).toHaveBeenCalledWith(root, [
+        {
+          task_id: id("first"),
+          branch: "feat/first",
+          baseBranch: null,
+          persona: null,
+          worktreePaths: [],
+        },
+        {
+          task_id: id("second"),
+          branch: "feat/second",
+          baseBranch: null,
+          persona: null,
+          worktreePaths: [],
+        },
+      ]);
+      const other = new LocalService(root, { ...config, layout: "monorepo" });
+      await expect(claim("parallel", other)).resolves.toMatchObject({
+        task: { id: id("parallel"), status: "IN_PROGRESS" },
+      });
+    } finally {
+      finish([{ file: "shared.ts", worktrees: ["first", "second"] }]);
+      await pendingBrief;
+    }
+    expect(await pendingBrief).toMatchObject({
+      ready_count: 1,
+      hints: [expect.stringContaining("Worktree file overlap detected (1): shared.ts")],
+    });
+
+    scanner.mockRejectedValue(new Error("Git unavailable"));
+    const failedHint = await mono.callTool("session_brief", {});
+    expect(failedHint.ready_count).toBe(0);
+    expect(failedHint.hints).toBeUndefined();
   });
 
   it("mengisi integrated_commit pada dependency handoff bila tersedia di state dan memigrasikan DB lama", async () => {
@@ -1690,7 +1761,7 @@ describe("LocalService code graph tools", () => {
       expect(unindexed).toMatchObject({ stale: true, stale_reason: "not_indexed" });
     }
 
-    await indexProjectGraph(service.stateFile, config.project_id, root);
+    await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
 
     // Fresh index: stale omitted on all 4 tools.
     const neighbors = await service.callTool("graph_neighbors", {
@@ -1781,5 +1852,390 @@ describe("LocalService code graph tools", () => {
       const staleOut = await service.callTool(name, args);
       expect(staleOut).toMatchObject({ stale: true, stale_reason: "modified_files" });
     }
+  });
+
+  it("supports batched graph_neighbors, graph_summary prefix, and session_brief stale hints", async () => {
+    await mkdir(join(root, "apps/api/src/users"), { recursive: true });
+    await mkdir(join(root, "apps/api/src/billing"), { recursive: true });
+
+    const usersRepo = join(root, "apps/api/src/users/repo.ts");
+    const usersSvc = join(root, "apps/api/src/users/service.ts");
+    const billingSvc = join(root, "apps/api/src/billing/service.ts");
+
+    await writeFile(usersRepo, "export function fetchUser() { return 1; }\n");
+    await writeFile(
+      usersSvc,
+      `import { fetchUser } from "./repo.js";\nexport function userHandler() { return fetchUser(); }\n`,
+    );
+    await writeFile(billingSvc, "export function charge() { return 2; }\n");
+
+    // Unindexed project: session_brief omits hints.
+    const unindexedBrief = await service.callTool("session_brief", {});
+    expect(unindexedBrief.hints).toBeUndefined();
+
+    await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
+
+    // Clean indexed project: session_brief omits hints.
+    const cleanBrief = await service.callTool("session_brief", {});
+    expect(cleanBrief.hints).toBeUndefined();
+
+    const batched = await service.callTool("graph_neighbors", {
+      paths: ["apps/api/src/users/repo.ts", "apps/api/src/users/service.ts"],
+      include_symbols: true,
+    });
+    expect(batched.files).toEqual([
+      {
+        path: "apps/api/src/users/repo.ts",
+        edges: [
+          {
+            kind: "imports",
+            from: "apps/api/src/users/service.ts",
+            to: "apps/api/src/users/repo.ts",
+            label: "apps/api/src/users/repo.ts",
+          },
+        ],
+        symbols: ["fetchUser"],
+      },
+      {
+        path: "apps/api/src/users/service.ts",
+        edges: [
+          {
+            kind: "imports",
+            from: "apps/api/src/users/service.ts",
+            to: "apps/api/src/users/repo.ts",
+            label: "apps/api/src/users/repo.ts",
+          },
+        ],
+        symbols: ["userHandler"],
+      },
+    ]);
+
+    const prefixed = await service.callTool("graph_summary", {
+      prefix: "apps/api/src/users",
+      depth: 5,
+    });
+    expect(prefixed.totals).toEqual({ files: 2, symbols: 2, edges: 1 });
+    expect(prefixed.hubs.map((h) => h.path)).not.toContain("apps/api/src/billing/service.ts");
+
+    // Stale indexed file -> session_brief emits concise stale graph hint.
+    await writeFile(usersRepo, "export function fetchUser() { return 42; }\n");
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(usersRepo, shifted, shifted);
+
+    const freshness = vi.spyOn(graphIndex, "checkGraphFreshness");
+    const staleBrief = await service.callTool("session_brief", {});
+    expect(staleBrief.hints).toEqual([
+      expect.stringContaining("Code graph index is stale (modified_files)"),
+    ]);
+    freshness.mockImplementation(() => {
+      throw new Error("Graph unavailable");
+    });
+    const withoutGraphHint = { ...staleBrief };
+    delete withoutGraphHint.hints;
+    expect(await service.callTool("session_brief", {})).toEqual(withoutGraphHint);
+  });
+
+  it("persists scope_files/verify_command/doc_refs and builds claim_task context_pack when include_context=true", async () => {
+    await service.callTool("upsert_persona", {
+      alias: "be",
+      role: "backend",
+      repos: ["be"],
+    });
+    await service.callTool("save_document", {
+      slug: "sync-board",
+      title: "Sync Board",
+      kind: "other",
+      content: [
+        "# Sync Board",
+        "## DECISIONS",
+        "- Keep MCP payloads compact",
+        "## OPEN ASKS",
+        "- ASK: be · NEED: verify scope_files",
+        "## ARCHIVE NOISE",
+        "- Unrelated historical log line",
+      ].join("\n"),
+    });
+    await mkdir(join(root, ".catenext/skills"), { recursive: true });
+    await writeFile(
+      join(root, ".catenext/skills/alpha-unrelated.md"),
+      `---\nname: alpha-unrelated\nwhen_to_use: For frontend css tweaks\nupdated_at: "2026-01-01T00:00:00.000Z"\n---\n\nUnrelated.\n`,
+    );
+    await writeFile(
+      join(root, ".catenext/skills/be-service.md"),
+      `---\nname: be-service\nwhen_to_use: Backend service conventions\nupdated_at: "2026-01-01T00:00:00.000Z"\n---\n\nBackend rules.\n`,
+    );
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src/entry.ts"),
+      `import { helper } from "./helper.js";\nexport function runEntry() { return helper(); }\n`,
+    );
+    await writeFile(join(root, "src/helper.ts"), `export function helper() { return 1; }\n`);
+
+    const { epic } = await service.callTool("create_epic", {
+      title: "v0.16 Context Pack",
+      description: "Single-shot claim context",
+    });
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [
+        plan("t1", {
+          persona: "be",
+          scope_files: ["src/entry.ts"],
+          verify_command: "pnpm --filter catenext test",
+          doc_refs: ["be-service", "sync-board"],
+        }),
+        plan("t2", {
+          persona: "be",
+          scope_files: ["src/helper.ts"],
+        }),
+      ],
+    });
+    const [first, second] = created;
+    if (!first || !second) throw new Error("Expected created tasks");
+    const t1 = first.task_id;
+    const t2 = second.task_id;
+
+    const updatedT2 = await service.updateTask(t2, {
+      scope_files: ["src/entry.ts", "src/helper.ts"],
+      verify_command: "pnpm lint",
+      doc_refs: ["sync-board"],
+    });
+    expect(updatedT2.scope_files).toEqual(["src/entry.ts", "src/helper.ts"]);
+    expect(updatedT2.verify_command).toBe("pnpm lint");
+    expect(updatedT2.doc_refs).toEqual(["sync-board"]);
+
+    const events = await service.readTaskEvents({ taskId: t2 });
+    expect(events.some((e) => e.event === "update" && e.note?.includes("scope_files"))).toBe(true);
+
+    await manage("approve_plan", t1);
+    await manage("approve_plan", t2);
+    await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
+
+    // Omitted include_context -> no context_pack, but scoping fields on task are returned.
+    const plainClaim = await service.callTool("claim_task", {
+      task_id: t1,
+      agent_alias: "be",
+    });
+    expect(plainClaim.context_pack).toBeUndefined();
+    expect(plainClaim.task).toMatchObject({
+      scope_files: ["src/entry.ts"],
+      verify_command: "pnpm --filter catenext test",
+      doc_refs: ["be-service", "sync-board"],
+    });
+
+    await service.callTool("release_task", { task_id: t1, lease_id: plainClaim.lease_id });
+
+    // include_context: true -> returns 1-shot context_pack.
+    const richClaim = await service.callTool("claim_task", {
+      task_id: t1,
+      agent_alias: "be",
+      include_context: true,
+    });
+    expect(richClaim.context_pack).toBeDefined();
+    expect(richClaim.context_pack?.epic_summary).toContain("v0.16 Context Pack");
+    expect(richClaim.context_pack?.sync_board_excerpt).toContain("DECISIONS");
+    expect(richClaim.context_pack?.sync_board_excerpt).toContain("OPEN ASKS");
+    expect(richClaim.context_pack?.sync_board_excerpt).not.toContain("Unrelated historical log");
+    expect(richClaim.context_pack?.sync_board_excerpt?.length ?? 0).toBeLessThanOrEqual(800);
+    expect(richClaim.context_pack?.skills_hint?.[0]).toBe("be-service");
+    expect(richClaim.context_pack?.truncated).toBeUndefined();
+    expect(richClaim.context_pack?.graph_slice).toEqual([
+      {
+        path: "src/entry.ts",
+        edges: [
+          { kind: "imports", from: "src/entry.ts", to: "src/helper.ts", label: "src/helper.ts" },
+        ],
+        symbols: ["runEntry"],
+        symbol_locations: [{ name: "runEntry", line: 2 }],
+      },
+    ]);
+
+    // Stale index retains graph hints, but not start lines that may have moved.
+    await service.callTool("release_task", { task_id: t1, lease_id: richClaim.lease_id });
+    const shifted = new Date(Date.now() + 5_000);
+    await utimes(join(root, "src/entry.ts"), shifted, shifted);
+    const expectedFiles = await service.callTool("graph_neighbors", {
+      paths: ["src/entry.ts", "src/helper.ts"],
+      include_symbols: true,
+    });
+    expect(expectedFiles.stale_reason).toBe("modified_files");
+    const staleClaim = await service.callTool("claim_task", {
+      task_id: t2,
+      agent_alias: "be",
+      include_context: true,
+    });
+    expect(staleClaim.context_pack?.graph_slice).toEqual(expectedFiles.files);
+    expect(staleClaim.context_pack?.graph_slice).toHaveLength(2);
+    for (const file of staleClaim.context_pack?.graph_slice ?? []) {
+      expect(file).not.toHaveProperty("symbol_locations");
+    }
+  });
+
+  it("retains claim graph hints without locations from a removed workspace root", async () => {
+    const extRoot = await mkdtemp(join(tmpdir(), "catenext-claim-ext-"));
+    try {
+      const paths = ["@external/entry.ts", "entry.ts"];
+      await service.callTool("upsert_persona", { alias: "be", role: "backend" });
+      await service.callTool("manage_roots", { action: "add", path: extRoot, label: "external" });
+      await writeFile(join(extRoot, "entry.ts"), "\nexport function externalEntry() {}\n");
+      await writeFile(join(root, "entry.ts"), "export function mainEntry() {}\n");
+      await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
+
+      const batch = await draft([plan("entry", { persona: "be", scope_files: paths })]);
+      const taskId = batch.id("entry");
+      await manage("approve_plan", taskId);
+      const claimInput = { task_id: taskId, agent_alias: "be", include_context: true };
+      const legacyInput = { paths, include_symbols: true };
+      const externalFile = { path: "@external/entry.ts", edges: [], symbols: ["externalEntry"] };
+      const mainFile = { path: "entry.ts", edges: [], symbols: ["mainEntry"] };
+      const expectedLegacy = { edges: [], files: [externalFile, mainFile] };
+      expect(await service.callTool("graph_neighbors", legacyInput)).toEqual(expectedLegacy);
+      const fresh = await service.callTool("claim_task", claimInput);
+      const mainWithLocations = {
+        ...mainFile,
+        symbol_locations: [{ name: "mainEntry", line: 1 }],
+      };
+      expect(fresh.context_pack?.graph_slice).toEqual([
+        { ...externalFile, symbol_locations: [{ name: "externalEntry", line: 2 }] },
+        mainWithLocations,
+      ]);
+      await service.callTool("release_task", { task_id: taskId, lease_id: fresh.lease_id });
+
+      // Keep the indexed row and disk file untouched; only remove its root registration.
+      await service.callTool("manage_roots", { action: "remove", path: extRoot });
+      expect(await service.callTool("graph_neighbors", legacyInput)).toEqual(expectedLegacy);
+      const removed = await service.callTool("claim_task", claimInput);
+      expect(removed.context_pack?.graph_slice).toEqual([externalFile, mainWithLocations]);
+    } finally {
+      await rm(extRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: "JSON escaping", heavy: '\u0001"\\'.repeat(450), multibyte: false },
+    { name: "multibyte UTF-8", heavy: "界".repeat(1500), multibyte: true },
+  ])(
+    "drops oversized graph detail with $name before other context",
+    async ({ heavy, multibyte }) => {
+      const scope = "entry.ts";
+      const taskFields = {
+        prompt_instruction: "Keep canonical instructions verbatim. 🚀\n".repeat(130),
+        scope_files: [scope],
+        doc_refs: ["sync-board"],
+        verify_command: "pnpm test --filter catenext",
+      };
+      const excerpt = '## Decisions\n- Keep quote " and backslash \\ and 東京';
+      await service.callTool("save_document", {
+        slug: "sync-board",
+        title: "Sync Board",
+        kind: "other",
+        content: excerpt,
+      });
+      const { id } = await draft([plan("bounded", taskFields)]);
+      await manage("approve_plan", id("bounded"));
+      await writeFile(join(root, scope), "export const entry = 1;\n");
+      await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
+      const graph = [
+        { path: scope, edges: [], symbols: [heavy], symbol_locations: [{ name: heavy, line: 1 }] },
+      ];
+      vi.spyOn(graphIndex, "queryClaimGraphSlice").mockReturnValue(graph);
+      const unbounded = {
+        epic_summary: "Delivery",
+        sync_board_excerpt: excerpt,
+        graph_slice: graph,
+      };
+      const raw = JSON.stringify(unbounded);
+      expect(heavy.length).toBeLessThan(4096);
+      if (multibyte) expect(raw.length).toBeLessThan(4096);
+      else expect(JSON.stringify(heavy).length).toBeGreaterThan(4096);
+      expect(Buffer.byteLength(raw, "utf8")).toBeGreaterThan(4096);
+
+      const claim = await service.callTool("claim_task", {
+        task_id: id("bounded"),
+        include_context: true,
+      });
+      expect(claim.task).toMatchObject(taskFields);
+      expect(claim.context_pack).toEqual({
+        epic_summary: "Delivery",
+        sync_board_excerpt: excerpt,
+        truncated: true,
+      });
+      expect(Buffer.byteLength(JSON.stringify(claim.context_pack), "utf8")).toBeLessThanOrEqual(
+        4096,
+      );
+    },
+  );
+
+  it("drops only symbol locations when Unicode and truncation metadata fill the byte budget", async () => {
+    const scope = "entry.ts";
+    const { id } = await draft([plan("locations", { scope_files: [scope] })]);
+    await manage("approve_plan", id("locations"));
+    await writeFile(join(root, scope), "export function entry() {}\n");
+    await graphIndex.indexProjectGraph(service.stateFile, config.project_id, root);
+
+    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+    const legacyFile = { path: scope, edges: [], symbols: ["界".repeat(1250), "entry", ""] };
+    const legacyPack = { epic_summary: "Delivery", graph_slice: [legacyFile] };
+    const expected = { ...legacyPack, truncated: true };
+    legacyFile.symbols[2] = "x".repeat(4096 - bytes(expected));
+    expect(bytes(expected)).toBe(4096);
+
+    const graph = [{ ...legacyFile, symbol_locations: [{ name: "entry", line: 1 }] }];
+    const unbounded = { ...legacyPack, graph_slice: graph };
+    expect(JSON.stringify(unbounded).length).toBeLessThan(4096);
+    expect(bytes(unbounded)).toBeGreaterThan(4096);
+    vi.spyOn(graphIndex, "queryClaimGraphSlice").mockReturnValue(graph);
+
+    const claim = await service.callTool("claim_task", {
+      task_id: id("locations"),
+      include_context: true,
+    });
+    expect(claim.context_pack).toEqual(expected);
+    expect(bytes(claim.context_pack)).toBe(4096);
+  });
+
+  it("shortens a non-graph excerpt without splitting a code point and counts the marker", async () => {
+    const { epic } = await service.callTool("create_epic", {
+      title: "Delivery",
+      description: "界".repeat(240),
+    });
+    const { created } = await service.callTool("create_tasks", {
+      epic_id: epic.id,
+      tasks: [plan("excerpt")],
+    });
+    const [task] = created;
+    if (!task) throw new Error("Missing task");
+    await manage("approve_plan", task.task_id);
+    const excerpt = `## Decisions\n${"\u0001\u0002\u0003\u0004🚀".repeat(130)}`;
+    expect(excerpt.length).toBeLessThanOrEqual(800);
+    expect(Buffer.byteLength(JSON.stringify(excerpt), "utf8")).toBeGreaterThan(3600);
+    await service.callTool("save_document", {
+      slug: "sync-board",
+      title: "Sync Board",
+      kind: "other",
+      content: excerpt,
+    });
+
+    const { context_pack: pack } = await service.callTool("claim_task", {
+      task_id: task.task_id,
+      include_context: true,
+    });
+    if (!pack?.sync_board_excerpt) throw new Error("Missing excerpt preview");
+    expect(pack.truncated).toBe(true);
+    expect(pack.epic_summary).toContain("Delivery: 界");
+    const preview = pack.sync_board_excerpt;
+    expect(preview.endsWith("…")).toBe(true);
+    const prefix = preview.slice(0, -1);
+    expect(excerpt.startsWith(prefix)).toBe(true);
+    expect(Buffer.from(prefix, "utf8").toString("utf8")).toBe(prefix);
+    expect(Buffer.byteLength(JSON.stringify(pack), "utf8")).toBeLessThanOrEqual(4096);
+    const next = Array.from(excerpt.slice(prefix.length))[0];
+    expect(next).toBeDefined();
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({ ...pack, sync_board_excerpt: `${prefix}${next}…` }),
+        "utf8",
+      ),
+    ).toBeGreaterThan(4096);
   });
 });

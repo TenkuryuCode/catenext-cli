@@ -17,7 +17,7 @@ import {
   tryEnableCodeSearchFts,
 } from "./migrate.js";
 import { openDatabaseAt } from "./open.js";
-import { loadProject } from "./project-codec.js";
+import { loadProject, loadTask, saveTask } from "./project-codec.js";
 import { SCHEMA_VERSION } from "./schema.js";
 
 const V1_SCHEMA_SQL = `
@@ -241,11 +241,14 @@ describe("SQLite schema migrations", () => {
       expect(result1).toEqual({
         fromVersion: 1,
         toVersion: SCHEMA_VERSION,
-        applied: [2, 3, 4, 5, 6],
+        applied: [2, 3, 4, 5, 6, 7],
       });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
       expect(colsAfter.some((c) => c.name === "integrated_commit_json")).toBe(true);
+      expect(colsAfter.some((c) => c.name === "scope_files_json")).toBe(true);
+      expect(colsAfter.some((c) => c.name === "verify_command")).toBe(true);
+      expect(colsAfter.some((c) => c.name === "doc_refs_json")).toBe(true);
 
       const tables = (
         db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
@@ -417,7 +420,7 @@ describe("SQLite schema migrations", () => {
       runSchemaMigrations(db, { targetVersion: 5 });
       expect(getSchemaVersion(db)).toBe(5);
 
-      const res = runSchemaMigrations(db);
+      const res = runSchemaMigrations(db, { targetVersion: 6 });
       expect(res).toEqual({ fromVersion: 5, toVersion: 6, applied: [6] });
       expect(getSchemaVersion(db)).toBe(6);
 
@@ -435,7 +438,7 @@ describe("SQLite schema migrations", () => {
       ]);
       expect(hasCodeSearchFts(db)).toBe(true);
       expect(loadProject(db, projectId).tasks.map((t) => t.id)).toEqual([taskId]);
-      expect(runSchemaMigrations(db).applied).toEqual([]);
+      expect(runSchemaMigrations(db, { targetVersion: 6 }).applied).toEqual([]);
 
       // Simulate missing FTS5 module inside an active transaction: savepoint rolls back cleanly.
       db.exec("BEGIN IMMEDIATE");
@@ -451,6 +454,66 @@ describe("SQLite schema migrations", () => {
         throw err;
       }
       expect(getSchemaVersion(db)).toBe(6);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migrates v6 to v7 adding task scoping columns idempotently while preserving rows and round-tripping values", () => {
+    const dbPath = join(dir, "v6-to-v7.sqlite");
+    const { projectId, taskId } = createV1Database(dbPath);
+    const db = new DatabaseSync(dbPath);
+    try {
+      runSchemaMigrations(db, { targetVersion: 6 });
+      expect(getSchemaVersion(db)).toBe(6);
+      const beforeCols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
+        (c) => c.name,
+      );
+      expect(beforeCols).not.toContain("scope_files_json");
+      expect(beforeCols).not.toContain("verify_command");
+      expect(beforeCols).not.toContain("doc_refs_json");
+
+      // Also verify pre-existing columns are tolerated idempotently by migration v7
+      db.exec("ALTER TABLE tasks ADD COLUMN verify_command TEXT");
+
+      const res = runSchemaMigrations(db);
+      expect(res).toEqual({ fromVersion: 6, toVersion: SCHEMA_VERSION, applied: [7] });
+      expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+      const afterCols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
+        (c) => c.name,
+      );
+      expect(afterCols).toEqual(
+        expect.arrayContaining(["scope_files_json", "verify_command", "doc_refs_json"]),
+      );
+
+      const existing = loadTask(db, projectId, taskId);
+      expect(existing).toBeDefined();
+      expect(existing?.scope_files).toBeUndefined();
+      expect(existing?.verify_command).toBeUndefined();
+      expect(existing?.doc_refs).toBeUndefined();
+
+      if (!existing) throw new Error("Expected existing task");
+      saveTask(db, projectId, {
+        ...existing,
+        scope_files: ["packages/shared/src/task.ts", "apps/cli/src/db/schema.ts"],
+        verify_command: "pnpm --filter catenext test",
+        doc_refs: ["sync-board", "blueprint"],
+      });
+
+      const reloaded = loadTask(db, projectId, taskId);
+      expect(reloaded?.scope_files).toEqual([
+        "packages/shared/src/task.ts",
+        "apps/cli/src/db/schema.ts",
+      ]);
+      expect(reloaded?.verify_command).toBe("pnpm --filter catenext test");
+      expect(reloaded?.doc_refs).toEqual(["sync-board", "blueprint"]);
+
+      expect(runSchemaMigrations(db)).toEqual({
+        fromVersion: SCHEMA_VERSION,
+        toVersion: SCHEMA_VERSION,
+        applied: [],
+      });
     } finally {
       db.close();
     }

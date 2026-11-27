@@ -34,6 +34,19 @@ describe("skema update parsial", () => {
       persona: "be",
     });
     expect(UpdateTaskInput.safeParse({ is_stale: true }).success).toBe(false);
+    expect(
+      UpdateTaskInput.parse({
+        scope_files: [" apps/cli/src/db/schema.ts "],
+        verify_command: " pnpm test ",
+        doc_refs: [" blueprint "],
+      }),
+    ).toEqual({
+      scope_files: ["apps/cli/src/db/schema.ts"],
+      verify_command: "pnpm test",
+      doc_refs: ["blueprint"],
+    });
+    expect(UpdateTaskInput.safeParse({ doc_refs: ["x".repeat(161)] }).success).toBe(false);
+    expect(UpdateTaskInput.safeParse({ scope_files: ["  "] }).success).toBe(false);
   });
 
   it("SetDependenciesInput memvalidasi array UUID", () => {
@@ -50,7 +63,23 @@ describe("skema update parsial", () => {
       draft_count: 0,
     };
     expect(SessionBriefOutput.parse(baseBrief).locale).toBeUndefined();
+    expect(SessionBriefOutput.parse(baseBrief).hints).toBeUndefined();
     expect(SessionBriefOutput.parse({ ...baseBrief, locale: "id" }).locale).toBe("id");
+    expect(
+      SessionBriefOutput.parse({ ...baseBrief, hints: ["Approve 2 DRAFT tasks"] }).hints,
+    ).toEqual(["Approve 2 DRAFT tasks"]);
+    expect(
+      SessionBriefOutput.safeParse({
+        ...baseBrief,
+        hints: ["1", "2", "3", "4", "5", "6", "7"],
+      }).success,
+    ).toBe(false);
+    expect(
+      SessionBriefOutput.safeParse({
+        ...baseBrief,
+        hints: ["x".repeat(161)],
+      }).success,
+    ).toBe(false);
 
     const baseCtx = {
       project: {

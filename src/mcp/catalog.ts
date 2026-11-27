@@ -77,7 +77,7 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   get_project_context:
     "Read repo identity, persona rules, skill index, docs, and dependency handoffs.",
   get_ready_tasks: "List claimable tasks for this repo whose dependencies are all done.",
-  claim_task: "Lock a task lease and retrieve instructions, persona rules, and handoffs.",
+  claim_task: "Lock task lease and fetch instructions, handoffs, and optional context pack.",
   complete_handoff: "Submit structured task handoff with commit hash; moves task to NEEDS_REVIEW.",
   report_blocker: "Release task lease and mark task BLOCKED with a specific reason.",
   create_tasks: "Propose a dependency-ordered list of DRAFT tasks for an epic.",
@@ -91,10 +91,10 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   interview_setup: "Return compact setup option cards for platform, personas, or locale.",
   session_brief: "Return compact ready, blocked, draft counts and next action hints.",
   manage_roots: "List, add, or remove external workspace roots owned by a persona.",
-  graph_neighbors: "List compact code-graph import and symbol neighbors for a file.",
+  graph_neighbors: "List code-graph import neighbors and symbols for up to 5 paths.",
   symbol_search: "Search indexed symbols in the local SQLite code graph.",
   graph_summary:
-    "Summarize project module architecture, dependency groups, hubs, and Mermaid graph.",
+    "Summarize module architecture, dependency groups, hubs, and Mermaid graph by prefix.",
   graph_impact: "Analyze reverse transitive dependents of a file before editing.",
 };
 

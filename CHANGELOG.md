@@ -4,11 +4,30 @@ Semua perubahan penting Catenext dicatat di sini, satu bagian per versi rilis CL
 (`catenext` di npm). Format mengikuti [Keep a Changelog](https://keepachangelog.com/id/1.1.0/)
 dan versi memakai [SemVer](https://semver.org/lang/id/).
 
-Aturan: setiap PR yang mengubah perilaku menambah baris di **Belum dirilis**. Saat rilis, bagian
-itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workflow *Release CLI* menolak
-tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STATUS.md).
+Aturan: setiap PR yang mengubah perilaku menambah baris di **Belum dirilis**. Saat menyiapkan rilis,
+bagian itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workflow *Release CLI*
+menolak tag yang versinya belum ada di file ini. Entri versi tidak berarti paket sudah terbit di npm.
+Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
 
-## [Belum dirilis]
+## [0.16.0] - 2026-11-27
+
+### Ditambahkan
+- **Delegasi subagent hemat-token (1-shot claim):**
+  - Pada MCP `claim_task`, kirim `task_id`, `agent_alias` untuk task berpersona, dan `worktree` (`session_id`, `branch`) bila diwajibkan, misalnya di monorepo. Tambahkan `include_context: true` untuk meminta `context_pack` opsional (`epic_summary`, `sync_board_excerpt`, `skills_hint`, `graph_slice`); `compact: true` meringkas handoff dependensi. Batas 4.096 byte JSON UTF-8 hanya berlaku untuk `context_pack`; konteks opsional yang dipangkas demi batas ini ditandai `truncated: true`.
+  - `graph_slice` dapat menyertakan `symbol_locations` (maks 3 nomor baris awal berbasis 1 per file) bila indeks dan metadata file mendukung serta masih muat dalam batas konteks. Lokasi ini tidak dikembalikan oleh `graph_neighbors`.
+  - `create_tasks` dan `update_task` menerima metadata lingkup terstruktur (`scope_files`, `verify_command`, `doc_refs`); `claim_task` mengembalikannya pada objek `task` bila tersimpan. Migrasi idempoten **SQLite schema v7** menambahkan `scope_files_json`, `verify_command`, dan `doc_refs_json` pada tabel `tasks`.
+  - `session_brief.hints` (maks 6 hint ringkas) yang memberi peringatan saat indeks graf kode stale atau terdeteksi overlap file antar-worktree.
+- **Code Graph v2:**
+  - Peningkatan ke parser graf v2 memperbarui indeks proyek, termasuk label simbol `* (<spec>)` dan deduplikasi `reexport` untuk barrel wildcard `export * from "<spec>"`.
+  - Resolusi `tsconfig.json` `references[]` (kedalaman maks 8, maks 64 config, tetap dalam batas `realRoot`).
+  - Filter `prefix` pada `graph_summary` (dan catatan scope `prefix=` di `renderArchitectureMarkdown`).
+  - Batching `graph_neighbors` melalui `paths[]` (1–5 file sekaligus) dan opsi `include_symbols` (`files[]` dengan hingga 12 simbol per file).
+  - Fast-path `catenext index --summary` / `--impact` melewati re-index saat indeks masih fresh (`--force` untuk memaksa rebuild), serta validasi eksplisit menolak `--impact --depth > 3`.
+- **Higiene worktree:** `catenext worktree status [--json]` (`apps/cli/src/worktree-status.ts`) mendeteksi file commit-ahead terhadap base branch (`ahead_count`, `ahead_files` maks 50) dan menggabungkannya dengan file kotor dalam perhitungan `overlaps` lintas worktree.
+
+### Diubah
+- Stub worker (`apps/cli/src/subagents.ts`) memakai alur direct-claim saat `TASK_ID` tersedia di brief (`compact: true`, `include_context: true`), dan template brief orchestrator diringkas menjadi `TASK_ID` / `WORKTREE` / `GOAL` / `FILES` / `CONTRACTS` / `VERIFY` / `CONSTRAINTS` / `DONE WHEN`.
+- Deskripsi katalog MCP (`apps/cli/src/mcp/catalog.ts`) untuk `claim_task`, `graph_neighbors`, dan `graph_summary` diselaraskan dengan fitur baru.
 
 ## [0.15.0] - 2026-11-27
 

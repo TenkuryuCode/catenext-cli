@@ -198,6 +198,24 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       tryEnableCodeSearchFts(db);
     },
   },
+  {
+    version: 7,
+    description:
+      "Add tasks.scope_files_json, tasks.verify_command, and tasks.doc_refs_json columns",
+    up(db) {
+      const columns = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
+      const names = new Set(columns.map((col) => col.name));
+      if (!names.has("scope_files_json")) {
+        db.exec("ALTER TABLE tasks ADD COLUMN scope_files_json TEXT");
+      }
+      if (!names.has("verify_command")) {
+        db.exec("ALTER TABLE tasks ADD COLUMN verify_command TEXT");
+      }
+      if (!names.has("doc_refs_json")) {
+        db.exec("ALTER TABLE tasks ADD COLUMN doc_refs_json TEXT");
+      }
+    },
+  },
 ];
 
 function hasCode(error: unknown, code: string): boolean {

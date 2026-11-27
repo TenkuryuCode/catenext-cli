@@ -824,6 +824,116 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(summaryWithTestsText).not.toContain("include_tests=false");
   }, 20_000);
 
+  it("rejects index --impact --depth 4 and supports fast-path skip vs --force", async () => {
+    git("init", "-b", "main");
+    cli(["init", "--platform", "claude-code"]);
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/core.ts"), "export function core() { return 1; }\n");
+    await writeFile(
+      join(root, "src/app.ts"),
+      `import { core } from "./core.js";\nexport function app() { return core(); }\n`,
+    );
+
+    const invalidDepth = runCli(["index", "--impact", "src/core.ts", "--depth", "4"]);
+    expect(invalidDepth.status).toBe(1);
+    expect(invalidDepth.stderr).toContain("--impact hanya mendukung --depth 1-3");
+
+    const first = JSON.parse(cli(["index", "--summary", "--json"])) as {
+      files: number;
+      skipped?: boolean;
+    };
+    expect(first.files).toBe(2);
+    expect(first.skipped).toBeUndefined();
+
+    // Add an untracked file without modifying indexed files: fast-path skips re-index
+    await writeFile(join(root, "src/extra.ts"), "export const extra = 42;\n");
+
+    const fastJson = JSON.parse(cli(["index", "--summary", "--json"])) as {
+      files: number;
+      skipped?: boolean;
+    };
+    expect(fastJson.files).toBe(2);
+    expect(fastJson.skipped).toBe(true);
+
+    const fastText = cli(["index", "--summary"]);
+    expect(fastText).toContain("skipped re-index");
+
+    // --force bypasses fast-path and indexes the newly added file
+    const forced = JSON.parse(cli(["index", "--summary", "--force", "--json"])) as {
+      files: number;
+      skipped?: boolean;
+    };
+    expect(forced.files).toBe(3);
+    expect(forced.skipped).toBeUndefined();
+  }, 20_000);
+
+  it.each(["paths", "references"])(
+    "rebuilds edges on index --force after only tsconfig %s changes",
+    async (configField) => {
+      git("init", "-b", "main");
+      cli(["init", "--platform", "claude-code"]);
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, "src/app.ts"), 'import "@dep";\n');
+      await writeFile(join(root, "src/old.ts"), "export const oldValue = 1;\n");
+      await writeFile(join(root, "src/new.ts"), "export const newValue = 2;\n");
+      await writeFile(join(fixtureDir, "outside.ts"), "export const outside = 3;\n");
+
+      const pathsConfig = (target: string) => ({
+        compilerOptions: { paths: { "@dep": [target] } },
+      });
+      await writeFile(join(root, "tsconfig.old.json"), JSON.stringify(pathsConfig("./src/old.ts")));
+      await writeFile(join(root, "tsconfig.new.json"), JSON.stringify(pathsConfig("./src/new.ts")));
+      await writeFile(
+        join(fixtureDir, "tsconfig.outside.json"),
+        JSON.stringify(pathsConfig("./outside.ts")),
+      );
+      const setConfig = (target: "old" | "new" | "outside") =>
+        writeFile(
+          join(root, "tsconfig.json"),
+          JSON.stringify(
+            configField === "paths"
+              ? pathsConfig(target === "outside" ? "../outside.ts" : `./src/${target}.ts`)
+              : {
+                  references: [
+                    {
+                      path:
+                        target === "outside"
+                          ? "../tsconfig.outside.json"
+                          : `./tsconfig.${target}.json`,
+                    },
+                  ],
+                },
+          ),
+        );
+      const readImpact = (target: "old" | "new", ...flags: string[]) =>
+        z
+          .object({
+            edges: z.number(),
+            skipped: z.boolean().optional(),
+            impact: z.object({ impacted: z.array(z.object({ path: z.string() })) }),
+          })
+          .parse(JSON.parse(cli(["index", "--impact", `src/${target}.ts`, "--json", ...flags])));
+
+      await setConfig("old");
+      expect(readImpact("old").impact.impacted).toEqual([{ path: "src/app.ts" }]);
+
+      await setConfig("new");
+      cli(["index"]); // Normal index stays incremental for config-only edits.
+      expect(readImpact("old")).toMatchObject({
+        skipped: true,
+        impact: { impacted: [{ path: "src/app.ts" }] },
+      });
+      const forced = readImpact("new", "--force");
+      expect(forced.skipped).toBeUndefined();
+      expect(forced.impact.impacted).toEqual([{ path: "src/app.ts" }]);
+      expect(readImpact("old")).toEqual({ edges: 1, skipped: true, impact: { impacted: [] } });
+
+      await setConfig("outside");
+      expect(readImpact("new", "--force")).toEqual({ edges: 0, impact: { impacted: [] } });
+    },
+    20_000,
+  );
+
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {
       const result = runCli([command, "--platform", "unknown-platform"]);

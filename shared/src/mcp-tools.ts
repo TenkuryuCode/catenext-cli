@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ReleaseTaskInput, SetDependenciesInput, UpdateEpicInput, UpdateTaskInput } from "./api.js";
 import {
+  ClaimGraphFileSchema,
   GraphImpactInput,
   GraphImpactOutput,
   GraphNeighborsInput,
@@ -45,7 +46,14 @@ import {
   SkillIndexEntrySchema,
   SkillNameSchema,
 } from "./skill.js";
-import { BlockerCategorySchema, TaskStatusSchema, TaskSummarySchema } from "./task.js";
+import {
+  BlockerCategorySchema,
+  TaskDocRefsSchema,
+  TaskScopeFilesSchema,
+  TaskStatusSchema,
+  TaskSummarySchema,
+  TaskVerifyCommandSchema,
+} from "./task.js";
 
 /**
  * Kontrak input/output untuk setiap tool MCP yang diekspos ke agen.
@@ -194,6 +202,19 @@ const BranchNameSchema = z
   .regex(/^[a-zA-Z0-9_./-]+$/)
   .refine((s) => s !== "HEAD" && !s.startsWith("-") && !s.includes(".."));
 
+/** Maximum serialized UTF-8 JSON bytes for the optional claim context, including its marker. */
+export const CLAIM_CONTEXT_PACK_MAX_BYTES = 4096;
+
+export const ClaimContextPackSchema = z.object({
+  epic_summary: z.string().optional(),
+  sync_board_excerpt: z.string().optional(),
+  skills_hint: z.array(z.string()).optional(),
+  graph_slice: z.array(ClaimGraphFileSchema).optional(),
+  /** Set when optional context was dropped or shortened to fit the byte budget. */
+  truncated: z.literal(true).optional(),
+});
+export type ClaimContextPack = z.infer<typeof ClaimContextPackSchema>;
+
 export const ClaimTaskInput = z.object({
   worktree: z
     .object({
@@ -208,6 +229,8 @@ export const ClaimTaskInput = z.object({
   agent_alias: AgentAliasSchema.optional(),
   /** Kembalikan ringkasan delta handoff dependensi (key_decisions, files_modified, notes) alih-alih payload penuh. */
   compact: z.boolean().optional(),
+  /** Sertakan context_pack 1-shot (epic_summary, sync_board_excerpt, skills_hint, graph_slice). */
+  include_context: z.boolean().optional(),
 });
 export const ClaimTaskOutput = z.object({
   task: z.object({
@@ -218,6 +241,9 @@ export const ClaimTaskOutput = z.object({
     role: RoleSchema.optional(),
     target_repo: RepoNameSchema.optional(),
     revision_count: z.number().int().min(0),
+    scope_files: TaskScopeFilesSchema.optional(),
+    verify_command: TaskVerifyCommandSchema.optional(),
+    doc_refs: TaskDocRefsSchema.optional(),
   }),
   /** Persona penanggung jawab task (atau persona agen): ikuti aturan dan batas wilayahnya. */
   persona: PersonaSchema.optional(),
@@ -234,6 +260,8 @@ export const ClaimTaskOutput = z.object({
     .optional(),
   /** Peringatan bila branch lokal berbeda dari git_branch handoff dependensi. */
   warnings: z.array(z.string()).default([]),
+  /** Konteks ringkas 1-shot bila include_context=true. */
+  context_pack: ClaimContextPackSchema.optional(),
 });
 
 // --- complete_handoff -------------------------------------------------------
@@ -341,6 +369,9 @@ export const PlannedTaskSchema = z.object({
   /** Alias persona penanggung jawab (lihat list_personas). Role task mengikuti persona ini. */
   persona: AgentAliasSchema.optional(),
   requires_approval: z.boolean().default(false),
+  scope_files: TaskScopeFilesSchema.optional(),
+  verify_command: TaskVerifyCommandSchema.optional(),
+  doc_refs: TaskDocRefsSchema.optional(),
 });
 
 export const CreateTasksInput = z

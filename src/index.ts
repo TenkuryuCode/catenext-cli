@@ -712,6 +712,7 @@ program
     12,
   )
   .option("--include-tests", "Sertakan file test pada ringkasan dan analisis dampak")
+  .option("--force", "Paksa re-index penuh meskipun indeks masih fresh")
   .option("--json", "Keluaran JSON")
   .action(
     (opts: {
@@ -722,17 +723,40 @@ program
       limit: number;
       maxHubs: number;
       includeTests?: boolean;
+      force?: boolean;
       json?: boolean;
     }) =>
       friendly(async () => {
+        if (opts.impact && opts.depth > 3) {
+          throw new LocalServiceError(
+            "invalid_input",
+            "--impact hanya mendukung --depth 1-3 (gunakan --depth 1..3; --summary mendukung 1..5).",
+          );
+        }
+
         const root = await requireRoot();
         const config = await readConfig(root);
         const dbPath = stateFilePath(root, config);
         const service = await cliService(root);
         // Ensure DB + project row exist.
         await service.callTool("session_brief", {});
-        const { indexProjectGraph } = await import("./db/graph-index.js");
-        const result = await indexProjectGraph(dbPath, config.project_id, root);
+        const rootsRes = await service.callTool("manage_roots", { action: "list" });
+        const rootDirs = [
+          { rootId: null, dir: root },
+          ...rootsRes.roots.map((r) => ({ rootId: r.id, dir: r.path })),
+        ];
+
+        const { getGraphCounts, getGraphIndexFastPathState, indexProjectGraph } = await import(
+          "./db/graph-index.js"
+        );
+        const canFastPath = Boolean((opts.summary || opts.impact) && !opts.force);
+        const fastState = canFastPath
+          ? getGraphIndexFastPathState(dbPath, config.project_id, rootDirs)
+          : undefined;
+        const skippedIndex = Boolean(fastState && fastState.indexed_files > 0 && !fastState.stale);
+        const result = skippedIndex
+          ? getGraphCounts(dbPath, config.project_id)
+          : await indexProjectGraph(dbPath, config.project_id, root, { rebuildEdges: opts.force });
 
         const includeTests = Boolean(opts.includeTests);
         const wantDoc = opts.writeDoc !== undefined && opts.writeDoc !== false;
@@ -795,6 +819,7 @@ program
             JSON.stringify(
               {
                 ...result,
+                ...(skippedIndex ? { skipped: true } : {}),
                 ...(summary ? { summary } : {}),
                 ...(impact ? { impact } : {}),
                 ...(savedDoc ? { document: savedDoc.document, created: savedDoc.created } : {}),
@@ -807,7 +832,9 @@ program
         }
 
         console.log(
-          `✓ indexed files=${result.files} symbols=${result.symbols} edges=${result.edges}`,
+          skippedIndex
+            ? `✓ index fresh (skipped re-index) files=${result.files} symbols=${result.symbols} edges=${result.edges}`
+            : `✓ indexed files=${result.files} symbols=${result.symbols} edges=${result.edges}`,
         );
         if (opts.summary && summary) {
           const { renderArchitectureMarkdown } = await import("./db/graph-summary.js");

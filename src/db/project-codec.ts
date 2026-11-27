@@ -17,6 +17,37 @@ function documentsSelectSql(db: DatabaseSync): string {
   return columns.some((col) => col.name === "archived_at") ? `${base}, archived_at` : base;
 }
 
+function tasksSelectSql(db: DatabaseSync): string {
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map((col) => col.name),
+  );
+  const cols = [
+    "id",
+    "epic_id",
+    "title",
+    "instruction",
+    "status",
+    "target",
+    "role",
+    "persona",
+    "requires_approval",
+    "revision",
+    "stale",
+    "feedback",
+    "lease_json",
+    "branch_json",
+    "handoff_json",
+    "review_json",
+    "blocker_json",
+    "integrated_commit_json",
+    "position",
+  ];
+  for (const optionalCol of ["scope_files_json", "verify_command", "doc_refs_json"]) {
+    if (columns.has(optionalCol)) cols.push(optionalCol);
+  }
+  return cols.join(", ");
+}
+
 export function emptyExtendedProject(): LocalProject {
   return {
     repos: [],
@@ -78,6 +109,19 @@ function hydrateTaskRow(row: Record<string, unknown>, dependencies: string[]): L
     undefined,
   );
   if (integratedCommit) task.integrated_commit = integratedCommit;
+  const scopeFiles = parseJson<LocalTask["scope_files"] | undefined>(
+    row.scope_files_json as string | null,
+    undefined,
+  );
+  if (Array.isArray(scopeFiles)) task.scope_files = scopeFiles;
+  if (typeof row.verify_command === "string" && row.verify_command.length > 0) {
+    task.verify_command = row.verify_command;
+  }
+  const docRefs = parseJson<LocalTask["doc_refs"] | undefined>(
+    row.doc_refs_json as string | null,
+    undefined,
+  );
+  if (Array.isArray(docRefs)) task.doc_refs = docRefs;
   return task;
 }
 
@@ -167,11 +211,7 @@ export function loadProjectState(
 
   const taskRows = db
     .prepare(
-      `SELECT id, epic_id, title, instruction, status, target, role, persona,
-              requires_approval, revision, stale, feedback,
-              lease_json, branch_json, handoff_json, review_json, blocker_json,
-              integrated_commit_json, position
-       FROM tasks WHERE project_id = ? ORDER BY position, rowid`,
+      `SELECT ${tasksSelectSql(db)} FROM tasks WHERE project_id = ? ORDER BY position, rowid`,
     )
     .all(projectId) as Record<string, unknown>[];
 
@@ -229,13 +269,7 @@ export function loadTask(
   taskId: string,
 ): LocalTask | undefined {
   const row = db
-    .prepare(
-      `SELECT id, epic_id, title, instruction, status, target, role, persona,
-              requires_approval, revision, stale, feedback,
-              lease_json, branch_json, handoff_json, review_json, blocker_json,
-              integrated_commit_json, position
-       FROM tasks WHERE project_id = ? AND id = ?`,
-    )
+    .prepare(`SELECT ${tasksSelectSql(db)} FROM tasks WHERE project_id = ? AND id = ?`)
     .get(projectId, taskId) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   const deps = (
@@ -253,8 +287,9 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
     `INSERT INTO tasks
       (id, project_id, epic_id, title, instruction, status, target, role, persona,
        requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+       scope_files_json, verify_command, doc_refs_json, position)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_id, id) DO UPDATE SET
        epic_id = excluded.epic_id,
        title = excluded.title,
@@ -273,6 +308,9 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
        review_json = excluded.review_json,
        blocker_json = excluded.blocker_json,
        integrated_commit_json = excluded.integrated_commit_json,
+       scope_files_json = excluded.scope_files_json,
+       verify_command = excluded.verify_command,
+       doc_refs_json = excluded.doc_refs_json,
        position = excluded.position`,
   ).run(
     task.id,
@@ -294,6 +332,9 @@ export function saveTask(db: DatabaseSync, projectId: string, task: LocalTask): 
     serialized.reviewJson,
     serialized.blockerJson,
     serialized.integratedCommitJson,
+    serialized.scopeFilesJson,
+    serialized.verifyCommand,
+    serialized.docRefsJson,
     serialized.position,
   );
 
@@ -401,6 +442,9 @@ type SerializedTask = {
   reviewJson: string | null;
   blockerJson: string | null;
   integratedCommitJson: string | null;
+  scopeFilesJson: string | null;
+  verifyCommand: string | null;
+  docRefsJson: string | null;
   position: number;
 };
 
@@ -424,6 +468,9 @@ function serializeTask(task: LocalTask): SerializedTask {
     reviewJson: task.review ? JSON.stringify(task.review) : null,
     blockerJson: task.blocker ? JSON.stringify(task.blocker) : null,
     integratedCommitJson: task.integrated_commit ? JSON.stringify(task.integrated_commit) : null,
+    scopeFilesJson: task.scope_files !== undefined ? JSON.stringify(task.scope_files) : null,
+    verifyCommand: task.verify_command ?? null,
+    docRefsJson: task.doc_refs !== undefined ? JSON.stringify(task.doc_refs) : null,
   };
 }
 
@@ -446,7 +493,10 @@ function serializedTaskEqual(a: SerializedTask, b: SerializedTask): boolean {
     a.handoffJson === b.handoffJson &&
     a.reviewJson === b.reviewJson &&
     a.blockerJson === b.blockerJson &&
-    a.integratedCommitJson === b.integratedCommitJson
+    a.integratedCommitJson === b.integratedCommitJson &&
+    a.scopeFilesJson === b.scopeFilesJson &&
+    a.verifyCommand === b.verifyCommand &&
+    a.docRefsJson === b.docRefsJson
   );
 }
 
@@ -662,8 +712,9 @@ export function saveProjectDiff(
         `INSERT INTO tasks
           (id, project_id, epic_id, title, instruction, status, target, role, persona,
            requires_approval, revision, stale, feedback,
-           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+           scope_files_json, verify_command, doc_refs_json, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       insTask.run(
         task.id,
@@ -685,6 +736,9 @@ export function saveProjectDiff(
         nextSer.reviewJson,
         nextSer.blockerJson,
         nextSer.integratedCommitJson,
+        nextSer.scopeFilesJson,
+        nextSer.verifyCommand,
+        nextSer.docRefsJson,
         nextSer.position,
       );
       for (const dep of new Set(task.dependencies)) {
@@ -701,7 +755,8 @@ export function saveProjectDiff(
              epic_id = ?, title = ?, instruction = ?, status = ?, target = ?, role = ?, persona = ?,
              requires_approval = ?, revision = ?, stale = ?, feedback = ?,
              lease_json = ?, branch_json = ?, handoff_json = ?, review_json = ?, blocker_json = ?,
-             integrated_commit_json = ?, position = ?
+             integrated_commit_json = ?, scope_files_json = ?, verify_command = ?, doc_refs_json = ?,
+             position = ?
            WHERE project_id = ? AND id = ?`,
         );
         updTask.run(
@@ -722,6 +777,9 @@ export function saveProjectDiff(
           nextSer.reviewJson,
           nextSer.blockerJson,
           nextSer.integratedCommitJson,
+          nextSer.scopeFilesJson,
+          nextSer.verifyCommand,
+          nextSer.docRefsJson,
           nextSer.position,
           projectId,
           task.id,
@@ -898,8 +956,9 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
     `INSERT INTO tasks
       (id, project_id, epic_id, title, instruction, status, target, role, persona,
        requires_approval, revision, stale, feedback,
-       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json, position)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       lease_json, branch_json, handoff_json, review_json, blocker_json, integrated_commit_json,
+       scope_files_json, verify_command, doc_refs_json, position)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertDep = db.prepare(
     "INSERT INTO task_deps (project_id, task_id, depends_on) VALUES (?, ?, ?)",
@@ -926,6 +985,9 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
       ser.reviewJson,
       ser.blockerJson,
       ser.integratedCommitJson,
+      ser.scopeFilesJson,
+      ser.verifyCommand,
+      ser.docRefsJson,
       ser.position,
     );
     for (const dep of task.dependencies) insertDep.run(projectId, task.id, dep);

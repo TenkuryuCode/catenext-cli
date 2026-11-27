@@ -77,6 +77,8 @@ export const SessionBriefOutput = z.object({
   read_first: z.literal("CATENEXT.md").default("CATENEXT.md"),
   /** Session locale preference from session_prefs (when configured). */
   locale: z.string().optional(),
+  /** Optional concise next-step hints for the orchestrator. */
+  hints: z.array(z.string().max(BRIEF_LIMITS.line)).max(6).optional(),
 });
 
 export const ManageRootsInput = z.object({
@@ -90,20 +92,56 @@ export const ManageRootsOutput = z.object({
   roots: z.array(WorkspaceRootSchema),
 });
 
-export const GraphNeighborsInput = z.object({
-  path: z.string().min(1).max(500),
-  depth: z.number().int().min(1).max(2).default(1),
-  limit: z.number().int().min(1).max(40).default(20),
-});
+export const GraphNeighborsInput = z
+  .object({
+    path: z.string().min(1).max(500).optional(),
+    paths: z.array(z.string().min(1).max(500)).min(1).max(5).optional(),
+    depth: z.number().int().min(1).max(2).default(1),
+    limit: z.number().int().min(1).max(40).default(20),
+    include_symbols: z.boolean().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (!v.path && (!v.paths || v.paths.length === 0)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "Provide path or paths (1..5 file paths).",
+      });
+    }
+    if (v.path && v.paths && v.paths.length > 0 && !v.paths.includes(v.path)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["paths"],
+        message: "Do not pass conflicting path and paths; use one or include path in paths.",
+      });
+    }
+  });
 export const GraphEdgeSchema = z.object({
   kind: z.string(),
   from: z.string(),
   to: z.string(),
   label: z.string().optional(),
 });
-export const GraphNeighborsOutput = z.object({
+export const GraphNeighborFileSchema = z.object({
   path: z.string(),
+  edges: z.array(GraphEdgeSchema),
+  symbols: z.array(z.string()).optional(),
+});
+export const MAX_CLAIM_SYMBOL_LOCATIONS = 3;
+export const ClaimGraphFileSchema = GraphNeighborFileSchema.extend({
+  /** Indexed 1-based start lines, returned only in the claim graph slice. */
+  symbol_locations: z
+    .array(z.object({ name: z.string(), line: z.number().int().min(1) }))
+    .min(1)
+    .max(MAX_CLAIM_SYMBOL_LOCATIONS)
+    .optional(),
+});
+export type ClaimGraphFile = z.infer<typeof ClaimGraphFileSchema>;
+
+export const GraphNeighborsOutput = z.object({
+  path: z.string().optional(),
   edges: z.array(GraphEdgeSchema).max(40),
+  files: z.array(GraphNeighborFileSchema).optional(),
   stale: z.boolean().optional(),
   stale_reason: z.string().optional(),
 });
@@ -156,6 +194,7 @@ export const GraphSummaryInput = z.object({
   max_hubs: z.number().int().min(1).max(30).default(12),
   include_mermaid: z.boolean().default(true),
   include_tests: z.boolean().default(false),
+  prefix: z.string().min(1).max(300).optional(),
 });
 export type GraphSummaryInputType = z.infer<typeof GraphSummaryInput>;
 

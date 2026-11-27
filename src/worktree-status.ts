@@ -1,13 +1,17 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { access, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { findProjectRoot, readConfig, stateFilePath } from "./config.js";
 import { loadProjectState } from "./db/project-codec.js";
 import { isConsistent, LocalStore } from "./db/store.js";
 import { LocalServiceError } from "./errors.js";
+import type { LocalTask } from "./local-state.js";
 import { WorktreeError } from "./worktrees.js";
 
 const MAX_MODIFIED_FILES = 50;
+export const WORKTREE_HINT_TIMEOUT_MS = 250;
+const exec = promisify(execFile);
 
 export interface WorktreeStatusLease {
   task_id: string;
@@ -21,6 +25,8 @@ export interface WorktreeStatusEntry {
   prunable: boolean;
   dirty_count: number;
   modified_files: string[];
+  ahead_count: number;
+  ahead_files: string[];
   lease?: WorktreeStatusLease;
 }
 
@@ -42,12 +48,13 @@ interface RawGitWorktree {
   prunable: boolean;
 }
 
-interface ActiveWorktreeLease {
-  task_id: string;
-  persona: string | null;
+export interface ActiveWorktreeLease extends WorktreeStatusLease {
   branch: string | null;
+  baseBranch: string | null;
   worktreePaths: string[];
 }
+
+type GitRunner = (cwd: string, args: string[]) => Promise<string>;
 
 function cleanGitEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -57,32 +64,44 @@ function cleanGitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function runGit(cwd: string, args: string[]): string {
-  return execFileSync("git", ["--no-optional-locks", ...args], {
+async function runGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  const child = exec("git", ["--no-optional-locks", ...args], {
     cwd,
     env: cleanGitEnv(),
     encoding: "utf8",
-    timeout: 5000,
-    maxBuffer: 8 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
+    ...(signal ? { signal, killSignal: "SIGKILL" } : { timeout: 5000 }),
+    // Bound parsing and file bookkeeping per command for best-effort hints only.
+    maxBuffer: signal ? 256 * 1024 : 8 * 1024 * 1024,
   });
+  child.child.stdin?.end();
+  const { stdout } = await child;
+  signal?.throwIfAborted();
+  return stdout;
 }
 
-function canonicalPath(path: string): string {
+async function canonicalPath(path: string): Promise<string> {
   const abs = resolve(path);
   try {
-    return realpathSync(abs);
+    return await realpath(abs);
   } catch {
     const parent = dirname(abs);
     if (parent !== abs) {
       try {
-        return join(realpathSync(parent), basename(abs));
+        return join(await realpath(parent), basename(abs));
       } catch {
         return abs;
       }
     }
     return abs;
   }
+}
+
+async function exists(path: string): Promise<boolean> {
+  return access(path).then(
+    () => true,
+    () => false,
+  );
 }
 
 function samePath(a: string, b: string): boolean {
@@ -179,6 +198,92 @@ export function parseGitStatusPorcelain(raw: string): string[] {
   return files;
 }
 
+export function parseGitDiffNameOnly(raw: string): string[] {
+  if (!raw) return [];
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const tokens = raw.includes("\0") ? raw.split("\0") : raw.split(/\r?\n/);
+  for (const token of tokens) {
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    files.push(token);
+  }
+  return files;
+}
+
+async function verifyCommitRef(git: GitRunner, cwd: string, ref: string): Promise<string | null> {
+  if (!ref || ref.startsWith("-") || ref.includes("..")) return null;
+  try {
+    const out = (await git(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).trim();
+    return /^[0-9a-f]{40,}$/i.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveDefaultBaseRef(
+  git: GitRunner,
+  cwd: string,
+  primaryBranch: string | null,
+): Promise<{ ref: string; commit: string } | null> {
+  const candidates: string[] = [];
+  try {
+    const remoteHead = (
+      await git(cwd, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    ).trim();
+    const prefix = "refs/remotes/origin/";
+    if (remoteHead.startsWith(prefix)) {
+      const name = remoteHead.slice(prefix.length);
+      if (name) {
+        candidates.push(`refs/heads/${name}`, remoteHead);
+      }
+    }
+  } catch {
+    // No origin/HEAD configured.
+  }
+  candidates.push("refs/heads/main", "refs/heads/master");
+  if (primaryBranch) {
+    candidates.push(`refs/heads/${primaryBranch}`);
+  }
+
+  for (const ref of new Set(candidates)) {
+    const commit = await verifyCommitRef(git, cwd, ref);
+    if (commit) return { ref, commit };
+  }
+  return null;
+}
+
+async function readMarkerBaseBranch(
+  git: GitRunner,
+  wtPath: string,
+  branch: string | null,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (!branch) return null;
+  try {
+    const gitDirRaw = (await git(wtPath, ["rev-parse", "--git-dir"])).trim();
+    if (!gitDirRaw) return null;
+    const adminDir = isAbsolute(gitDirRaw) ? gitDirRaw : resolve(wtPath, gitDirRaw);
+    const markerPath = join(adminDir, "catenext-worktree.json");
+    const parsed = JSON.parse(await readFile(markerPath, { encoding: "utf8", signal })) as {
+      branch?: unknown;
+      base_branch?: unknown;
+    };
+    if (
+      parsed.branch === branch &&
+      typeof parsed.base_branch === "string" &&
+      parsed.base_branch.length > 0 &&
+      !parsed.base_branch.startsWith("-") &&
+      !parsed.base_branch.includes("..")
+    ) {
+      return parsed.base_branch;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function readActiveWorktreeLeases(
   cwd: string,
   primaryPath?: string,
@@ -191,88 +296,191 @@ async function readActiveWorktreeLeases(
 
   const config = await readConfig(root);
   const dbPath = stateFilePath(root, config);
-  if (!existsSync(dbPath)) return [];
 
-  const leases = await new LocalStore(dbPath).inspect((db) => {
-    const { exists, project } = loadProjectState(db, config.project_id);
-    if (!exists) return [];
-    if (!isConsistent(project)) {
-      throw new LocalServiceError("corrupt_state", "SQLite state tidak konsisten.");
-    }
-    const items: ActiveWorktreeLease[] = [];
-    for (const task of project.tasks) {
-      if (!task.lease) continue;
-      const worktreePaths = [task.lease.worktree?.worktree_path, task.branch?.worktree_path]
-        .filter((p): p is string => typeof p === "string" && isAbsolute(p))
-        .map(canonicalPath);
-      const branch = task.branch && task.branch.repo === config.repo_name ? task.branch.name : null;
-      if (worktreePaths.length === 0 && !branch) continue;
-      items.push({
+  return (
+    (await new LocalStore(dbPath).inspect((db) => {
+      const { exists, project } = loadProjectState(db, config.project_id);
+      if (!exists) return [];
+      if (!isConsistent(project)) {
+        throw new LocalServiceError("corrupt_state", "SQLite state tidak konsisten.");
+      }
+      return snapshotWorktreeLeases(project.tasks, config.repo_name);
+    })) ?? []
+  );
+}
+
+/** Copy only lease metadata used by worktree status; no filesystem access or lease tokens. */
+export function snapshotWorktreeLeases(tasks: LocalTask[], repo: string): ActiveWorktreeLease[] {
+  return tasks.flatMap((task) => {
+    if (!task.lease) return [];
+    const worktreePaths = [task.lease.worktree?.worktree_path, task.branch?.worktree_path].filter(
+      (p): p is string => typeof p === "string" && isAbsolute(p),
+    );
+    const branch = task.branch?.repo === repo ? task.branch.name : null;
+    if (!worktreePaths.length && !branch) return [];
+    return [
+      {
         task_id: task.id,
         persona: task.lease.alias ?? task.persona ?? null,
         branch,
+        baseBranch: task.lease.worktree?.base_branch ?? null,
         worktreePaths,
-      });
-    }
-    return items;
+      },
+    ];
   });
-
-  return leases ?? [];
 }
 
-function matchLease(
+function matchLeaseRecord(
   wtPath: string,
   wtBranch: string | null,
   leases: ActiveWorktreeLease[],
-): WorktreeStatusLease | undefined {
+): ActiveWorktreeLease | undefined {
   const byPath = leases.find((lease) => lease.worktreePaths.some((p) => samePath(p, wtPath)));
-  if (byPath) return { task_id: byPath.task_id, persona: byPath.persona };
+  if (byPath) return byPath;
   if (wtBranch) {
     const byBranch = leases.find((lease) => lease.branch !== null && lease.branch === wtBranch);
-    if (byBranch) return { task_id: byBranch.task_id, persona: byBranch.persona };
+    if (byBranch) return byBranch;
   }
   return undefined;
 }
 
-/** Read-only Git worktree status, SQLite lease enrichment, and cross-worktree overlap detection. */
+/** Full CLI status. Keep normal per-command Git timeouts and SQLite lease enrichment. */
 export async function readWorktreeStatus(
   cwd: string = process.cwd(),
 ): Promise<WorktreeStatusResult> {
+  return scanWorktreeStatus(cwd);
+}
+
+/** Best-effort scan from a lease snapshot. Never reopens SQLite or reads project config. */
+export async function readWorktreeOverlapHint(
+  cwd: string,
+  leases: readonly ActiveWorktreeLease[],
+  deadline: AbortSignal = AbortSignal.timeout(WORKTREE_HINT_TIMEOUT_MS),
+): Promise<WorktreeFileOverlap[]> {
+  if (deadline.aborted) return [];
+  // realpath/access cannot be aborted. Return on deadline even if such a call is still pending.
+  let onAbort: () => void = () => {};
+  const aborted = new Promise<WorktreeFileOverlap[]>((resolve) => {
+    onAbort = () => resolve([]);
+    deadline.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const scan = scanWorktreeStatus(cwd, { leases, signal: deadline });
+    return await Promise.race([scan.then(({ overlaps }) => overlaps), aborted]);
+  } catch {
+    return [];
+  } finally {
+    deadline.removeEventListener("abort", onAbort);
+  }
+}
+
+async function scanWorktreeStatus(
+  cwd: string,
+  hint?: { leases: readonly ActiveWorktreeLease[]; signal: AbortSignal },
+): Promise<WorktreeStatusResult> {
+  const signal = hint?.signal;
+  const git: GitRunner = (cwd, args) => runGit(cwd, args, signal);
   let rawList: string;
   try {
-    rawList = runGit(cwd, ["worktree", "list", "--porcelain"]);
+    rawList = await git(cwd, ["worktree", "list", "--porcelain"]);
   } catch {
+    signal?.throwIfAborted();
     throw new WorktreeError("Tidak bisa membaca daftar worktree Git.");
   }
 
   const rawTrees = parseWorktreeListPorcelain(rawList);
-  if (rawTrees.length === 0 || rawTrees.some((entry) => !isAbsolute(entry.path))) {
+  const primary = rawTrees[0];
+  if (!primary || rawTrees.some((entry) => !isAbsolute(entry.path))) {
     throw new WorktreeError("Daftar worktree Git tidak valid.");
   }
+  const primaryPath = await canonicalPath(primary.path);
+  signal?.throwIfAborted();
+  const rawLeases = hint?.leases ?? (await readActiveWorktreeLeases(cwd, primaryPath));
+  const leases: ActiveWorktreeLease[] = [];
+  for (const lease of rawLeases) {
+    signal?.throwIfAborted();
+    leases.push({
+      ...lease,
+      worktreePaths: await Promise.all(lease.worktreePaths.map(canonicalPath)),
+    });
+  }
+  const defaultBase = await resolveDefaultBaseRef(git, primaryPath, primary.branch);
 
-  const primaryPath = rawTrees[0] ? canonicalPath(rawTrees[0].path) : undefined;
-  const leases = await readActiveWorktreeLeases(cwd, primaryPath);
-
-  const inspected: Array<WorktreeStatusEntry & { allDirtyFiles: string[] }> = [];
-  for (const rawTree of rawTrees) {
-    const path = canonicalPath(rawTree.path);
-    const missing = !existsSync(path);
+  const inspected: Array<
+    WorktreeStatusEntry & { allDirtyFiles: string[]; allAheadFiles: string[] }
+  > = [];
+  for (const [index, rawTree] of rawTrees.entries()) {
+    signal?.throwIfAborted();
+    const path = index === 0 ? primaryPath : await canonicalPath(rawTree.path);
+    const missing = !(await exists(path));
+    signal?.throwIfAborted();
     let prunable = rawTree.prunable || missing;
     let allDirtyFiles: string[] = [];
+    let allAheadFiles: string[] = [];
 
     if (!prunable && !rawTree.bare) {
       try {
-        const statusRaw = runGit(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+        const statusRaw = await git(path, [
+          "status",
+          "--porcelain=v1",
+          "-z",
+          "--untracked-files=all",
+        ]);
         allDirtyFiles = parseGitStatusPorcelain(statusRaw);
       } catch {
-        if (!existsSync(path)) {
+        signal?.throwIfAborted();
+        if (!(await exists(path))) {
           prunable = true;
         }
         allDirtyFiles = [];
       }
     }
 
-    const lease = matchLease(path, rawTree.branch, leases);
+    const leaseRecord = matchLeaseRecord(path, rawTree.branch, leases);
+    const lease: WorktreeStatusLease | undefined = leaseRecord
+      ? { task_id: leaseRecord.task_id, persona: leaseRecord.persona }
+      : undefined;
+
+    if (!prunable && !rawTree.bare && rawTree.branch && rawTree.head) {
+      const preferredBase =
+        leaseRecord?.baseBranch ??
+        (index > 0 ? await readMarkerBaseBranch(git, path, rawTree.branch, signal) : null);
+      let baseRef: string | null = null;
+      let baseCommit: string | null = null;
+      if (preferredBase) {
+        const candidates = preferredBase.startsWith("refs/")
+          ? [preferredBase]
+          : [`refs/heads/${preferredBase}`, preferredBase];
+        for (const ref of candidates) {
+          const commit = await verifyCommitRef(git, path, ref);
+          if (commit) {
+            baseRef = ref;
+            baseCommit = commit;
+            break;
+          }
+        }
+      }
+      if (!baseRef && defaultBase) {
+        baseRef = defaultBase.ref;
+        baseCommit = defaultBase.commit;
+      }
+
+      if (
+        baseRef &&
+        baseCommit &&
+        baseCommit !== rawTree.head &&
+        baseRef !== `refs/heads/${rawTree.branch}`
+      ) {
+        try {
+          const diffRaw = await git(path, ["diff", "--name-only", "-z", `${baseRef}...HEAD`]);
+          allAheadFiles = parseGitDiffNameOnly(diffRaw);
+        } catch {
+          signal?.throwIfAborted();
+          allAheadFiles = [];
+        }
+      }
+    }
+
     inspected.push({
       path,
       branch: rawTree.branch,
@@ -280,14 +488,19 @@ export async function readWorktreeStatus(
       prunable,
       dirty_count: allDirtyFiles.length,
       modified_files: allDirtyFiles.slice(0, MAX_MODIFIED_FILES),
+      ahead_count: allAheadFiles.length,
+      ahead_files: allAheadFiles.slice(0, MAX_MODIFIED_FILES),
       ...(lease ? { lease } : {}),
       allDirtyFiles,
+      allAheadFiles,
     });
   }
 
+  signal?.throwIfAborted();
   const fileToWorktrees = new Map<string, string[]>();
   for (const entry of inspected) {
-    for (const file of entry.allDirtyFiles) {
+    const touchedFiles = new Set([...entry.allDirtyFiles, ...entry.allAheadFiles]);
+    for (const file of touchedFiles) {
       const list = fileToWorktrees.get(file);
       if (list) list.push(entry.path);
       else fileToWorktrees.set(file, [entry.path]);
@@ -303,7 +516,7 @@ export async function readWorktreeStatus(
   overlaps.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 
   return {
-    worktrees: inspected.map(({ allDirtyFiles: _ignored, ...entry }) => entry),
+    worktrees: inspected.map(({ allDirtyFiles: _d, allAheadFiles: _a, ...entry }) => entry),
     overlaps,
   };
 }
@@ -316,6 +529,7 @@ export function formatWorktreeStatus(result: WorktreeStatusResult): string {
     const stateParts: string[] = [];
     if (wt.prunable) stateParts.push("missing/prunable");
     stateParts.push(wt.dirty_count === 0 ? "clean" : `${wt.dirty_count} dirty`);
+    if (wt.ahead_count > 0) stateParts.push(`${wt.ahead_count} ahead`);
     if (wt.lease) {
       const who = wt.lease.persona ?? "unassigned";
       stateParts.push(`lease=${who}:${wt.lease.task_id}`);
