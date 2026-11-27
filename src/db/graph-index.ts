@@ -167,30 +167,103 @@ async function withDatabaseAsync<T>(
   }
 }
 
+function findTagClose(content: string, startIdx: number): number {
+  let quote: '"' | "'" | null = null;
+  for (let i = startIdx; i < content.length; i++) {
+    const ch = content[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ">") return i;
+  }
+  return -1;
+}
+
+function isAllowedScriptType(attrs: string): boolean {
+  const typeMatch = attrs.match(/\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i);
+  const rawType = typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3];
+  if (!rawType) return true;
+  const mime = rawType.trim().toLowerCase();
+  if (!mime) return true;
+  return (
+    mime === "module" ||
+    mime === "text/javascript" ||
+    mime === "application/javascript" ||
+    mime === "text/typescript" ||
+    mime === "application/typescript"
+  );
+}
+
 function extractSfcScriptBlocks(content: string): Array<{ code: string; startLine: number }> {
   const blocks: Array<{ code: string; startLine: number }> = [];
-  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-  for (const match of content.matchAll(re)) {
-    const attrs = match[1] ?? "";
-    const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']+)["']/i);
-    if (typeMatch?.[1]) {
-      const mime = typeMatch[1].trim().toLowerCase();
-      if (
-        mime !== "module" &&
-        mime !== "text/javascript" &&
-        mime !== "application/javascript" &&
-        mime !== "text/typescript" &&
-        mime !== "application/typescript"
-      ) {
+  const lower = content.toLowerCase();
+  const openToken = "<script";
+  const closeToken = "</script";
+  let pos = 0;
+
+  while (pos < content.length) {
+    const openIdx = lower.indexOf(openToken, pos);
+    if (openIdx === -1) break;
+
+    const afterOpenIdx = openIdx + openToken.length;
+    if (afterOpenIdx >= content.length) break;
+
+    const afterOpenCh = content[afterOpenIdx] ?? "";
+    if (afterOpenCh !== ">" && afterOpenCh !== "/" && !/\s/.test(afterOpenCh)) {
+      pos = afterOpenIdx;
+      continue;
+    }
+
+    const openCloseIdx = findTagClose(content, afterOpenIdx);
+    if (openCloseIdx === -1) break;
+
+    if (content[openCloseIdx - 1] === "/") {
+      pos = openCloseIdx + 1;
+      continue;
+    }
+
+    const attrs = content.slice(afterOpenIdx, openCloseIdx);
+    const codeStart = openCloseIdx + 1;
+
+    let scanPos = codeStart;
+    let closeStart = -1;
+    let closeEnd = -1;
+    while (scanPos < content.length) {
+      const closeIdx = lower.indexOf(closeToken, scanPos);
+      if (closeIdx === -1) break;
+
+      const afterCloseIdx = closeIdx + closeToken.length;
+      if (afterCloseIdx >= content.length) break;
+
+      const afterCloseCh = content[afterCloseIdx] ?? "";
+      if (afterCloseCh !== ">" && !/\s/.test(afterCloseCh)) {
+        scanPos = afterCloseIdx;
         continue;
       }
+
+      const tagEnd = findTagClose(content, afterCloseIdx);
+      if (tagEnd === -1) break;
+
+      closeStart = closeIdx;
+      closeEnd = tagEnd;
+      break;
     }
-    const code = match[2] ?? "";
-    const openEnd = match[0].indexOf(">") + 1;
-    const codeStart = (match.index ?? 0) + openEnd;
-    const startLine = content.slice(0, codeStart).split(/\r?\n/).length;
-    blocks.push({ code, startLine });
+
+    if (closeStart === -1 || closeEnd === -1) break;
+
+    if (isAllowedScriptType(attrs)) {
+      const startLine = content.slice(0, codeStart).split(/\r?\n/).length;
+      blocks.push({ code: content.slice(codeStart, closeStart), startLine });
+    }
+
+    pos = closeEnd + 1;
   }
+
   return blocks;
 }
 

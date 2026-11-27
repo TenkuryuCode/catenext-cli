@@ -10,6 +10,11 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.14.1] - 2026-11-27
+
+### Diperbaiki
+- Mengganti regex tag `<script>` di `extractSfcScriptBlocks` (`apps/cli/src/db/graph-index.ts`) dengan linear character/index scanner (`findTagClose`, `isAllowedScriptType`) untuk menutup alert CodeQL `js/bad-tag-filter`, menangani variasi penutup (`</script >`, `</SCRIPT ...>`), quoted `>` pada atribut, dan batas nama tag (`<scripture>`).
+
 ## [0.14.0] - 2026-11-27
 
 ### Ditambahkan

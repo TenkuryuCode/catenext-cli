@@ -470,6 +470,31 @@ describe("parseSymbols multi-language", () => {
     ]);
     expect(parseImports(svelte, ".svelte")).toEqual(["./loader"]);
   });
+
+  it("handles </script > and </SCRIPT foo=\"bar\"> closing tags, <scripture> boundary, quoted '>' attrs, and non-JS type blocks", () => {
+    const vueWithVariants = [
+      "<template>",
+      "  <scripture>export function ignoredBoundary() {}</scripture>",
+      "</template>",
+      '<script type="application/json">',
+      '{"functionNotCode": "export function ignoredJson() {}"}',
+      "</script>",
+      '<script setup lang="ts" data-hint="a>b">',
+      'import { helper } from "./helper";',
+      "export function fromQuotedAttr() {}",
+      "</script >",
+      '<script lang="ts">',
+      'import { extra } from "./extra";',
+      "const upperClosed = 1;",
+      '</SCRIPT foo="bar">',
+    ].join("\n");
+
+    expect(parseSymbols(vueWithVariants, ".vue")).toEqual([
+      { name: "fromQuotedAttr", kind: "function", line: 9 },
+      { name: "upperClosed", kind: "variable", line: 13 },
+    ]);
+    expect(parseImports(vueWithVariants, ".vue")).toEqual(["./helper", "./extra"]);
+  });
 });
 
 describe("PHP PSR-4, Python relative imports, SFC graph & standalone WAL cleanup", () => {
