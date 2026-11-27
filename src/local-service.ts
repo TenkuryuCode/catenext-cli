@@ -6,28 +6,19 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   briefText,
   type CatenextConfig,
-  CLAIM_CONTEXT_PACK_MAX_BYTES,
-  type ClaimContextPack,
   DOCUMENT_LIMITS,
-  type DocumentHeading,
-  DocumentIndexEntrySchema,
   findCycle,
   GENERAL_RULES,
   IdSchema,
   isMcpCrudTool,
-  LOCK_LEASE_MS,
   MCP_TOOLS,
   type McpCrudToolName,
   type McpToolName,
   type McpToolOutput,
-  nextStatus,
   type Persona,
   type ProjectDocument,
-  type PullRequestState,
-  type ReviewResult,
   type SearchHit,
   SetDependenciesInput,
-  type TaskEvent,
   type TaskSummary,
   UpdateEpicInput,
   UpdateTaskInput,
@@ -40,13 +31,7 @@ import {
   requireHumanApproval,
 } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
-import {
-  checkGraphFreshness,
-  getGraphCounts,
-  queryClaimGraphSlice,
-  queryGraphNeighbors,
-  symbolSearch,
-} from "./db/graph-index.js";
+import { checkGraphFreshness, queryGraphNeighbors, symbolSearch } from "./db/graph-index.js";
 import {
   analyzeGraphImpact,
   type GraphRootDir,
@@ -79,6 +64,28 @@ import { assertDescends, assertRunCheckout, fullSha, localCommit } from "./epic-
 import { LocalServiceError } from "./errors.js";
 import { buildInterviewSetup } from "./interview.js";
 import {
+  type ClaimContextSnapshot,
+  enrichClaimContext,
+  snapshotClaimContext,
+} from "./local-claim-context.js";
+import { claimResponse, dependencyHandoffs } from "./local-claim-response.js";
+import {
+  extractMarkdownOutline,
+  extractMarkdownSection,
+  filterVisibleDocuments,
+  isDocumentArchived,
+  recordIndex,
+} from "./local-documents-markdown.js";
+import {
+  advance,
+  claimable,
+  endLease,
+  leaseEnd,
+  leaseKey,
+  leaseMatches,
+  returnClaim,
+} from "./local-lease.js";
+import {
   archiveEpicInProject,
   type EpicArchiveResult,
   type EpicRestoreResult,
@@ -90,29 +97,20 @@ import {
   UpsertEpicSummaryInput,
   upsertVersionedEpicSummary,
 } from "./local-retention.js";
+import { offlineReview, reviewPullRequest, reviseTask } from "./local-review-workflow.js";
 import { type LocalSearchItem, searchLocalContext } from "./local-search.js";
 import {
+  allowsRepo,
   type LocalPermission,
   type LocalProject,
-  type LocalReview,
   type LocalTask,
   PERMISSION_ACTIONS,
   type PermissionAction,
   type VersionedEpicSummary,
 } from "./local-state.js";
-import {
-  buildReviewContextPack,
-  isStaleReviewCommit,
-  withReviewResponseByteLength,
-} from "./review-context.js";
 import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep, scrubText } from "./scrubber.js";
 import { applyProjectSeed } from "./seed.js";
-import {
-  type DiscoveredSkillEntry,
-  discoverSkillCatalog,
-  loadCatalogSkill,
-  toSkillIndexEntries,
-} from "./skill-catalog.js";
+import { discoverSkillCatalog, loadCatalogSkill, toSkillIndexEntries } from "./skill-catalog.js";
 import { saveSkill } from "./skills.js";
 import {
   type ActiveWorktreeLease,
@@ -125,7 +123,7 @@ export { LocalServiceError } from "./errors.js";
 
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
-  [N in Exclude<McpToolName, McpCrudToolName | "session_brief">]: (
+  [N in Exclude<McpToolName, McpCrudToolName | "claim_task" | "session_brief">]: (
     input: Parsed<N>,
   ) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
@@ -134,7 +132,6 @@ interface SessionBriefHintSnapshot {
   graphRoots: GraphRootDir[];
   worktreeLeases?: ActiveWorktreeLease[];
 }
-const offlineReview = "Review lokal saja. Status, head SHA, dan merge PR di host tidak diperiksa.";
 const directives = [
   ...GENERAL_RULES,
   "Jangan edit file state Catenext langsung; gunakan tool MCP atau CLI.",
@@ -145,47 +142,6 @@ const directives = [
 
 function fail(code: string, message: string, details?: unknown): never {
   throw new LocalServiceError(code, message, details);
-}
-
-function leaseEnd(now: number): string {
-  return new Date(now + LOCK_LEASE_MS).toISOString();
-}
-
-/** State menyimpan hash token, bukan token yang bisa dipakai ulang oleh pembaca state. */
-function leaseKey(token: string): string {
-  return `sha256.${createHash("sha256").update(token).digest("hex")}`;
-}
-
-/**
- * State baru menyimpan hash: cocokkan `leaseKey(presented)`.
- * State lama yang masih plaintext: cocokkan kesamaan langsung (bukan hash yang disalin dari state).
- */
-function leaseMatches(stored: string, presented: string | undefined): boolean {
-  if (presented === undefined) return false;
-  if (stored.startsWith("sha256.")) return stored === leaseKey(presented);
-  return stored === presented;
-}
-
-function claimable(task: LocalTask): boolean {
-  return task.status === "TODO" || task.status === "REVISION_REQUESTED";
-}
-
-function advance(task: LocalTask, event: TaskEvent): void {
-  const status = nextStatus(task.status, event);
-  if (!status)
-    fail("invalid_transition", `Aksi ${event} tidak berlaku untuk status ${task.status}.`);
-  task.status = status;
-}
-
-function endLease(task: LocalTask) {
-  delete task.lease;
-  if (!task.handoff) delete task.branch;
-}
-
-function returnClaim(task: LocalTask): "TODO" | "REVISION_REQUESTED" {
-  endLease(task);
-  task.status = task.handoff ? "REVISION_REQUESTED" : "TODO";
-  return task.status;
 }
 
 /** UUIDv5 with the project UUID as namespace. Alias remains the persisted identity. */
@@ -200,212 +156,10 @@ function projectPersonaId(projectId: string, alias: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function allowsRepo(persona: Persona | undefined, repo: string): boolean {
-  return !persona?.repos.length || persona.repos.includes(repo);
-}
-
-function recordIndex(doc: ProjectDocument) {
-  return DocumentIndexEntrySchema.parse(doc);
-}
-
-function isDocumentArchived(doc: ProjectDocument): boolean {
-  return doc.archived_at != null && doc.archived_at.length > 0;
-}
-
-function filterVisibleDocuments(
-  documents: ProjectDocument[],
-  includeArchived?: boolean,
-): ProjectDocument[] {
-  if (includeArchived) return documents;
-  return documents.filter((doc) => !isDocumentArchived(doc));
-}
-
-function extractMarkdownOutline(content: string): DocumentHeading[] {
-  const headings: DocumentHeading[] = [];
-  const lines = content.split(/\r?\n/);
-  let fence: { char: "`" | "~"; len: number } | null = null;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? "";
-    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1] ?? "```";
-      const char = marker[0] as "`" | "~";
-      if (!fence) fence = { char, len: marker.length };
-      else if (fence.char === char && marker.length >= fence.len) fence = null;
-      continue;
-    }
-    if (fence) continue;
-    const headingMatch = line.match(/^(#{1,6})(\s.*)$/);
-    if (!headingMatch) continue;
-    const hashes = headingMatch[1];
-    const title = headingMatch[2]?.trimEnd().replace(/\s#+$/, "").trim();
-    if (!hashes || !title) continue;
-    headings.push({ level: hashes.length, title, line: i + 1 });
-  }
-  return headings;
-}
-
-function extractMarkdownSection(
-  content: string,
-  sectionQuery: string,
-): { title: string; content: string; truncated: boolean } | null {
-  const headings = extractMarkdownOutline(content);
-  const needle = sectionQuery
-    .trim()
-    .replace(/^#{1,6}\s+/, "")
-    .toLowerCase();
-  if (!needle) return null;
-  const matched =
-    headings.find((h) => h.title.trim().toLowerCase() === needle) ??
-    headings.find((h) => h.title.trim().toLowerCase().includes(needle));
-  if (!matched) return null;
-  const nextHeading = headings.find((h) => h.line > matched.line && h.level <= matched.level);
-  const lines = content.split(/\r?\n/);
-  const startIdx = matched.line - 1;
-  const endIdx = nextHeading ? nextHeading.line - 1 : lines.length;
-  const slice = lines.slice(startIdx, endIdx).join("\n").trimEnd();
-  return {
-    title: matched.title,
-    content: slice,
-    truncated: slice.length < content.length,
-  };
-}
-
 function sameStringList(a?: readonly string[], b?: readonly string[]): boolean {
   if (a === undefined && b === undefined) return true;
   if (a === undefined || b === undefined) return false;
   return a.length === b.length && a.every((item, idx) => item === b[idx]);
-}
-
-function extractSyncBoardExcerpt(
-  content: string,
-  taskId: string,
-  persona: string | null,
-): string | undefined {
-  const trimmed = content.trim();
-  if (!trimmed) return undefined;
-
-  const lines = trimmed.split(/\r?\n/);
-  const blocks: Array<{ heading?: string; body: string[] }> = [];
-  let current: { heading?: string; body: string[] } = { body: [] };
-  for (const line of lines) {
-    if (/^#{1,6}\s+/.test(line)) {
-      if (current.heading || current.body.length > 0) blocks.push(current);
-      current = { heading: line, body: [] };
-    } else {
-      current.body.push(line);
-    }
-  }
-  if (current.heading || current.body.length > 0) blocks.push(current);
-
-  const taskNeedle = taskId.toLowerCase();
-  const personaNeedle = persona?.toLowerCase();
-  const lineMatches = (line: string): boolean => {
-    const low = line.toLowerCase();
-    if (low.includes(taskNeedle)) return true;
-    if (personaNeedle && low.includes(personaNeedle)) return true;
-    return /\b(?:decisions|open\s+asks)\b/i.test(line);
-  };
-
-  const picked: string[] = [];
-  for (const block of blocks) {
-    const heading = block.heading;
-    const body = block.body.filter((line) => line.trim().length > 0);
-    if (heading && /\b(?:decisions|open\s+asks)\b/i.test(heading)) {
-      picked.push(heading, ...body);
-      continue;
-    }
-    const matchingLines = body.filter(lineMatches);
-    if (matchingLines.length > 0) {
-      if (heading) picked.push(heading);
-      picked.push(...matchingLines);
-    }
-  }
-
-  let excerpt = (picked.length > 0 ? picked : lines.filter((line) => line.trim().length > 0)).join(
-    "\n",
-  );
-  excerpt = excerpt.trim();
-  if (!excerpt) return undefined;
-  if (excerpt.length > 800) excerpt = `${excerpt.slice(0, 799)}…`;
-  return excerpt;
-}
-
-function prioritizeSkills(
-  skills: readonly Pick<
-    DiscoveredSkillEntry,
-    "name" | "when_to_use" | "disable_model_invocation"
-  >[],
-  task: LocalTask,
-): string[] {
-  const docNeedles = new Set((task.doc_refs ?? []).map((ref) => ref.toLowerCase()));
-  const roleNeedles = [task.role, task.persona]
-    .filter((v): v is string => typeof v === "string" && v.length > 0)
-    .map((v) => v.toLowerCase());
-
-  const matches = (
-    skill: Pick<DiscoveredSkillEntry, "name" | "when_to_use" | "disable_model_invocation">,
-  ): boolean => {
-    const nameLow = skill.name.toLowerCase();
-    if (docNeedles.has(nameLow)) return true;
-    for (const ref of docNeedles) {
-      if (ref.includes(nameLow) || nameLow.includes(ref)) return true;
-    }
-    const hay = `${nameLow} ${skill.when_to_use.toLowerCase()}`;
-    return roleNeedles.some((needle) => hay.includes(needle));
-  };
-
-  const prioritized: string[] = [];
-  const rest: string[] = [];
-  const seen = new Set<string>();
-  for (const skill of skills) {
-    if (skill.disable_model_invocation || seen.has(skill.name)) continue;
-    seen.add(skill.name);
-    if (matches(skill)) prioritized.push(skill.name);
-    else rest.push(skill.name);
-  }
-  return [...prioritized, ...rest].slice(0, 5);
-}
-
-function boundClaimContextPack(pack: ClaimContextPack): ClaimContextPack {
-  const fits = (candidate: ClaimContextPack) =>
-    Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CLAIM_CONTEXT_PACK_MAX_BYTES;
-  if (fits(pack)) return pack;
-
-  const bounded: ClaimContextPack = { ...pack, truncated: true };
-  if (pack.graph_slice?.some((file) => file.symbol_locations)) {
-    // Preserve the original slice when only the added locations exceed the budget.
-    bounded.graph_slice = pack.graph_slice.map(({ symbol_locations: _locations, ...file }) => file);
-    if (fits(bounded)) return bounded;
-  }
-  delete bounded.graph_slice;
-  if (fits(bounded)) return bounded;
-
-  const excerpt = bounded.sync_board_excerpt;
-  delete bounded.sync_board_excerpt;
-  if (excerpt && fits(bounded)) {
-    // Find longest excerpt prefix that fits, including JSON escaping and the truncation marker.
-    const chars = Array.from(excerpt);
-    let low = 1;
-    let high = chars.length - 1;
-    let best: string | undefined;
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
-      const prefix = `${chars.slice(0, mid).join("")}…`;
-      if (fits({ ...bounded, sync_board_excerpt: prefix })) {
-        best = prefix;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    if (best !== undefined) bounded.sync_board_excerpt = best;
-  }
-
-  // Defensive fallback if non-excerpt context ever grows beyond current field limits.
-  if (!fits(bounded)) delete bounded.skills_hint;
-  if (!fits(bounded)) delete bounded.epic_summary;
-  return bounded;
 }
 
 /** Shared local orchestration boundary for standalone CLI and MCP processes. */
@@ -1263,6 +1017,14 @@ export class LocalService {
         // Worktree hints are optional, even if the scanner fails unexpectedly.
       }
     }
+    if (this.caller === "agent" && process.env.CATENEXT_MCP_ROLE === "") {
+      hints.push(
+        briefText(
+          "MCP launched without --role — prefer --role orchestrator|worker to shrink tools/list.",
+          160,
+        ),
+      );
+    }
     return hints.slice(0, 6);
   }
 
@@ -1294,7 +1056,7 @@ export class LocalService {
       requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
     }
     const existed = existsSync(this.stateFile);
-    const { out, hintSnapshot } = await this.store.transaction(
+    const { out, hintSnapshot, claimContext } = await this.store.transaction(
       this.config.project_id,
       this.config.repo_name,
       async (project, dirty, db, afterSave) => {
@@ -1316,17 +1078,23 @@ export class LocalService {
           const { brief, hintSnapshot } = tools.sessionBrief(Boolean(verbose));
           return { out: contract.output.parse(brief) as McpToolOutput<K>, hintSnapshot };
         }
-        // Registry key correlates parser, handler, and output. TS cannot retain that correlation
-        // on a generic indexed access; output validation happens before the transaction commits.
-        const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
-        const result = contract.output.parse(
-          name === "manage_task" && local?.approvalSnapshot !== undefined
-            ? tools.manageTask(
-                MCP_TOOLS.manage_task.input.parse(parsed.data),
-                local.approvalSnapshot,
-              )
-            : await run(parsed.data),
-        );
+        let result: unknown;
+        let claimContext: ClaimContextSnapshot | undefined;
+        if (toolName === "claim_task") {
+          ({ result, context: claimContext } = tools.claim(
+            MCP_TOOLS.claim_task.input.parse(parsed.data),
+          ));
+        } else if (name === "manage_task" && local?.approvalSnapshot !== undefined) {
+          result = tools.manageTask(
+            MCP_TOOLS.manage_task.input.parse(parsed.data),
+            local.approvalSnapshot,
+          );
+        } else {
+          // The registry correlates the parser and handler, which TS loses on generic access.
+          const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
+          result = await run(parsed.data);
+        }
+        const validated = contract.output.parse(result) as McpToolOutput<K>;
         const events = tools.drainEvents();
         const runs = tools.drainRuns();
         if (events.length > 0 || runs.length > 0) {
@@ -1335,7 +1103,7 @@ export class LocalService {
             insertTaskEvents(txDb, this.config.project_id, events);
           });
         }
-        return { out: result as McpToolOutput<K> };
+        return { out: validated, claimContext };
       },
     );
     if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
@@ -1345,6 +1113,10 @@ export class LocalService {
     if (hintSnapshot) {
       const hints = await this.sessionBriefHints(hintSnapshot);
       if (hints.length > 0) return { ...out, hints };
+    }
+    if (claimContext) {
+      const pack = await enrichClaimContext(claimContext, this.repoRoot, this.config.platforms);
+      if (pack) return { ...out, context_pack: pack };
     }
     return out;
   }
@@ -1512,7 +1284,7 @@ class LocalWorkflow {
     const revision = task.revision;
     if (options.decision === "request_changes") {
       if (revision >= 2) this.pauseRun(run, `Task ${task.id} reached its two-revision limit.`);
-      else this.revise(task, options.feedback);
+      else reviseTask(task, this.tasks.values(), options.feedback, this.iso);
     } else if (previous?.revision === revision && previous.head === options.head) {
       fail(
         "run_review",
@@ -1587,7 +1359,6 @@ class LocalWorkflow {
     get_ready_tasks: (input) => ({
       tasks: this.ready(input, input.limit).map((task) => this.summary(task)),
     }),
-    claim_task: (input) => this.claim(input),
     release_task: (input) => this.release(input),
     report_blocker: (input) => this.block(input),
     complete_handoff: (input) => this.handoff(input),
@@ -1596,7 +1367,19 @@ class LocalWorkflow {
     archive_document: (input) => this.archiveDocument(input),
     restore_document: (input) => this.restoreDocument(input),
     search_context: (input) => this.search(input),
-    review_pull_request: ({ request }) => this.review(request),
+    review_pull_request: ({ request }) =>
+      reviewPullRequest(request, {
+        project: this.project,
+        tasks: this.tasks,
+        repoRoot: this.root,
+        repo: this.repo,
+        overrides: this.config.overrides,
+        now: this.now,
+        iso: this.iso,
+        personaForAlias: (alias) => this.persona(alias),
+        dirty: this.dirty,
+        recordEvent: (event) => this.recordEvent(event),
+      }),
     load_skill: async ({ name, revision, source_id }) => {
       const skill = await loadCatalogSkill(this.root, name, {
         platforms: this.config.platforms,
@@ -2219,47 +2002,6 @@ class LocalWorkflow {
     };
   }
 
-  private dependencyHandoffs(task: LocalTask) {
-    return task.dependencies.flatMap((id) => {
-      const dep = this.tasks.get(id);
-      if (!dep?.handoff) return [];
-      const integrated =
-        dep.integrated_commit ??
-        (dep.handoff as { integrated_commit?: { branch: string; sha: string } }).integrated_commit;
-      return [
-        {
-          task_id: id,
-          title: dep.title,
-          handoff_summary: dep.handoff,
-          ...(integrated ? { integrated_commit: integrated } : {}),
-        },
-      ];
-    });
-  }
-
-  private claimDependencyHandoffs(task: LocalTask, compact: boolean) {
-    if (!compact) return this.dependencyHandoffs(task);
-    return task.dependencies.flatMap((id) => {
-      const dep = this.tasks.get(id);
-      if (!dep?.handoff) return [];
-      const integrated =
-        dep.integrated_commit ??
-        (dep.handoff as { integrated_commit?: { branch: string; sha: string } }).integrated_commit;
-      return [
-        {
-          task_id: id,
-          title: dep.title,
-          compact_handoff: {
-            files_modified: dep.handoff.files_modified,
-            key_decisions: dep.handoff.key_decisions,
-            notes_for_next_agent: dep.handoff.notes_for_next_agent,
-          },
-          ...(integrated ? { integrated_commit: integrated } : {}),
-        },
-      ];
-    });
-  }
-
   private async context(
     input: Parsed<"get_project_context">,
   ): Promise<McpToolOutput<"get_project_context">> {
@@ -2272,9 +2014,10 @@ class LocalWorkflow {
             (task) => task.lease?.repo === this.repo && leaseMatches(task.lease.id, input.lease_id),
           );
     const epic = active && this.project.epics.find((item) => item.id === active.epicId);
-    const recent = new Map<string, ReturnType<LocalWorkflow["dependencyHandoffs"]>[number]>();
+    const recent = new Map<string, ReturnType<typeof dependencyHandoffs>[number]>();
     for (const task of active ? [active] : this.ready(input, 5)) {
-      for (const handoff of this.dependencyHandoffs(task)) recent.set(handoff.task_id, handoff);
+      for (const handoff of dependencyHandoffs(task, this.tasks))
+        recent.set(handoff.task_id, handoff);
     }
     const catalog = await discoverSkillCatalog(this.root, {
       platforms: this.config.platforms,
@@ -2305,7 +2048,10 @@ class LocalWorkflow {
     };
   }
 
-  private async claim(input: Parsed<"claim_task">): Promise<McpToolOutput<"claim_task">> {
+  claim(input: Parsed<"claim_task">): {
+    result: McpToolOutput<"claim_task">;
+    context?: ClaimContextSnapshot;
+  } {
     const task = this.task(input.task_id);
     const { worktree } = input;
     const run = this.taskRun(task);
@@ -2442,60 +2188,27 @@ class LocalWorkflow {
         ...(worktree ? { branch: worktree.branch, session: worktree.session_id } : {}),
       },
     });
-    let contextPack: ClaimContextPack | undefined;
-    if (input.include_context === true) {
-      const pack: ClaimContextPack = {};
-      const epic = this.project.epics.find((item) => item.id === task.epicId);
-      if (epic) {
-        pack.epic_summary = resolveEpicSummaryText(epic, this.project.tasks, 240);
-      }
-      const syncDoc = this.project.documents.find((d) => d.slug === "sync-board" && !d.archived_at);
-      if (syncDoc) {
-        const excerpt = extractSyncBoardExcerpt(syncDoc.content, task.id, task.persona);
-        if (excerpt) pack.sync_board_excerpt = excerpt;
-      }
-      const catalog = await discoverSkillCatalog(this.root, {
-        platforms: this.config.platforms,
-      });
-      if (catalog.entries.length > 0) {
-        const hint = prioritizeSkills(catalog.entries, task);
-        if (hint.length > 0) pack.skills_hint = hint;
-      }
-      if (task.scope_files?.length && getGraphCounts(this.db, this.config.project_id).files > 0) {
-        const files = queryClaimGraphSlice(
-          this.db,
-          this.config.project_id,
-          task.scope_files.slice(0, 5),
-          this.graphRootDirs(),
-        );
-        if (files.length > 0) pack.graph_slice = files;
-      }
-      if (Object.keys(pack).length > 0) {
-        contextPack = boundClaimContextPack(pack);
-      }
-    }
+    const context =
+      input.include_context === true
+        ? snapshotClaimContext({
+            project: this.project,
+            task,
+            db: this.db,
+            projectId: this.config.project_id,
+            graphRootDirs: () => this.graphRootDirs(),
+          })
+        : undefined;
     this.dirty();
-    return {
-      task: {
-        id: task.id,
-        title: task.title,
-        prompt_instruction: task.instruction,
-        status: "IN_PROGRESS",
-        revision_count: task.revision,
-        ...(task.role ? { role: task.role } : {}),
-        ...(task.target ? { target_repo: task.target } : {}),
-        ...(task.scope_files !== undefined ? { scope_files: task.scope_files } : {}),
-        ...(task.verify_command !== undefined ? { verify_command: task.verify_command } : {}),
-        ...(task.doc_refs !== undefined ? { doc_refs: task.doc_refs } : {}),
-      },
-      ...(persona ? { persona } : {}),
-      lease_id: leaseId,
-      lease_expires_at: expiry,
-      dependencies: this.claimDependencyHandoffs(task, Boolean(input.compact)),
-      ...(revision ? { revision } : {}),
-      warnings: [],
-      ...(contextPack ? { context_pack: contextPack } : {}),
-    };
+    const result = claimResponse({
+      task,
+      tasks: this.tasks,
+      persona,
+      leaseId,
+      expiry,
+      compact: Boolean(input.compact),
+      revision,
+    });
+    return { result, context };
   }
 
   /** Hanya holder dengan token lease yang cocok (hash di state) yang boleh memperbarui task. */
@@ -2615,43 +2328,6 @@ class LocalWorkflow {
     };
   }
 
-  private revise(task: LocalTask, feedback: string): string[] {
-    const wasDone = task.status === "DONE";
-    advance(task, "request_revision");
-    task.feedback = feedback;
-    task.revision += 1;
-    delete task.integrated_commit;
-    if (task.review) {
-      delete task.review.lease;
-      delete task.review.decision;
-      task.review.approvedLocally = false;
-      task.review.updatedAt = this.iso;
-    }
-    if (!wasDone) return [];
-    const downstream = new Map<string, LocalTask[]>();
-    for (const child of this.tasks.values()) {
-      for (const id of child.dependencies) {
-        const children = downstream.get(id);
-        if (children) children.push(child);
-        else downstream.set(id, [child]);
-      }
-    }
-    const queue = [task.id];
-    const seen = new Set(queue);
-    const updated: string[] = [];
-    for (const id of queue) {
-      for (const child of downstream.get(id) ?? []) {
-        if (seen.has(child.id)) continue;
-        seen.add(child.id);
-        queue.push(child.id);
-        if (child.status === "DRAFT" || child.status === "TODO") continue;
-        child.stale = true;
-        updated.push(child.id);
-      }
-    }
-    return updated;
-  }
-
   manageTask(input: Parsed<"manage_task">, snapshot?: string): McpToolOutput<"manage_task"> {
     const task = this.task(input.task_id);
     if (snapshot !== undefined) {
@@ -2691,9 +2367,11 @@ class LocalWorkflow {
     let unlocked: string[] | undefined;
     if (input.action === "assign" || input.action === "request_revision") {
       if (input.action === "request_revision")
-        stale = this.revise(
+        stale = reviseTask(
           task,
+          this.tasks.values(),
           input.feedback ?? fail("invalid_input", "Feedback revisi wajib."),
+          this.iso,
         );
       else if (task.status !== "DRAFT" && !claimable(task) && task.status !== "BLOCKED")
         fail(
@@ -2935,181 +2613,6 @@ class LocalWorkflow {
       hits,
       reranked: false,
       degraded,
-    };
-  }
-
-  private reviewEntry(
-    task: LocalTask,
-    review: LocalReview,
-    status: "NEEDS_REVIEW" | "REVISION_REQUESTED" | "DONE",
-  ) {
-    const stage: PullRequestState["stage"] = review.approvedLocally
-      ? "approved_locally"
-      : status === "REVISION_REQUESTED"
-        ? "changes_requested"
-        : review.decision?.value === "approve"
-          ? "awaiting_human_approval"
-          : review.lease
-            ? "in_review"
-            : "awaiting_review";
-    return {
-      task_id: task.id,
-      title: task.title,
-      status,
-      review: {
-        ...(review.ref.url ? { url: review.ref.url } : {}),
-        base_branch: review.ref.base_branch,
-        head_sha: review.ref.head_sha,
-        stage,
-        checked_at: review.updatedAt,
-        reviewer: review.lease?.reviewer ?? review.decision?.reviewer ?? null,
-        merge_sha: null,
-      },
-    };
-  }
-
-  private review(input: Parsed<"review_pull_request">["request"]): ReviewResult {
-    if (input.action === "list") {
-      return {
-        reviews: this.project.tasks
-          .flatMap((task) =>
-            task.status === "NEEDS_REVIEW" &&
-            task.review?.repo === this.repo &&
-            !task.review.lease &&
-            !task.review.decision
-              ? [this.reviewEntry(task, task.review, "NEEDS_REVIEW")]
-              : [],
-          )
-          .slice(0, input.limit),
-      };
-    }
-    const task = this.task(input.task_id);
-    const review = task.review;
-    if (!review || review.repo !== this.repo)
-      fail("not_found", "Review tidak ditemukan di repo ini.");
-    const status = task.status;
-    if (status !== "NEEDS_REVIEW" && status !== "DONE" && status !== "REVISION_REQUESTED")
-      fail("review_not_pending", "Tunggu handoff berikutnya.");
-    const entry = this.reviewEntry(task, review, status);
-    if (input.action === "refresh") {
-      if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
-        return {
-          ...entry,
-          stale_commit: true,
-          warning: `Review tidak cocok: head SHA handoff sudah berubah. ${offlineReview}`,
-        };
-      }
-      const contextPack =
-        input.include_context === true
-          ? buildReviewContextPack({
-              repoRoot: this.root,
-              project: this.project,
-              task,
-              review,
-              compact: Boolean(input.compact),
-            })
-          : undefined;
-      const refreshed = {
-        ...entry,
-        notice: offlineReview,
-        ...(contextPack ? { review_context_pack: contextPack } : {}),
-      };
-      return input.include_context === true || input.compact === true
-        ? withReviewResponseByteLength(refreshed)
-        : refreshed;
-    }
-    if (status !== "NEEDS_REVIEW")
-      return { ...entry, warning: `Review tidak menunggu keputusan. ${offlineReview}` };
-    if (input.action === "claim") {
-      if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
-        return {
-          ...entry,
-          stale_commit: true,
-          warning: `Review tidak diambil: head SHA handoff sudah berubah. ${offlineReview}`,
-        };
-      }
-      const alias =
-        input.agent_alias ??
-        (this.config.overrides?.default_role === "reviewer"
-          ? this.config.overrides.default_agent_alias
-          : undefined);
-      const persona = alias ? this.persona(alias) : undefined;
-      if (persona && (persona.role !== "reviewer" || !allowsRepo(persona, this.repo)))
-        fail("reviewer_required", "Gunakan persona reviewer yang memegang repo ini.");
-      if (alias && alias === review.author)
-        fail("self_review", "Persona implementer tidak dapat menjadi reviewer PR ini.");
-      if (review.lease || review.decision)
-        return { ...entry, warning: `Review sudah diambil atau diputuskan. ${offlineReview}` };
-      const leaseId = randomUUID();
-      review.lease = {
-        id: leaseKey(leaseId),
-        reviewer: persona?.alias ?? `reviewer@${this.repo}`,
-        expiresAt: leaseEnd(this.now),
-      };
-      review.updatedAt = this.iso;
-      this.dirty();
-      const contextPack =
-        input.include_context === true
-          ? buildReviewContextPack({
-              repoRoot: this.root,
-              project: this.project,
-              task,
-              review,
-              compact: Boolean(input.compact),
-            })
-          : undefined;
-      const rawNotes = task.handoff?.notes_for_next_agent;
-      const notes =
-        rawNotes !== undefined && input.compact === true ? briefText(rawNotes, 160) : rawNotes;
-      const claimed = {
-        ...this.reviewEntry(task, review, status),
-        lease_id: leaseId,
-        lease_expires_at: review.lease.expiresAt,
-        ...(notes !== undefined ? { notes_for_next_agent: notes } : {}),
-        notice: offlineReview,
-        ...(contextPack ? { review_context_pack: contextPack } : {}),
-      };
-      return input.include_context === true || input.compact === true
-        ? withReviewResponseByteLength(claimed)
-        : claimed;
-    }
-    const staleSubmit = isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha });
-    if (!review.lease || !leaseMatches(review.lease.id, input.lease_id) || staleSubmit) {
-      return {
-        ...entry,
-        ...(staleSubmit ? { stale_commit: true as const } : {}),
-        warning: `Review tidak disimpan: lease atau head SHA handoff tidak cocok. ${offlineReview}`,
-      };
-    }
-    const reviewer = review.lease.reviewer;
-    delete review.lease;
-    if (input.decision === "request_changes") {
-      const fromStatus = task.status;
-      this.revise(task, input.feedback);
-      this.recordEvent({
-        task_id: task.id,
-        event: "revision",
-        actor: reviewer,
-        note: input.feedback,
-        detail: {
-          from: fromStatus,
-          to: task.status,
-          revision_count: task.revision,
-          via: "review_pull_request",
-        },
-      });
-    }
-    // A reviewer recommendation is not an approval; only the human manage_task path can set DONE.
-    review.decision = { value: input.decision, reviewer, feedback: input.feedback };
-    review.updatedAt = this.iso;
-    this.dirty();
-    return {
-      ...this.reviewEntry(
-        task,
-        review,
-        input.decision === "approve" ? "NEEDS_REVIEW" : "REVISION_REQUESTED",
-      ),
-      notice: offlineReview,
     };
   }
 }

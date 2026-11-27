@@ -11,6 +11,7 @@ import {
   buildMcpToolCatalog,
   compactJsonSchema,
   ROLE_TOOLS,
+  TOOL_ANNOTATIONS,
   TOOL_DESCRIPTIONS,
   toolsForRole,
   zodToCompactJsonSchema,
@@ -69,9 +70,81 @@ describe("MCP tool catalog compaction & role filtering", () => {
     const rawJson = JSON.stringify(rawCatalog);
     const compactJson = JSON.stringify(compactCatalog);
     const workerJson = JSON.stringify(workerCatalog);
-    expect(compactJson.length).toBeLessThan(rawJson.length * 0.7);
-    expect(estimateTokens(compactJson)).toBeLessThan(estimateTokens(rawJson) * 0.7);
+    // Compact catalog includes standard MCP annotations on every tool, so allow up to 75% of raw.
+    expect(compactJson.length).toBeLessThan(rawJson.length * 0.75);
+    expect(estimateTokens(compactJson)).toBeLessThan(estimateTokens(rawJson) * 0.75);
     expect(workerJson.length).toBeLessThan(rawJson.length * 0.45);
+  });
+
+  it("exposes standard MCP tool annotations on every tool in the catalog", () => {
+    const fullCatalog = buildMcpToolCatalog(undefined, true);
+    expect(fullCatalog).toHaveLength(MCP_TOOL_NAMES.length);
+
+    for (const name of MCP_TOOL_NAMES) {
+      const ann = TOOL_ANNOTATIONS[name];
+      expect(ann, `missing annotations for ${name}`).toBeDefined();
+      expect(typeof ann.readOnlyHint).toBe("boolean");
+      expect(typeof ann.destructiveHint).toBe("boolean");
+      expect(typeof ann.idempotentHint).toBe("boolean");
+      expect(typeof ann.openWorldHint).toBe("boolean");
+      expect(ann.openWorldHint).toBe(false);
+
+      const entry = fullCatalog.find((t) => t.name === name);
+      expect(entry?.annotations).toEqual(ann);
+    }
+
+    const readOnlyTools = [
+      "get_project_board",
+      "search_context",
+      "get_document",
+      "get_project_context",
+      "get_ready_tasks",
+      "list_epics",
+      "list_personas",
+      "load_skill",
+      "interview_setup",
+      "session_brief",
+      "graph_neighbors",
+      "symbol_search",
+      "graph_summary",
+      "graph_impact",
+    ] as const;
+    for (const name of readOnlyTools) {
+      expect(TOOL_ANNOTATIONS[name]).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      });
+    }
+
+    const destructiveTools = [
+      "cancel_task",
+      "remove_persona",
+      "archive_document",
+      "manage_roots",
+    ] as const;
+    for (const name of destructiveTools) {
+      expect(TOOL_ANNOTATIONS[name].readOnlyHint).toBe(false);
+      expect(TOOL_ANNOTATIONS[name].destructiveHint).toBe(true);
+    }
+  });
+
+  it("hides human approve actions from manage_task MCP tools/list schema", () => {
+    const tool = buildMcpToolCatalog("orchestrator").find((t) => t.name === "manage_task");
+    expect(tool).toBeDefined();
+    const schemaJson = JSON.stringify(tool?.inputSchema);
+    expect(schemaJson).not.toContain("approve_plan");
+    expect(schemaJson).not.toMatch(/"approve"/);
+    expect(schemaJson).toContain("request_revision");
+    expect(schemaJson).toContain("assign");
+    // Runtime schema still accepts human approve for CLI callers.
+    expect(
+      MCP_TOOLS.manage_task.input.safeParse({
+        action: "approve",
+        task_id: "11111111-1111-4111-8111-111111111111",
+      }).success,
+    ).toBe(true);
   });
 
   it("filters tool lists by role and preserves full default tool set", () => {
@@ -100,5 +173,13 @@ describe("MCP tool catalog compaction & role filtering", () => {
     expect(toolsForRole(undefined, true)).toEqual([...MCP_TOOL_NAMES]);
     expect(toolsForRole("orchestrator", true)).toEqual([...orch, ...MCP_CRUD_TOOLS]);
     expect(toolsForRole("worker", true)).toEqual(worker);
+  });
+
+  it("attaches compact object outputSchema to every tool in the catalog", () => {
+    const fullCatalog = buildMcpToolCatalog(undefined, true);
+    expect(fullCatalog).toHaveLength(MCP_TOOL_NAMES.length);
+    for (const tool of fullCatalog) {
+      expect(tool.outputSchema).toEqual({ type: "object" });
+    }
   });
 });

@@ -1,98 +1,49 @@
-import { MCP_TOOLS, type McpToolName } from "@catenext/shared";
-import type { z } from "zod";
-import { requireHumanApproval } from "../approval-policy.js";
-import { findProjectRoot, readConfig } from "../config.js";
-import type { LocalService } from "../local-service.js";
-import { describeRedactions, SCRUB_TOOL_FIELDS, scrubDeep } from "../scrubber.js";
-import { loadCatalogSkill } from "../skill-catalog.js";
-import { saveSkill } from "../skills.js";
-import { buildMcpToolCatalog, type McpRole, toolsForRole } from "./catalog.js";
+import { buildMcpToolCatalog, toolsForRole } from "./catalog.js";
+import { getPrompt, listPrompts } from "./handlers/prompts.js";
 import {
-  JSONRPC_VERSION,
-  type JsonRpcErrorResponse,
-  type JsonRpcId,
-  type JsonRpcMessage,
-  type JsonRpcSuccessResponse,
-  type McpTransport,
-} from "./stdio.js";
+  createJsonRpcResponder,
+  isPlainObject,
+  isRequestId,
+  JSONRPC_INTERNAL_ERROR,
+  JSONRPC_INVALID_REQUEST,
+  JSONRPC_METHOD_NOT_FOUND,
+  JSONRPC_PARSE_ERROR,
+  negotiateProtocolVersion,
+} from "./handlers/protocol.js";
+import { listResources, listResourceTemplates, readResource } from "./handlers/resources.js";
+import { createToolInvoker, handleToolsCall } from "./handlers/tools.js";
+import type { HandlerResult, ServerOptions } from "./handlers/types.js";
+import { JSONRPC_VERSION, type JsonRpcId, type McpTransport } from "./stdio.js";
+
+export type {
+  CallToolResult,
+  GetPromptResult,
+  McpPrompt,
+  McpPromptArgument,
+  McpPromptMessage,
+  McpResource,
+  McpResourceTemplate,
+  ResourceLinkContent,
+  ServerContext,
+  ServerOptions,
+  ToolResultContent,
+} from "./handlers/types.js";
 
 export const LOCAL_TOOLS = toolsForRole();
-
-const LATEST_PROTOCOL_VERSION = "2025-11-25";
-const SUPPORTED_PROTOCOL_VERSIONS = new Set([
-  LATEST_PROTOCOL_VERSION,
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05",
-  "2024-10-07",
-]);
-
-const JSONRPC_PARSE_ERROR = -32700;
-const JSONRPC_INVALID_REQUEST = -32600;
-const JSONRPC_METHOD_NOT_FOUND = -32601;
-const JSONRPC_INVALID_PARAMS = -32602;
-const JSONRPC_INTERNAL_ERROR = -32603;
 
 export const SERVER_INSTRUCTIONS = [
   "Catenext stores local orchestration state in SQLite (.catenext/catenext.sqlite).",
   "Orchestrator: ask the user first in their language; agent stubs stay English; prefer session_brief and interview_setup (compact JSON, no essays).",
   "Delegate only — do not implement persona tasks. Use get_project_board when needed; keep payloads short.",
-  "Workers: get_ready_tasks then claim_task (worktree required for monorepo). complete_handoff → NEEDS_REVIEW.",
-  "Approvals: ask first about one exact task and action. Only after its direct explicit human reply, use the conditional CLI with the snapshot shown before asking, then verify the board. MCP cannot approve or attest chat authorship. Ask separately for merge, tag, or publish. Revisions reuse the same task.",
+  "Workers: get_ready_tasks then claim_task (worktree required for monorepo; prefer compact:true). complete_handoff → NEEDS_REVIEW. Prefer MCP --role worker for worker sessions.",
+  "Approvals: ask first about one exact task and action. Only after its direct explicit human reply, use the conditional CLI with the snapshot shown before asking, then verify the board. MCP cannot approve or attest chat authorship. review_pull_request submit approve is a recommendation only; human uses catenext review approve. Ask separately for merge, tag, or publish. Revisions reuse the same task.",
   "External folders: manage_roots. Code graph: catenext index then graph_neighbors / symbol_search.",
   "Never publish credentials or critical secrets (handoffs/docs/git — paths only). No code dumps. Do not hand-edit .catenext/config.yaml or IDE MCP configs.",
 ].join(" ");
 
-export type ServerContext =
-  | { ok: true; service: Pick<LocalService, "callTool">; root: string }
-  | { ok: false; error: string };
-
-type ReadyContext = Extract<ServerContext, { ok: true }>;
-
-export interface ServerOptions {
-  version: string;
-  /** Muat konteks saat tool pertama dipanggil, agar server bisa memberi pesan bila belum init. */
-  context: () => Promise<ServerContext>;
-  log?: (message: string) => void;
-  /** Filter tool MCP berdasarkan peran: orchestrator atau worker (default: semua tool). */
-  role?: McpRole;
-  /** Trusted local launch flag; never accepted as a tool argument. */
-  allowCrud?: boolean;
-}
-
-export interface CallToolResult {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-}
-
 export interface CatenextMcpServer {
   connect(transport: McpTransport): Promise<void>;
   close(): Promise<void>;
-}
-
-const text = (body: string): CallToolResult => ({
-  content: [{ type: "text", text: body }],
-  isError: true,
-});
-
-/** Compact JSON (no pretty-print) to save tokens. */
-const json = (data: unknown, notes: string[] = []): CallToolResult => ({
-  content: [
-    { type: "text", text: JSON.stringify(data) },
-    ...notes.map((n) => ({ type: "text" as const, text: n })),
-  ],
-});
-
-function zodIssues(error: z.ZodError): string {
-  return error.issues.map((i) => `- ${i.path.join(".") || "(root)"}: ${i.message}`).join("\n");
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isRequestId(value: unknown): value is JsonRpcId {
-  return typeof value === "string" || (typeof value === "number" && Number.isInteger(value));
 }
 
 export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer {
@@ -100,108 +51,34 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
   const tools = buildMcpToolCatalog(opts.role, opts.allowCrud);
   const allowedTools = new Set<string>(tools.map((tool) => tool.name));
   let activeTransport: McpTransport | undefined;
+  let supportsResourceLinks = false;
+  let supportsStructuredContent = false;
 
-  const runTool = async (
-    { service, root }: ReadyContext,
-    name: McpToolName,
-    parsed: unknown,
-  ): Promise<unknown> => {
-    if (name === "load_skill") {
-      const { name: skillName, revision, source_id } = MCP_TOOLS.load_skill.input.parse(parsed);
-      const primaryRoot = (await findProjectRoot(root, { managedWorktree: true })) ?? root;
-      const config = await readConfig(primaryRoot).catch(() => null);
-      const skill = await loadCatalogSkill(root, skillName, {
-        platforms: config?.platforms,
-        sourceId: source_id,
-        revision,
-      });
-      return {
-        name: skill.name,
-        when_to_use: skill.when_to_use,
-        content: skill.content,
-        source_id: skill.source_id,
-        source_kind: skill.source_kind,
-        source_path: skill.source_path,
-        ...(skill.collision ? { collision: true } : {}),
-        ...(revision ? { revision } : {}),
-      };
-    }
-    if (name === "save_repo_skill") {
-      const saved = await saveSkill(root, MCP_TOOLS.save_repo_skill.input.parse(parsed));
-      return { path: saved.path, created: saved.created };
-    }
-    return service.callTool(name, parsed);
-  };
+  const { sendResult, sendError } = createJsonRpcResponder({
+    isActive: (transport) => activeTransport === transport,
+    log,
+  });
 
-  const invokeTool = async (name: McpToolName, rawArgs: unknown): Promise<CallToolResult> => {
-    try {
-      const schema = MCP_TOOLS[name].input;
-      const initial = schema.safeParse(rawArgs ?? {});
-      if (!initial.success) return text(`Input ditolak:\n${zodIssues(initial.error)}`);
-      if (name === "manage_task") {
-        requireHumanApproval("agent", MCP_TOOLS.manage_task.input.parse(initial.data));
-      }
+  const invokeTool = createToolInvoker({
+    context: opts.context,
+    log,
+    supportsResourceLinks: () => supportsResourceLinks,
+    supportsStructuredContent: () => supportsStructuredContent,
+  });
 
-      const ctx = await opts.context();
-      if (!ctx.ok) return text(`Catenext belum siap: ${ctx.error}`);
-
-      const keep = SCRUB_TOOL_FIELDS[name];
-      let payload: unknown = initial.data;
-      const notes: string[] = [];
-
-      if (keep) {
-        const scrubbed = scrubDeep(initial.data, new Set(keep));
-        // Sensor dapat mengubah ukuran payload; validasi ulang sebelum disimpan.
-        const reparsed = schema.safeParse(scrubbed.value);
-        if (!reparsed.success) return text(`Input ditolak:\n${zodIssues(reparsed.error)}`);
-        payload = reparsed.data;
-        if (scrubbed.total > 0) {
-          const note = describeRedactions(scrubbed);
-          log(note);
-          notes.push(note);
-        }
-      }
-
-      const result = await runTool(ctx, name, payload);
-      return json(result, notes);
-    } catch (err) {
-      return text(`Catenext: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  };
-
-  const safeSend = async (transport: McpTransport, msg: JsonRpcMessage) => {
-    if (activeTransport !== transport) return;
-    try {
-      await transport.send(msg);
-    } catch (err) {
-      log(`Transport send failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  };
-
-  const sendResult = async (transport: McpTransport, id: JsonRpcId, result: unknown) => {
-    const msg: JsonRpcSuccessResponse = {
-      jsonrpc: JSONRPC_VERSION,
-      id,
-      result: result as JsonRpcSuccessResponse["result"],
-    };
-    await safeSend(transport, msg);
-  };
-
-  const sendError = async (
+  const sendHandlerResult = async <T>(
     transport: McpTransport,
-    id: JsonRpcId | null,
-    code: number,
-    message: string,
-  ) => {
-    const msg: JsonRpcErrorResponse = {
-      jsonrpc: JSONRPC_VERSION,
-      id,
-      error: { code, message },
-    };
-    await safeSend(transport, msg);
+    id: JsonRpcId,
+    outcome: HandlerResult<T>,
+  ): Promise<void> => {
+    if (outcome.ok) {
+      await sendResult(transport, id, outcome.result);
+    } else {
+      await sendError(transport, id, outcome.code, outcome.message);
+    }
   };
 
-  const handleMessage = async (transport: McpTransport, raw: unknown) => {
+  const handleMessage = async (transport: McpTransport, raw: unknown): Promise<void> => {
     const envelope = isPlainObject(raw) ? raw : undefined;
     const hasId = envelope !== undefined && Object.hasOwn(envelope, "id");
     const rawId = hasId ? envelope.id : undefined;
@@ -224,55 +101,56 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
     // Only a valid envelope without an ID is a notification. Never reply to it.
     if (id === null) return;
     try {
-      if (method === "initialize") {
-        const requested = isPlainObject(params) ? params.protocolVersion : undefined;
-        const protocolVersion =
-          typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.has(requested)
-            ? requested
-            : LATEST_PROTOCOL_VERSION;
-        await sendResult(transport, id, {
-          protocolVersion,
-          capabilities: { tools: {} },
-          serverInfo: { name: "catenext", version: opts.version },
-          instructions: SERVER_INSTRUCTIONS,
-        });
-        return;
-      }
-
-      if (method === "ping") {
-        await sendResult(transport, id, {});
-        return;
-      }
-
-      if (method === "tools/list") {
-        await sendResult(transport, id, { tools });
-        return;
-      }
-
-      if (method === "tools/call") {
-        if (!isPlainObject(params) || typeof params.name !== "string") {
-          await sendError(transport, id, JSONRPC_INVALID_PARAMS, "Invalid tools/call params.");
+      switch (method) {
+        case "initialize": {
+          const negotiated = negotiateProtocolVersion(
+            isPlainObject(params) ? params.protocolVersion : undefined,
+          );
+          supportsResourceLinks = negotiated.supportsResourceLinks;
+          supportsStructuredContent = negotiated.supportsStructuredContent;
+          await sendResult(transport, id, {
+            protocolVersion: negotiated.protocolVersion,
+            capabilities: { tools: {}, resources: {}, prompts: {} },
+            serverInfo: { name: "catenext", version: opts.version },
+            instructions: SERVER_INSTRUCTIONS,
+          });
           return;
         }
-        if (params.arguments !== undefined && !isPlainObject(params.arguments)) {
-          await sendError(
+        case "ping":
+          await sendResult(transport, id, {});
+          return;
+        case "tools/list":
+          await sendResult(transport, id, {
+            tools: supportsStructuredContent
+              ? tools
+              : tools.map(({ outputSchema: _outputSchema, ...rest }) => rest),
+          });
+          return;
+        case "resources/list":
+          await sendHandlerResult(transport, id, await listResources(opts.context));
+          return;
+        case "resources/templates/list":
+          await sendHandlerResult(transport, id, listResourceTemplates());
+          return;
+        case "resources/read":
+          await sendHandlerResult(transport, id, await readResource(opts.context, params));
+          return;
+        case "prompts/list":
+          await sendHandlerResult(transport, id, listPrompts());
+          return;
+        case "prompts/get":
+          await sendHandlerResult(transport, id, getPrompt(params));
+          return;
+        case "tools/call":
+          await sendHandlerResult(
             transport,
             id,
-            JSONRPC_INVALID_PARAMS,
-            "Tool arguments must be an object.",
+            await handleToolsCall({ allowedTools, invokeTool, params }),
           );
           return;
-        }
-        if (!allowedTools.has(params.name)) {
-          await sendError(transport, id, JSONRPC_INVALID_PARAMS, `Tool ${params.name} not found`);
-          return;
-        }
-        const result = await invokeTool(params.name as McpToolName, params.arguments);
-        await sendResult(transport, id, result);
-        return;
+        default:
+          await sendError(transport, id, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
       }
-
-      await sendError(transport, id, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
     } catch (err) {
       await sendError(
         transport,
@@ -289,6 +167,8 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
         await activeTransport.close();
       }
       activeTransport = transport;
+      supportsResourceLinks = false;
+      supportsStructuredContent = false;
       transport.onparseerror = () => {
         void sendError(transport, null, JSONRPC_PARSE_ERROR, "Parse error.");
       };

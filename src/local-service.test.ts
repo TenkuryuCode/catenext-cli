@@ -16,6 +16,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as graphIndex from "./db/graph-index.js";
 import { LocalService } from "./local-service.js";
+import * as skillCatalog from "./skill-catalog.js";
 import * as worktreeStatus from "./worktree-status.js";
 
 function readTaskJsonField(
@@ -108,6 +109,95 @@ async function repo(name: string, projectId = config.project_id) {
 }
 
 describe("LocalService task workflows", () => {
+  it("commits the lease and permits independent claims while optional skill discovery waits", async () => {
+    const monoConfig = { ...config, layout: "monorepo" } as const;
+    const mono = new LocalService(root, monoConfig);
+    const { id } = await draft([plan("first"), plan("parallel")], mono);
+    for (const ref of ["first", "parallel"]) {
+      await manage("approve_plan", id(ref), {}, mono);
+    }
+
+    let markScanStarted!: () => void;
+    const scanStarted = new Promise<void>((resolve) => {
+      markScanStarted = resolve;
+    });
+    let failScan!: (error: Error) => void;
+    const catalog = new Promise<skillCatalog.SkillCatalogResult>((_resolve, reject) => {
+      failScan = reject;
+    });
+    const discover = vi.spyOn(skillCatalog, "discoverSkillCatalog").mockImplementation(() => {
+      markScanStarted();
+      return catalog;
+    });
+    const claim = (client: LocalService, ref: string, include_context = false) =>
+      client.callTool("claim_task", {
+        task_id: id(ref),
+        include_context,
+        worktree: { session_id: randomUUID(), branch: `feat/${ref}` },
+      });
+    const first = claim(mono, "first", true);
+    try {
+      await Promise.race([
+        scanStarted,
+        first.then(() => {
+          throw new Error("Claim returned before skill discovery started");
+        }),
+      ]);
+
+      await expect(access(`${mono.stateFile}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+      const other = new LocalService(root, monoConfig);
+      expect(await other.readTaskEvents({ taskId: id("first"), event: "claim" })).toHaveLength(1);
+      await expect(claim(other, "first", true)).rejects.toMatchObject({ code: "already_claimed" });
+      await expect(claim(other, "parallel")).resolves.toMatchObject({
+        task: { id: id("parallel"), status: "IN_PROGRESS" },
+      });
+      expect(discover).toHaveBeenCalledTimes(1);
+    } finally {
+      failScan(new Error("Skill discovery failed"));
+      await first.catch(() => {});
+    }
+    const claimed = await first;
+    expect(claimed.task).toMatchObject({ id: id("first"), status: "IN_PROGRESS" });
+    expect(claimed.context_pack).toEqual({ epic_summary: "Delivery" });
+    await expect(
+      mono.callTool("release_task", { task_id: id("first"), lease_id: claimed.lease_id }),
+    ).resolves.toMatchObject({ status: "TODO" });
+  });
+
+  it("preserves spaces in file paths submitted through complete_handoff", async () => {
+    const { id } = await draft([
+      plan("release-notes"),
+      plan("follow-up", { depends_on: ["release-notes"] }),
+    ]);
+    const task_id = id("release-notes");
+    await manage("approve_plan", task_id);
+    const { lease_id } = await service.callTool("claim_task", { task_id });
+    const complete = (file: string) =>
+      service.callTool("complete_handoff", {
+        lease_id,
+        task_id,
+        handoff_summary: handoff({ files_modified: [file] }),
+      });
+
+    await expect(complete("docs/Release\nNotes.md")).rejects.toMatchObject({
+      code: "invalid_input",
+    });
+    await expect(complete("const x = 1")).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(complete("docs/Release Notes.md")).resolves.toMatchObject({
+      status: "NEEDS_REVIEW",
+    });
+
+    await manage("approve", task_id);
+    await manage("approve_plan", id("follow-up"));
+    const followUp = await service.callTool("claim_task", { task_id: id("follow-up") });
+    expect(followUp.dependencies).toMatchObject([
+      {
+        task_id,
+        handoff_summary: { files_modified: ["docs/Release Notes.md"] },
+      },
+    ]);
+  });
+
   it("keeps drafts out of ready tasks and unlocks cross-repo dependencies only after local approval", async () => {
     const fe = await repo("fe");
     await service.callTool("upsert_persona", {
@@ -2174,6 +2264,43 @@ describe("LocalService code graph tools", () => {
     } finally {
       await rm(extRoot, { recursive: true, force: true });
     }
+  });
+
+  it("keeps the task's sync-board decision ahead of unrelated matches within the context budget", async () => {
+    await service.callTool("upsert_persona", { alias: "be", role: "backend" });
+    const { id } = await draft([plan("excerpt", { persona: "be" })]);
+    const taskId = id("excerpt");
+    const decision = `- ${taskId.toUpperCase()} · Keep the claim context compact.`;
+    const archiveLine = "- Historical work before the context pack was added.";
+    const personaAsk = "- ASK: BE · NEED: confirm the verification command.";
+    await service.callTool("save_document", {
+      slug: "sync-board",
+      title: "Sync Board",
+      kind: "other",
+      content: [
+        "## Archive",
+        ...Array<string>(25).fill(archiveLine),
+        "## Current work",
+        personaAsk,
+        "## Decisions",
+        ...Array<string>(25).fill("- A general project decision without a task reference."),
+        decision,
+      ].join("\n"),
+    });
+    await manage("approve_plan", taskId);
+
+    const { context_pack: pack } = await service.callTool("claim_task", {
+      task_id: taskId,
+      agent_alias: "be",
+      include_context: true,
+    });
+    const excerpt = pack?.sync_board_excerpt;
+    if (!excerpt) throw new Error("Missing excerpt preview");
+    expect(excerpt).toContain(decision);
+    expect(excerpt).toContain(personaAsk);
+    expect(excerpt).not.toContain(archiveLine);
+    expect(excerpt.length).toBeLessThanOrEqual(800);
+    expect(Buffer.byteLength(JSON.stringify(pack), "utf8")).toBeLessThanOrEqual(4096);
   });
 
   it.each([

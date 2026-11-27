@@ -14,12 +14,21 @@ export const HANDOFF_LIMITS = {
 } as const;
 
 const CODE_FENCE = /```/;
+const CODE_DECLARATION = /^(?:const|let|var)\s+[$\p{ID_Start}][$\p{ID_Continue}]*\s*=/u;
+const PATH_CONTROL_OR_LINE_BREAK = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 
 const FilePathSchema = z
   .string()
   .min(1)
   .max(HANDOFF_LIMITS.maxPathLength)
-  .regex(/^[^\s]+$/, "Path file tidak boleh berisi spasi atau baris baru (tanpa potongan kode)");
+  .refine(
+    (path) =>
+      path.trim().length > 0 &&
+      !PATH_CONTROL_OR_LINE_BREAK.test(path) &&
+      !CODE_FENCE.test(path) &&
+      !CODE_DECLARATION.test(path.trimStart()),
+    "Isi path file tanpa karakter kontrol, baris baru, atau potongan kode",
+  );
 
 const NoCodeText = (max: number) =>
   z

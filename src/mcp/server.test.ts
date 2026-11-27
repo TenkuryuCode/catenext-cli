@@ -428,6 +428,39 @@ describe("server MCP catenext", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("tools/list menyertakan MCP annotations pada setiap tool", async () => {
+    const { client } = await setup();
+    const { tools } = await client.listTools();
+    expect(tools).toHaveLength(29);
+    for (const t of tools) {
+      expect(t.annotations).toBeDefined();
+      expect(typeof t.annotations?.readOnlyHint).toBe("boolean");
+      expect(typeof t.annotations?.destructiveHint).toBe("boolean");
+      expect(typeof t.annotations?.idempotentHint).toBe("boolean");
+      expect(typeof t.annotations?.openWorldHint).toBe("boolean");
+    }
+
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    expect(byName.get("get_ready_tasks")?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(byName.get("claim_task")?.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+    expect(byName.get("archive_document")?.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+  });
+
   it("memfilter tool tools/list saat role orchestrator atau worker diset", async () => {
     const orch = await setup(undefined, undefined, "orchestrator");
     const orchList = await orch.client.listTools();
@@ -668,6 +701,399 @@ describe("server MCP catenext", () => {
     expect(briefStale.isError).toBeFalsy();
     expect(JSON.parse(textOf(briefStale)).hints).toEqual([
       expect.stringContaining("Code graph index is stale (modified_files)"),
+    ]);
+  });
+
+  it("exposes resources/list and resources/read for project documents and handoffs", async () => {
+    const handoffPayload = {
+      task_id: TASK,
+      title: "Implement auth",
+      handoff_summary: HANDOFF,
+    };
+    const { client } = await setup((call) => {
+      if (call.name === "get_project_context") {
+        return {
+          documents: [{ slug: "sync-board", title: "Sync Board", kind: "decision", version: 3 }],
+          recent_handoffs: [handoffPayload],
+        };
+      }
+      if (call.name === "get_document") {
+        const { slug } = call.body as { slug: string };
+        if (slug === "sync-board") {
+          return {
+            slug: "sync-board",
+            title: "Sync Board",
+            kind: "decision",
+            version: 3,
+            content: "# Sync Board\n\n- Use resource_link",
+          };
+        }
+        throw new Error(`Dokumen "${slug}" tidak ditemukan`);
+      }
+      return { ok: 1 };
+    });
+
+    expect(client.getServerCapabilities()).toMatchObject({
+      tools: {},
+      resources: {},
+      prompts: {},
+    });
+
+    const listed = await client.listResources();
+    expect(listed.resources).toEqual([
+      {
+        uri: "catenext://documents/sync-board",
+        name: "sync-board",
+        title: "Sync Board",
+        description: "decision document (v3)",
+        mimeType: "text/markdown",
+      },
+      {
+        uri: `catenext://handoffs/${TASK}`,
+        name: `handoff-${TASK}`,
+        title: "Handoff: Implement auth",
+        description: "Task handoff for Implement auth",
+        mimeType: "application/json",
+      },
+    ]);
+
+    const readDoc = await client.readResource({ uri: "catenext://documents/sync-board" });
+    expect(readDoc.contents).toEqual([
+      {
+        uri: "catenext://documents/sync-board",
+        mimeType: "text/markdown",
+        text: "# Sync Board\n\n- Use resource_link",
+      },
+    ]);
+
+    const readHandoff = await client.readResource({ uri: `catenext://handoffs/${TASK}` });
+    expect(readHandoff.contents).toEqual([
+      {
+        uri: `catenext://handoffs/${TASK}`,
+        mimeType: "application/json",
+        text: JSON.stringify(handoffPayload),
+      },
+    ]);
+
+    await expect(
+      client.readResource({ uri: "catenext://documents/missing" }),
+    ).rejects.toMatchObject({
+      code: -32002,
+    });
+    await expect(client.readResource({ uri: "catenext://unknown/foo" })).rejects.toMatchObject({
+      code: -32002,
+    });
+  });
+
+  it("emits resource_link items and compacts large handoffs when client supports >= 2025-06-18", async () => {
+    const largeNotes = "x".repeat(4500);
+    const largeHandoff = {
+      task_id: TASK,
+      title: "Large handoff",
+      handoff_summary: { ...HANDOFF, notes_for_next_agent: largeNotes },
+    };
+    const { client } = await setup((call) => {
+      if (call.name === "get_project_context") {
+        return {
+          documents: [{ slug: "blueprint", title: "Blueprint", kind: "architecture", version: 1 }],
+          recent_handoffs: [largeHandoff],
+        };
+      }
+      if (call.name === "claim_task") {
+        return {
+          task: { id: TASK },
+          dependency_handoffs: [largeHandoff],
+        };
+      }
+      if (call.name === "get_document") {
+        return {
+          slug: "blueprint",
+          title: "Blueprint",
+          kind: "architecture",
+          version: 1,
+          content: "",
+          truncated: true,
+        };
+      }
+      return { ok: 1 };
+    });
+
+    const ctxRes = await client.callTool({ name: "get_project_context", arguments: {} });
+    const ctxContent = ctxRes.content as Array<{ type: string; text?: string; uri?: string }>;
+    expect(JSON.parse(ctxContent[0]?.text ?? "{}").recent_handoffs).toEqual([
+      {
+        task_id: TASK,
+        title: "Large handoff",
+        resource_uri: `catenext://handoffs/${TASK}`,
+      },
+    ]);
+    expect(ctxContent.slice(1)).toEqual([
+      expect.objectContaining({ type: "resource_link", uri: "catenext://documents/blueprint" }),
+      expect.objectContaining({ type: "resource_link", uri: `catenext://handoffs/${TASK}` }),
+    ]);
+
+    const claimRes = await client.callTool({
+      name: "claim_task",
+      arguments: { task_id: TASK, agent_alias: "be" },
+    });
+    const claimContent = claimRes.content as Array<{ type: string; text?: string; uri?: string }>;
+    expect(JSON.parse(claimContent[0]?.text ?? "{}").dependency_handoffs).toEqual([
+      {
+        task_id: TASK,
+        title: "Large handoff",
+        resource_uri: `catenext://handoffs/${TASK}`,
+      },
+    ]);
+    expect(claimContent.slice(1)).toEqual([
+      expect.objectContaining({ type: "resource_link", uri: `catenext://handoffs/${TASK}` }),
+    ]);
+
+    const docRes = await client.callTool({
+      name: "get_document",
+      arguments: { slug: "blueprint", outline_only: true },
+    });
+    const docContent = docRes.content as Array<{ type: string; uri?: string }>;
+    expect(docContent[1]).toMatchObject({
+      type: "resource_link",
+      uri: "catenext://documents/blueprint",
+    });
+  });
+
+  it("omits resource_link items for older protocol clients (< 2025-06-18)", async () => {
+    const sent: unknown[] = [];
+    const server = createCatenextMcpServer({
+      version: "test",
+      context: async () => ({
+        ok: true,
+        root: "/tmp",
+        service: {
+          async callTool() {
+            return {
+              documents: [
+                { slug: "blueprint", title: "Blueprint", kind: "architecture", version: 1 },
+              ],
+              recent_handoffs: [
+                {
+                  task_id: TASK,
+                  title: "Large handoff",
+                  handoff_summary: { ...HANDOFF, notes_for_next_agent: "y".repeat(4500) },
+                },
+              ],
+            };
+          },
+        } as Extract<ServerContext, { ok: true }>["service"],
+      }),
+    });
+    const transport: McpTransport = {
+      async start() {},
+      async close() {},
+      async send(msg) {
+        sent.push(msg);
+      },
+    };
+    await server.connect(transport);
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "get_project_context", arguments: {} },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    await server.close();
+
+    const callReply = sent[1] as {
+      result: { content: Array<{ type: string; text?: string }> };
+    };
+    expect(callReply.result.content).toHaveLength(1);
+    expect(callReply.result.content[0]?.type).toBe("text");
+    expect(
+      JSON.parse(callReply.result.content[0]?.text ?? "{}").recent_handoffs[0].handoff_summary,
+    ).toBeDefined();
+  });
+
+  it("lists resource templates for documents and handoffs", async () => {
+    const { client } = await setup(() => ({ ok: 1 }));
+    const result = await client.listResourceTemplates();
+    expect(result.resourceTemplates).toEqual([
+      {
+        uriTemplate: "catenext://documents/{slug}",
+        name: "project-document",
+        title: "Project Document",
+        description: "Read a Catenext project document by slug (e.g. blueprint, sync-board).",
+        mimeType: "text/markdown",
+      },
+      {
+        uriTemplate: "catenext://handoffs/{task_id}",
+        name: "task-handoff",
+        title: "Task Handoff",
+        description: "Read a Catenext task handoff summary by task UUID.",
+        mimeType: "application/json",
+      },
+    ]);
+  });
+
+  it("lists and renders parameterized workflow prompts and rejects invalid requests", async () => {
+    const { client } = await setup(() => ({ ok: 1 }));
+    const listed = await client.listPrompts();
+    expect(listed.prompts.map((p) => p.name)).toEqual([
+      "kickoff-brainstorm",
+      "rc-review",
+      "docs-hygiene",
+    ]);
+
+    const epicId = "11111111-1111-4111-8111-111111111111";
+    const kickoff = await client.getPrompt({
+      name: "kickoff-brainstorm",
+      arguments: { goal: "Ship MCP v2", personas: "be,reviewer", epic_id: epicId },
+    });
+    expect(kickoff.messages).toHaveLength(1);
+    expect(kickoff.messages[0]?.role).toBe("user");
+    expect(kickoff.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Ship MCP v2"),
+    });
+    expect(kickoff.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining("be,reviewer"),
+    });
+    expect(kickoff.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining(epicId),
+    });
+
+    const review = await client.getPrompt({
+      name: "rc-review",
+      arguments: { task_id: TASK, focus: "security" },
+    });
+    expect(review.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining(`catenext://handoffs/${TASK}`),
+    });
+    expect(review.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining("Focus: security"),
+    });
+
+    const hygiene = await client.getPrompt({ name: "docs-hygiene" });
+    expect(hygiene.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("blueprint, orchestrator, permissions, sync-board"),
+    });
+
+    await expect(client.getPrompt({ name: "unknown-prompt" })).rejects.toMatchObject({
+      code: -32602,
+    });
+    await expect(
+      client.getPrompt({ name: "kickoff-brainstorm", arguments: {} }),
+    ).rejects.toMatchObject({
+      code: -32602,
+    });
+    await expect(
+      client.getPrompt({ name: "rc-review", arguments: { task_id: "   " } }),
+    ).rejects.toMatchObject({
+      code: -32602,
+    });
+  });
+
+  it("returns structuredContent and outputSchema for MCP >= 2025-06-18 clients", async () => {
+    const { client } = await setup((call) => {
+      if (call.name === "session_brief") {
+        return { ready: 2, blocked: 0, draft: 1, next: ["claim_task"] };
+      }
+      return { ok: 1 };
+    });
+
+    const { tools } = await client.listTools();
+    const briefTool = tools.find((t) => t.name === "session_brief");
+    expect(briefTool?.outputSchema).toEqual({ type: "object" });
+
+    const okRes = await client.callTool({ name: "session_brief", arguments: {} });
+    expect(okRes.structuredContent).toEqual({
+      ready: 2,
+      blocked: 0,
+      draft: 1,
+      next: ["claim_task"],
+    });
+    expect(okRes.content).toEqual([
+      {
+        type: "text",
+        text: JSON.stringify({ ready: 2, blocked: 0, draft: 1, next: ["claim_task"] }),
+      },
+    ]);
+
+    const errRes = await client.callTool({
+      name: "claim_task",
+      arguments: { task_id: "not-a-uuid" },
+    });
+    expect(errRes.isError).toBe(true);
+    expect(errRes.structuredContent).toBeUndefined();
+  });
+
+  it("omits structuredContent and outputSchema for older protocol clients (< 2025-06-18)", async () => {
+    const sent: unknown[] = [];
+    const server = createCatenextMcpServer({
+      version: "test",
+      context: async () => ({
+        ok: true,
+        root: "/tmp",
+        service: {
+          async callTool() {
+            return { ready: 1, blocked: 0, draft: 0 };
+          },
+        } as Extract<ServerContext, { ok: true }>["service"],
+      }),
+    });
+    const transport: McpTransport = {
+      async start() {},
+      async close() {},
+      async send(msg) {
+        sent.push(msg);
+      },
+    };
+    await server.connect(transport);
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "session_brief", arguments: {} },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    await server.close();
+
+    const listReply = sent[1] as {
+      result: { tools: Array<{ name: string; outputSchema?: unknown }> };
+    };
+    expect(listReply.result.tools.length).toBeGreaterThan(0);
+    for (const tool of listReply.result.tools) {
+      expect(tool.outputSchema).toBeUndefined();
+    }
+
+    const callReply = sent[2] as {
+      result: {
+        content: Array<{ type: string; text?: string }>;
+        structuredContent?: unknown;
+      };
+    };
+    expect(callReply.result.structuredContent).toBeUndefined();
+    expect(callReply.result.content).toEqual([
+      { type: "text", text: JSON.stringify({ ready: 1, blocked: 0, draft: 0 }) },
     ]);
   });
 });

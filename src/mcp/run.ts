@@ -24,6 +24,8 @@ export async function runMcpServer(opts: {
   allowCrud?: boolean;
 }) {
   const allowCrud = mcpCrudEnabled(opts.role, opts.allowCrud);
+  // Hint surface for session_brief when launch omitted --role (full catalog).
+  process.env.CATENEXT_MCP_ROLE = opts.role ?? "";
   let cached: Promise<ServerContext> | undefined;
   let stateFile: string | undefined;
 

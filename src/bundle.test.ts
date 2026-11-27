@@ -46,7 +46,7 @@ describe("zero-runtime-dep CLI bundle", () => {
     expect(distFiles.some((f) => f.endsWith(".map"))).toBe(false);
 
     const sizeBytes = statSync(join(CLI_DIR, "dist/index.js")).size;
-    expect(sizeBytes).toBeLessThan(1_500_000);
+    expect(sizeBytes).toBeLessThan(1_000_000);
 
     const isolated = mkdtempSync(join(tmpdir(), "catenext-bundle-isolated-"));
     try {
@@ -92,6 +92,12 @@ describe("zero-runtime-dep CLI bundle", () => {
             method: "tools/call",
             params: { name: "session_brief", arguments: {} },
           }),
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 5,
+            method: "tools/call",
+            params: { name: "get_project_board", arguments: { limit: "not-a-number" } },
+          }),
         ]
           .map((l) => `${l}\n`)
           .join(""),
@@ -103,12 +109,17 @@ describe("zero-runtime-dep CLI bundle", () => {
         .trim()
         .split(/\r?\n/)
         .map((line) => JSON.parse(line) as { id: number; result?: Record<string, unknown> });
-      expect(responses).toHaveLength(4);
-      expect(responses[0]?.result).toMatchObject({ serverInfo: { name: "catenext" } });
-      expect(responses[1]?.result).toEqual({});
-      expect((responses[2]?.result as { tools?: unknown[] })?.tools?.length).toBeGreaterThan(0);
-      expect(responses[3]?.result).toMatchObject({
+      expect(responses).toHaveLength(5);
+      const byId = new Map(responses.map((r) => [r.id, r.result]));
+      expect(byId.get(1)).toMatchObject({ serverInfo: { name: "catenext" } });
+      expect(byId.get(2)).toEqual({});
+      expect((byId.get(3) as { tools?: unknown[] })?.tools?.length).toBeGreaterThan(0);
+      expect(byId.get(4)).toMatchObject({
         content: [{ type: "text", text: expect.any(String) }],
+      });
+      expect(byId.get(5)).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: expect.stringMatching(/number/i) }],
       });
     } finally {
       rmSync(isolated, { recursive: true, force: true });

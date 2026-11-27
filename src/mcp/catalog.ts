@@ -1,5 +1,6 @@
 import {
   isMcpCrudTool,
+  ManageTaskAgentInput,
   MCP_CRUD_TOOLS,
   MCP_TOOL_NAMES,
   MCP_TOOLS,
@@ -73,7 +74,7 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
     "Soft-archive a project document by setting archived_at; hidden from default indexes.",
   restore_document: "Restore an archived project document so it appears in default indexes again.",
   manage_task: "Assign, revise, unblock, or return tasks to draft. MCP cannot approve.",
-  review_pull_request: "Manage local PR review queue, claim, refresh, or submit recommendation.",
+  review_pull_request: "Local review queue; submit recommends, human CLI approves.",
   get_project_context:
     "Read repo identity, persona rules, skill index, docs, and dependency handoffs.",
   get_ready_tasks: "List claimable tasks for this repo whose dependencies are all done.",
@@ -98,6 +99,85 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   graph_impact: "Analyze reverse transitive dependents of a file before editing.",
 };
 
+export interface McpToolAnnotations {
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+
+const READ_ONLY: McpToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+const MUTATE: McpToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+const IDEMPOTENT_MUTATE: McpToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+const DESTRUCTIVE_MUTATE: McpToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+const DESTRUCTIVE_IDEMPOTENT_MUTATE: McpToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+/** Standard MCP tool annotations for every tool exposed in tools/list. */
+export const TOOL_ANNOTATIONS: Record<McpToolName, McpToolAnnotations> = {
+  update_task: IDEMPOTENT_MUTATE,
+  update_epic: IDEMPOTENT_MUTATE,
+  set_dependencies: IDEMPOTENT_MUTATE,
+  cancel_task: DESTRUCTIVE_MUTATE,
+  release_task: MUTATE,
+  get_project_board: READ_ONLY,
+  search_context: READ_ONLY,
+  get_document: READ_ONLY,
+  save_document: MUTATE,
+  archive_document: DESTRUCTIVE_IDEMPOTENT_MUTATE,
+  restore_document: IDEMPOTENT_MUTATE,
+  manage_task: MUTATE,
+  review_pull_request: MUTATE,
+  get_project_context: READ_ONLY,
+  get_ready_tasks: READ_ONLY,
+  claim_task: MUTATE,
+  complete_handoff: MUTATE,
+  report_blocker: MUTATE,
+  create_tasks: MUTATE,
+  list_epics: READ_ONLY,
+  create_epic: MUTATE,
+  list_personas: READ_ONLY,
+  upsert_persona: IDEMPOTENT_MUTATE,
+  remove_persona: DESTRUCTIVE_MUTATE,
+  load_skill: READ_ONLY,
+  save_repo_skill: IDEMPOTENT_MUTATE,
+  interview_setup: READ_ONLY,
+  session_brief: READ_ONLY,
+  manage_roots: DESTRUCTIVE_MUTATE,
+  graph_neighbors: READ_ONLY,
+  symbol_search: READ_ONLY,
+  graph_summary: READ_ONLY,
+  graph_impact: READ_ONLY,
+};
+
 export interface CompactToolInputSchema {
   type: "object";
   properties?: Record<string, object>;
@@ -105,10 +185,18 @@ export interface CompactToolInputSchema {
   [key: string]: unknown;
 }
 
+export type CompactToolOutputSchema = CompactToolInputSchema;
+
+export const COMPACT_OBJECT_OUTPUT_SCHEMA: CompactToolOutputSchema = {
+  type: "object",
+};
+
 export interface CompactMcpTool {
   name: McpToolName;
   description: string;
   inputSchema: CompactToolInputSchema;
+  outputSchema?: CompactToolOutputSchema;
+  annotations: McpToolAnnotations;
 }
 
 /** Only trusted launch options grant CRUD; role can narrow but never grant it. */
@@ -159,6 +247,10 @@ export function buildMcpToolCatalog(role?: McpRole, allowCrud = false): CompactM
   return toolsForRole(role, allowCrud).map((name) => ({
     name,
     description: TOOL_DESCRIPTIONS[name],
-    inputSchema: zodToCompactJsonSchema(MCP_TOOLS[name].input),
+    inputSchema: zodToCompactJsonSchema(
+      name === "manage_task" ? ManageTaskAgentInput : MCP_TOOLS[name].input,
+    ),
+    outputSchema: COMPACT_OBJECT_OUTPUT_SCHEMA,
+    annotations: TOOL_ANNOTATIONS[name],
   }));
 }

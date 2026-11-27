@@ -9,6 +9,28 @@ bagian itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workfl
 menolak tag yang versinya belum ada di file ini. Entri versi tidak berarti paket sudah terbit di npm.
 Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
 
+## [0.18.0] - 2026-11-28
+
+### Ditambahkan
+- **MCP Protocol v2 (`apps/cli/src/mcp/`):**
+  - Menambahkan `resources/list`, `resources/read`, dan `resources/templates/list` (`catenext://documents/{slug}`, `catenext://handoffs/{task_id}`) serta emisi `resource_link` tergerbang protokol (`>= 2025-06-18`) untuk payload besar.
+  - Menambahkan `prompts/list` dan `prompts/get` (`kickoff-brainstorm`, `rc-review`, `docs-hygiene`) dengan validasi parameter `-32602`.
+  - Menambahkan `annotations` MCP standar (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) pada seluruh 33 tool di `catalog.ts`.
+  - Menambahkan `structuredContent` pada `tools/call` dan `outputSchema` kompak pada `tools/list` untuk klien `>= 2025-06-18` dengan kompatibilitas penuh untuk klien `< 2025-06-18`.
+- **Deklarasi tool stub Antigravity:** `apps/cli/src/subagents.ts` kini mendeklarasikan frontmatter `tools` sesuai peran pekerja (`read, search, write, edit, terminal`) vs `reviewer`/`scribe` (`read, search, verify`).
+- **Benchmark terukur MCP & bundle:** menambahkan benchmark context-pack, compact handoff, dan ukuran bundle CLI di `apps/cli/src/mcp/context-benchmark.test.ts` dan `docs/benchmarks/`.
+
+### Diubah
+- Memecah `apps/cli/src/mcp/server.ts` menjadi router JSON-RPC tipis dan domain handler (`handlers/types.ts`, `handlers/protocol.ts`, `handlers/resources.ts`, `handlers/tools.ts`, `handlers/prompts.ts`).
+- Memecah `LocalService` menjadi `local-claim-response.ts` dan `local-review-workflow.ts`, serta memecah `graph-index.ts` menjadi `graph-parser.ts` dan `graph-import-resolver.ts`.
+- Memangkas 63 modul locale Zod yang tidak terpakai pada `apps/cli/build.mjs` (`zodEnOnlyLocalesPlugin`) sehingga ukuran `dist/index.js` turun ke ~849.9 KB.
+- Mengoptimalkan latensi `buildReviewContextPack` dengan menggabungkan `git diff`/`diff-tree --raw --numstat -z -M` dan menghapus panggilan `git` redundan (~73% lebih cepat pada p50).
+- Memindahkan `discoverSkillCatalog` ke luar transaksi writer SQLite pada `claim_task`, memprioritaskan baris/heading task-ID pada excerpt `sync-board`, serta mengizinkan spasi pada `git_paths` handoff sambil tetap menolak karakter kontrol dan deklarasi kode.
+
+### Diperbaiki
+- Mereset `supportsStructuredContent = false` saat reconnect transport di `apps/cli/src/mcp/server.ts`.
+- Menghilangkan 11 warning Biome `noNonNullAssertion` dan menaikkan timeout `context-benchmark.test.ts` ke `60_000` ms untuk stabilitas Windows CI.
+
 ## [0.17.0] - 2026-11-28
 
 ### Ditambahkan

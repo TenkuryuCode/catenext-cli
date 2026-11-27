@@ -118,12 +118,25 @@ function runGitReadOnly(cwd: string, args: string[]): string | null {
 }
 
 function resolveGitMergeBase(cwd: string, baseBranch: string, headSha: string): string | null {
-  const candidates = [`refs/heads/${baseBranch}`, `refs/remotes/origin/${baseBranch}`, baseBranch];
-  for (const ref of candidates) {
+  const localRef = `refs/heads/${baseBranch}`;
+  const originRef = `refs/remotes/origin/${baseBranch}`;
+  const isSameCommit = (sha: string) =>
+    sha === headSha || sha.toLowerCase().startsWith(headSha.toLowerCase());
+
+  for (const ref of [localRef, originRef, baseBranch]) {
     const out = runGitReadOnly(cwd, ["merge-base", ref, headSha]);
     const sha = out?.trim();
-    if (sha && /^[0-9a-f]{40,64}$/i.test(sha) && sha !== headSha) {
-      return sha;
+    if (!sha || !/^[0-9a-f]{40,64}$/i.test(sha)) continue;
+    if (!isSameCommit(sha)) return sha;
+    if (ref === localRef) {
+      // Local baseBranch already resolved to headSha; bare baseBranch would resolve identically.
+      // Only check origin/<baseBranch> in case local baseBranch has unpushed commits.
+      const originOut = runGitReadOnly(cwd, ["merge-base", originRef, headSha]);
+      const originSha = originOut?.trim();
+      if (originSha && /^[0-9a-f]{40,64}$/i.test(originSha) && !isSameCommit(originSha)) {
+        return originSha;
+      }
+      return null;
     }
   }
   return null;
@@ -145,10 +158,7 @@ function statusFromGitCode(code: string): ReviewChangedFile["status"] {
   }
 }
 
-function parseGitDiffZ(
-  numstatOut: string,
-  nameStatusOut: string,
-): {
+function parseGitDiffZ(combinedOut: string): {
   files: ReviewChangedFile[];
   additions: number;
   deletions: number;
@@ -157,49 +167,62 @@ function parseGitDiffZ(
     string,
     { status: ReviewChangedFile["status"]; previous_path?: string }
   >();
-  const statusTokens = nameStatusOut.split("\0");
-  for (let i = 0; i < statusTokens.length; i += 1) {
-    const token = statusTokens[i]?.trim();
-    if (!token) continue;
-    const status = statusFromGitCode(token);
-    if (token.startsWith("R") || token.startsWith("C")) {
-      const oldPath = statusTokens[i + 1];
-      const newPath = statusTokens[i + 2];
-      i += 2;
-      if (newPath) {
-        statusByPath.set(newPath, {
-          status,
-          ...(oldPath ? { previous_path: oldPath } : {}),
-        });
-      }
-    } else {
-      const path = statusTokens[i + 1];
-      i += 1;
-      if (path) statusByPath.set(path, { status });
-    }
-  }
-
   const files: ReviewChangedFile[] = [];
   let totalAdditions = 0;
   let totalDeletions = 0;
-  const numTokens = numstatOut.split("\0");
-  for (let i = 0; i < numTokens.length; i += 1) {
-    const entry = numTokens[i];
-    if (!entry) continue;
-    const tab1 = entry.indexOf("\t");
-    if (tab1 === -1) continue;
-    const tab2 = entry.indexOf("\t", tab1 + 1);
-    if (tab2 === -1) continue;
-    const addRaw = entry.slice(0, tab1).trim();
-    const delRaw = entry.slice(tab1 + 1, tab2).trim();
-    const pathPart = entry.slice(tab2 + 1);
+
+  const tokens = combinedOut.split("\0");
+  for (let i = 0; i < tokens.length; ) {
+    const token = tokens[i];
+    if (!token) {
+      i += 1;
+      continue;
+    }
+
+    if (token.startsWith(":")) {
+      const lastSpace = token.lastIndexOf(" ");
+      const statusCode = lastSpace === -1 ? "" : token.slice(lastSpace + 1).trim();
+      const status = statusFromGitCode(statusCode);
+      if (statusCode.startsWith("R") || statusCode.startsWith("C")) {
+        const oldPath = tokens[i + 1];
+        const newPath = tokens[i + 2];
+        i += 3;
+        if (newPath) {
+          statusByPath.set(newPath, {
+            status,
+            ...(oldPath ? { previous_path: oldPath } : {}),
+          });
+        }
+      } else {
+        const path = tokens[i + 1];
+        i += 2;
+        if (path) statusByPath.set(path, { status });
+      }
+      continue;
+    }
+
+    const tab1 = token.indexOf("\t");
+    if (tab1 === -1) {
+      i += 1;
+      continue;
+    }
+    const tab2 = token.indexOf("\t", tab1 + 1);
+    if (tab2 === -1) {
+      i += 1;
+      continue;
+    }
+    const addRaw = token.slice(0, tab1).trim();
+    const delRaw = token.slice(tab1 + 1, tab2).trim();
+    const pathPart = token.slice(tab2 + 1);
 
     let filePath = pathPart;
     let previousPath: string | undefined;
     if (pathPart === "") {
-      previousPath = numTokens[i + 1];
-      filePath = numTokens[i + 2] ?? "";
-      i += 2;
+      previousPath = tokens[i + 1];
+      filePath = tokens[i + 2] ?? "";
+      i += 3;
+    } else {
+      i += 1;
     }
     if (!filePath) continue;
 
@@ -241,20 +264,27 @@ export function collectScopedDiffMeta(options: {
     maxFiles = DEFAULT_MAX_CHANGED_FILES,
   } = options;
 
-  const commitExists =
-    /^[0-9a-f]{7,64}$/i.test(headSha) &&
-    runGitReadOnly(repoRoot, ["rev-parse", "--verify", `${headSha}^{commit}`]) !== null;
-
   let rawFiles: ReviewChangedFile[] = [];
   let source: ReviewDiffMeta["source"] = "handoff_only";
   let baseRef: string | undefined;
   let additions = 0;
   let deletions = 0;
 
-  if (commitExists) {
+  if (/^[0-9a-f]{7,64}$/i.test(headSha)) {
     const mergeBase = resolveGitMergeBase(repoRoot, baseBranch, headSha);
     const diffArgs = mergeBase
-      ? ["diff", "--no-ext-diff", "--no-textconv", "-z", "-M", mergeBase, headSha, "--"]
+      ? [
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--raw",
+          "--numstat",
+          "-z",
+          "-M",
+          mergeBase,
+          headSha,
+          "--",
+        ]
       : [
           "diff-tree",
           "--no-commit-id",
@@ -262,23 +292,16 @@ export function collectScopedDiffMeta(options: {
           "--root",
           "--no-ext-diff",
           "--no-textconv",
+          "--raw",
+          "--numstat",
           "-z",
           "-M",
           headSha,
           "--",
         ];
-    const numstat = runGitReadOnly(repoRoot, [
-      diffArgs[0] ?? "diff",
-      "--numstat",
-      ...diffArgs.slice(1),
-    ]);
-    const nameStatus = runGitReadOnly(repoRoot, [
-      diffArgs[0] ?? "diff",
-      "--name-status",
-      ...diffArgs.slice(1),
-    ]);
-    if (numstat !== null && nameStatus !== null) {
-      const parsed = parseGitDiffZ(numstat, nameStatus);
+    const diffOut = runGitReadOnly(repoRoot, diffArgs);
+    if (diffOut !== null) {
+      const parsed = parseGitDiffZ(diffOut);
       rawFiles = parsed.files;
       additions = parsed.additions;
       deletions = parsed.deletions;

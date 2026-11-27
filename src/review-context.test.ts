@@ -378,4 +378,61 @@ describe("review-context unit and integration tests", () => {
     );
     expect(logs.some((line) => line.includes("Context pack: 1 file (+2/-1)"))).toBe(true);
   });
+
+  it("parses renamed and binary files from combined --raw --numstat and falls back on missing commit", async () => {
+    git(root, "init", "-b", "main");
+    git(root, "config", "user.name", "Test User");
+    git(root, "config", "user.email", "test@example.com");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/old.ts"), "export const x = 1;\nexport const y = 2;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "init");
+
+    git(root, "checkout", "-b", "feat/rename-bin");
+    git(root, "mv", "src/old.ts", "src/new.ts");
+    await writeFile(join(root, "src/bin.dat"), Buffer.from([0x00, 0x01, 0x02, 0xff]));
+    git(root, "add", ".");
+    git(root, "commit", "-m", "rename and binary");
+    const headSha = git(root, "rev-parse", "HEAD");
+
+    const meta = collectScopedDiffMeta({
+      repoRoot: root,
+      baseBranch: "main",
+      headSha,
+      handoffFiles: ["src/new.ts", "src/bin.dat"],
+    });
+    expect(meta.source).toBe("git_diff");
+    expect(meta.changed_files).toEqual([
+      {
+        path: "src/bin.dat",
+        status: "added",
+        additions: 0,
+        deletions: 0,
+        binary: true,
+      },
+      {
+        path: "src/new.ts",
+        status: "renamed",
+        additions: 0,
+        deletions: 0,
+        previous_path: "src/old.ts",
+      },
+    ]);
+
+    const missing = collectScopedDiffMeta({
+      repoRoot: root,
+      baseBranch: "main",
+      headSha: "deadbeef".repeat(5),
+      handoffFiles: ["src/new.ts"],
+    });
+    expect(missing.source).toBe("handoff_only");
+    expect(missing.changed_files).toEqual([
+      {
+        path: "src/new.ts",
+        status: "handoff",
+        additions: 0,
+        deletions: 0,
+      },
+    ]);
+  });
 });

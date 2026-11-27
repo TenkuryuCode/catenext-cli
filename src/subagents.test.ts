@@ -77,6 +77,39 @@ describe("subagent persona", () => {
     expect(anti).toContain("model: inherit");
     expect(anti).toContain("subagent: true");
     expect(anti).toContain("mainAgent: false");
+    expect(anti).toContain("tools: [read, search, write, edit, terminal]");
+    expect(anti).toContain("Tool capabilities: write/terminal enabled");
+
+    const reviewer = {
+      alias: "reviewer",
+      role: "reviewer",
+      rules: ["Review PRs"],
+      repos: [],
+      scope: "project" as const,
+    };
+    const antiReviewer = renderSubagent(
+      reviewer,
+      { stack: ["node"], personas: [adel, reviewer] },
+      "antigravity",
+    );
+    expect(antiReviewer).toContain("tools: [read, search, verify]");
+    expect(antiReviewer).toContain("Tool capabilities: read/verify only");
+
+    const scribe = {
+      alias: "scribe",
+      role: "docs",
+      rules: ["Keep docs tidy"],
+      repos: [],
+      scope: "project" as const,
+    };
+    const antiScribe = renderSubagent(
+      scribe,
+      { stack: ["node"], personas: [adel, reviewer, scribe] },
+      "antigravity",
+    );
+    expect(antiScribe).toContain("tools: [read, search, verify]");
+    expect(antiScribe).toContain("Tool capabilities: read/verify only");
+    expect(antiScribe).toContain("save_document");
 
     const codex = renderCodexSubagent(adel, { stack: ["node"], personas: [adel] });
     expect(codex).toContain(`# ${SUBAGENT_MARKER}`);

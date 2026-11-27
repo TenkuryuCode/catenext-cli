@@ -305,13 +305,18 @@ export const ReportBlockerOutput = z.object({
  * Aksi orchestrator (agen utama sesi) atas task yang sudah ada. Revisi tidak membuat task
  * baru: task dipindah ke REVISION_REQUESTED dan diambil lagi oleh persona penanggung jawab.
  */
-export const MANAGE_TASK_ACTIONS = [
+/** Actions agents may request via MCP `manage_task` (approvals stay human CLI-only). */
+export const MANAGE_TASK_AGENT_ACTIONS = [
   "request_revision",
   "assign",
-  "approve_plan",
   "return_to_draft",
-  "approve",
   "unblock",
+] as const;
+
+export const MANAGE_TASK_ACTIONS = [
+  ...MANAGE_TASK_AGENT_ACTIONS,
+  "approve_plan",
+  "approve",
 ] as const;
 
 export const ManageTaskInput = z
@@ -341,6 +346,33 @@ export const ManageTaskInput = z
       });
     }
   });
+
+/** MCP tools/list schema: hide human-only approve actions from agent-visible enums. */
+export const ManageTaskAgentInput = z
+  .object({
+    action: z.enum(MANAGE_TASK_AGENT_ACTIONS),
+    task_id: IdSchema,
+    feedback: z.string().trim().min(5).max(2000).optional(),
+    agent_alias: AgentAliasSchema.nullable().optional(),
+    role: RoleSchema.nullable().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.action === "request_revision" && !v.feedback) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["feedback"],
+        message: "request_revision butuh feedback: apa yang harus diperbaiki.",
+      });
+    }
+    if (v.action === "assign" && v.agent_alias === undefined && v.role === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["agent_alias"],
+        message: "assign butuh agent_alias atau role.",
+      });
+    }
+  });
+
 export const ManageTaskOutput = z.object({
   task_id: IdSchema,
   status: TaskStatusSchema,

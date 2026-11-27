@@ -5,6 +5,7 @@ import {
   HandoffSummarySchema,
   IdSchema,
   IsoDateTimeSchema,
+  type Persona,
   type PersonaSchema,
   type ProjectDocumentSchema,
   PullRequestRefSchema,
@@ -170,3 +171,7 @@ export type LocalProject = {
 
 export type LocalTask = z.output<typeof task>;
 export type LocalReview = z.output<typeof review>;
+
+export function allowsRepo(persona: Persona | undefined, repo: string): boolean {
+  return !persona?.repos.length || persona.repos.includes(repo);
+}

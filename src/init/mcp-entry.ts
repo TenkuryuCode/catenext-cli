@@ -38,6 +38,15 @@ export function stdioEntry(command: unknown, args: unknown): McpServerEntry | nu
 export function entryBase(entry: McpServerEntry): McpServerEntry | null {
   const args = entry.args.slice();
   if (args.at(-2) === "--root") args.splice(-2);
+  // Optional flags after `mcp`: --role <orchestrator|worker>, --allow-crud
+  if (
+    args.length >= 2 &&
+    args.at(-2) === "--role" &&
+    (args.at(-1) === "orchestrator" || args.at(-1) === "worker")
+  ) {
+    args.splice(-2);
+  }
+  if (args.at(-1) === "--allow-crud") args.pop();
   if (args.pop() !== "mcp") return null;
   return { command: entry.command, args };
 }

@@ -48,10 +48,32 @@ describe("HandoffSummarySchema", () => {
     ).toBe(false);
   });
 
-  it("menolak path berisi spasi (potongan kode) dan hash commit tidak valid", () => {
-    expect(
-      HandoffSummarySchema.safeParse({ ...valid, files_modified: ["const x = 1"] }).success,
-    ).toBe(false);
+  it("mempertahankan spasi dalam path file", () => {
+    const files_modified = ["docs/Release Notes.md", "Release Notes"];
+    expect(HandoffSummarySchema.parse({ ...valid, files_modified }).files_modified).toEqual(
+      files_modified,
+    );
+  });
+
+  it.each([
+    "",
+    "   ",
+    "a".repeat(HANDOFF_LIMITS.maxPathLength + 1),
+    "docs/Release\nNotes.md",
+    "docs/Release\rNotes.md",
+    "docs/Release\tNotes.md",
+    "docs/Release\u0000Notes.md",
+    "docs/Release\u0085Notes.md",
+    "docs/Release\u2028Notes.md",
+    "const x = 1",
+    "```const x = 1```",
+  ])("menolak path file yang tidak valid: %j", (path) => {
+    expect(HandoffSummarySchema.safeParse({ ...valid, files_modified: [path] }).success).toBe(
+      false,
+    );
+  });
+
+  it("menolak hash commit tidak valid", () => {
     expect(HandoffSummarySchema.safeParse({ ...valid, last_commit_hash: "xyz" }).success).toBe(
       false,
     );
