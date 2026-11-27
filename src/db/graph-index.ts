@@ -1,21 +1,16 @@
 import { createHash } from "node:crypto";
-import { type Dirent, type Stats, statSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { collectRootTargets } from "../workspace-roots.js";
+import {
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_SKIP_DIRS,
+  isSafeRegularFileSync,
+  readBoundedUtf8File,
+  walkWorkspaceFiles,
+} from "../workspace-walk.js";
 import { openDatabaseAt } from "./open.js";
-
-const SKIP_DIRS = new Set([
-  ".git",
-  "node_modules",
-  ".catenext",
-  "dist",
-  "build",
-  ".turbo",
-  "coverage",
-  "__pycache__",
-]);
 
 const CODE_EXT = new Set([
   ".ts",
@@ -84,11 +79,11 @@ function hash(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-function isRegularFile(filePath: string): boolean {
+function safeRealpathSync(target: string): string {
   try {
-    return statSync(filePath).isFile();
+    return realpathSync(target);
   } catch {
-    return false;
+    return resolve(target);
   }
 }
 
@@ -112,26 +107,6 @@ async function withDatabaseAsync<T>(
     return await fn(db);
   } finally {
     db.close();
-  }
-}
-
-async function walk(dir: string, out: string[]): Promise<void> {
-  let entries: Dirent[];
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      await walk(full, out);
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const ext = extname(entry.name);
-    if (CODE_EXT.has(ext)) out.push(full);
   }
 }
 
@@ -222,12 +197,13 @@ export function resolveImport(
   knownFiles?: ReadonlySet<string>,
 ): string | null {
   const absRoot = resolve(root);
+  const realRoot = safeRealpathSync(absRoot);
   const absFrom = isAbsolute(fromFile) ? resolve(fromFile) : resolve(absRoot, fromFile);
   const base = resolve(dirname(absFrom), spec);
   for (const candidate of importCandidates(base, spec)) {
     const rel = toRelInsideRoot(absRoot, candidate);
     if (!rel) continue;
-    const exists = knownFiles ? knownFiles.has(rel) : isRegularFile(candidate);
+    const exists = knownFiles ? knownFiles.has(rel) : isSafeRegularFileSync(realRoot, candidate);
     if (exists) return rel;
   }
   return toRelInsideRoot(absRoot, base);
@@ -239,9 +215,14 @@ export type GraphIndexResult = {
   edges: number;
 };
 
+export type GraphIndexOptions = {
+  maxFileBytes?: number;
+};
+
 type WalkedEntry = {
   rootId: string | null;
   absRoot: string;
+  realRoot: string;
   prefix: string;
   full: string;
   relInRoot: string;
@@ -262,7 +243,9 @@ export async function indexProjectGraph(
   dbOrPath: DatabaseSync | string,
   projectId: string,
   root: string,
+  options: GraphIndexOptions = {},
 ): Promise<GraphIndexResult> {
+  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
   return withDatabaseAsync(dbOrPath, async (db) => {
     const registeredRoots = db
       .prepare("SELECT id, path, label FROM workspace_roots WHERE project_id = ? ORDER BY path")
@@ -273,28 +256,28 @@ export async function indexProjectGraph(
     const knownFilesByRoot = new Map<string | null, Set<string>>();
 
     for (const target of targets) {
-      const walkedPaths: string[] = [];
-      await walk(target.absRoot, walkedPaths);
+      const { realRoot, files: walkedFiles } = await walkWorkspaceFiles(target.absRoot, {
+        extensions: CODE_EXT,
+        skipDirs: DEFAULT_SKIP_DIRS,
+        skipDotEntries: true,
+        maxFileBytes,
+        honorGitignore: true,
+      });
       const rootKnown = new Set<string>();
-      for (const full of walkedPaths) {
-        let st: Stats;
-        try {
-          st = await stat(full);
-        } catch {
-          continue;
-        }
-        const relInRoot = relative(target.absRoot, full).replaceAll("\\", "/");
+      for (const file of walkedFiles) {
+        const relInRoot = file.rel;
         const rel = target.prefix ? `${target.prefix}/${relInRoot}` : relInRoot;
         rootKnown.add(relInRoot);
         entries.push({
           rootId: target.rootId,
           absRoot: target.absRoot,
+          realRoot,
           prefix: target.prefix,
-          full,
+          full: file.full,
           relInRoot,
           rel,
-          ext: extname(full),
-          mtimeMs: Math.floor(st.mtimeMs),
+          ext: extname(file.full),
+          mtimeMs: file.mtimeMs,
         });
       }
       knownFilesByRoot.set(target.rootId, rootKnown);
@@ -368,7 +351,7 @@ export async function indexProjectGraph(
     const resolveImportsForEntry = (entry: WalkedEntry, content: string): string[] => {
       const rootKnown = knownFilesByRoot.get(entry.rootId);
       return parseImports(content)
-        .map((spec) => resolveImport(entry.full, spec, entry.absRoot, rootKnown))
+        .map((spec) => resolveImport(entry.full, spec, entry.realRoot, rootKnown))
         .filter((to): to is string => Boolean(to))
         .map((to) => (entry.prefix ? `${entry.prefix}/${to}` : to));
     };
@@ -380,7 +363,11 @@ export async function indexProjectGraph(
         continue;
       }
 
-      const content = await readFile(entry.full, "utf8");
+      const content = await readBoundedUtf8File(entry.full, entry.realRoot, maxFileBytes);
+      if (content === null) {
+        if (existing) deletedIds.push(existing.id);
+        continue;
+      }
       const contentHash = hash(content);
       if (existing && existing.hash === contentHash) {
         idByPath.set(entry.rel, existing.id);
@@ -423,7 +410,8 @@ export async function indexProjectGraph(
       const existing = existingByPath.get(rel);
       const entry = entryByRel.get(rel);
       if (!existing || !entry) continue;
-      const content = await readFile(entry.full, "utf8");
+      const content = await readBoundedUtf8File(entry.full, entry.realRoot, maxFileBytes);
+      if (content === null) continue;
       const imports = resolveImportsForEntry(entry, content);
       refreshedEdges.push({ id: existing.id, rel, imports });
     }

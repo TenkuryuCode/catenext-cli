@@ -189,16 +189,33 @@ describe("verifySetup", () => {
     await writeFile(target, "data");
     await chmod(target, 0o600);
 
-    await symlink(target, state);
-    const symLines = await verifySetup(root, config, []);
-    const symCheck = symLines.find((l) => l.label === `File state lokal: ${state}`);
-    expect(symCheck).toEqual({
-      ok: false,
-      label: `File state lokal: ${state}`,
-      hint: "State harus file biasa, bukan symlink atau hardlink.",
-    });
+    let symlinkCreated = false;
+    try {
+      await symlink(target, state);
+      symlinkCreated = true;
+    } catch (error) {
+      if (
+        !(
+          process.platform === "win32" &&
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "EPERM"
+        )
+      ) {
+        throw error;
+      }
+    }
+    if (symlinkCreated) {
+      const symLines = await verifySetup(root, config, []);
+      const symCheck = symLines.find((l) => l.label === `File state lokal: ${state}`);
+      expect(symCheck).toEqual({
+        ok: false,
+        label: `File state lokal: ${state}`,
+        hint: "State harus file biasa, bukan symlink atau hardlink.",
+      });
+      await rm(state);
+    }
 
-    await rm(state);
     await link(target, state);
     const hardLines = await verifySetup(root, config, []);
     const hardCheck = hardLines.find((l) => l.label === `File state lokal: ${state}`);
@@ -209,11 +226,14 @@ describe("verifySetup", () => {
     });
   });
 
-  it("rethrows non-ENOENT lstat errors on state file", async () => {
-    await writeRepo("not-a-dir", "plain file");
-    const config = makeConfig([], "not-a-dir/state.sqlite");
-    await expect(verifySetup(root, config, [])).rejects.toMatchObject({ code: "ENOTDIR" });
-  });
+  it.skipIf(process.platform === "win32")(
+    "rethrows non-ENOENT lstat errors on state file",
+    async () => {
+      await writeRepo("not-a-dir", "plain file");
+      const config = makeConfig([], "not-a-dir/state.sqlite");
+      await expect(verifySetup(root, config, [])).rejects.toMatchObject({ code: "ENOTDIR" });
+    },
+  );
 
   it("reports windsurf unsupported and empty platform selection", async () => {
     const config = makeConfig(["windsurf"]);

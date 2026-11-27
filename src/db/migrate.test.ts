@@ -8,11 +8,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalServiceError } from "../errors.js";
 import {
   getSchemaVersion,
+  hasCodeSearchFts,
   legacyStateJsonPath,
   migrateJsonStateIfNeeded,
   runSchemaMigrations,
   SCHEMA_MIGRATIONS,
   setSchemaVersion,
+  tryEnableCodeSearchFts,
 } from "./migrate.js";
 import { openDatabaseAt } from "./open.js";
 import { loadProject } from "./project-codec.js";
@@ -236,7 +238,11 @@ describe("SQLite schema migrations", () => {
       expect(colsBefore.some((c) => c.name === "integrated_commit_json")).toBe(false);
 
       const result1 = runSchemaMigrations(db);
-      expect(result1).toEqual({ fromVersion: 1, toVersion: SCHEMA_VERSION, applied: [2, 3, 4, 5] });
+      expect(result1).toEqual({
+        fromVersion: 1,
+        toVersion: SCHEMA_VERSION,
+        applied: [2, 3, 4, 5, 6],
+      });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
       expect(colsAfter.some((c) => c.name === "integrated_commit_json")).toBe(true);
@@ -246,7 +252,9 @@ describe("SQLite schema migrations", () => {
           name: string;
         }[]
       ).map((r) => r.name);
-      expect(tables).toEqual(expect.arrayContaining(["files", "symbols", "edges", "task_events"]));
+      expect(tables).toEqual(
+        expect.arrayContaining(["files", "symbols", "edges", "task_events", "code_search_files"]),
+      );
 
       const indexes = (
         db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as {
@@ -380,7 +388,11 @@ describe("SQLite schema migrations", () => {
           .some(({ name }) => name === "archived_at"),
       ).toBe(false);
 
-      expect(runSchemaMigrations(db)).toEqual({ fromVersion: 4, toVersion: 5, applied: [5] });
+      expect(runSchemaMigrations(db, { targetVersion: 5 })).toEqual({
+        fromVersion: 4,
+        toVersion: 5,
+        applied: [5],
+      });
       const docCols = (
         db.prepare("PRAGMA table_info(documents)").all() as { name: string; dflt_value: unknown }[]
       ).find((c) => c.name === "archived_at");
@@ -391,7 +403,54 @@ describe("SQLite schema migrations", () => {
         .get(projectId) as { archived_at: string | null };
       expect(row.archived_at).toBeNull();
       expect(loadProject(db, projectId).documents[0]?.archived_at ?? null).toBeNull();
+      expect(runSchemaMigrations(db, { targetVersion: 5 }).applied).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migrates v5 to v6 with code_search_files + FTS5 idempotently and handles unavailable FTS5 cleanly", () => {
+    const dbPath = join(dir, "v5-to-v6.sqlite");
+    const { projectId, taskId } = createV1Database(dbPath);
+    const db = new DatabaseSync(dbPath);
+    try {
+      runSchemaMigrations(db, { targetVersion: 5 });
+      expect(getSchemaVersion(db)).toBe(5);
+
+      const res = runSchemaMigrations(db);
+      expect(res).toEqual({ fromVersion: 5, toVersion: 6, applied: [6] });
+      expect(getSchemaVersion(db)).toBe(6);
+
+      const cols = (
+        db.prepare("PRAGMA table_info(code_search_files)").all() as { name: string }[]
+      ).map((c) => c.name);
+      expect(cols).toEqual([
+        "id",
+        "project_id",
+        "root_id",
+        "path",
+        "sha256",
+        "mtime_ms",
+        "content",
+      ]);
+      expect(hasCodeSearchFts(db)).toBe(true);
+      expect(loadProject(db, projectId).tasks.map((t) => t.id)).toEqual([taskId]);
       expect(runSchemaMigrations(db).applied).toEqual([]);
+
+      // Simulate missing FTS5 module inside an active transaction: savepoint rolls back cleanly.
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const enabled = tryEnableCodeSearchFts(
+          db,
+          "CREATE VIRTUAL TABLE code_search_fts_missing USING fts5_unavailable_mod(path, content)",
+        );
+        expect(enabled).toBe(false);
+        db.exec("COMMIT");
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+      expect(getSchemaVersion(db)).toBe(6);
     } finally {
       db.close();
     }

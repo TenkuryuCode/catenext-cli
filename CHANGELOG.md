@@ -10,6 +10,19 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.13.0] - 2026-11-27
+
+### Ditambahkan
+- SQLite schema v6 (`code_search_files` + `code_search_fts` FTS5 `unicode61` dengan fallback `LIKE` via `SAVEPOINT`) menggantikan cache JSON `.catenext/cache/*.json` (pruning aman dengan mempertahankan `cli-session-id`).
+- Shared `.gitignore`-aware `workspace-walk` untuk graph indexing & code search (root + nested `.gitignore`, extra skip dir, batas 256 KiB per file, serta guard `lstat`/`realpath` terhadap symlink loop).
+- `catenext backup <out>` (`VACUUM INTO`, rename atomik, izin `0o600`, guard `--force`) dan `catenext restore <file>` (validasi file reguler non-symlink, header SQLite, `integrity_check`, verifikasi tabel Catenext, serta salinan cadangan sebelum swap `--force`).
+- CI lintas-platform (`Linux ARM64`, `macOS`, `Windows`) dan smoke check bundle CLI (`.github/scripts/smoke-cli-bundle.mjs` + `.gitattributes` LF).
+
+### Diubah
+- Lifecycle SQLite WAL: `PRAGMA wal_checkpoint(TRUNCATE)` pada `postAction` CLI (kecuali `doctor`/`watch`/`mcp`/`config`/`verify`) dan shutdown MCP (`beforeExit`/`SIGINT`/`SIGTERM`).
+- Keamanan & stdio MCP: perluasan pola sensor `scrubber.ts` (`url_password` + token provider sambil menjaga link PR, SHA commit, UUID), batas frame stdio 1 MiB (`STDIO_DEFAULT_MAX_LINE_SIZE`) dengan `StdioBufferError` + pemulihan JSON-RPC `-32600`, serta penghapusan `apps/cli/AGENTS.md` yang usang.
+- Upgrade **Master Prompt** di `apps/cli/mirror/README.md` serta penyelarasan `README.md` dan `apps/cli/README.md`.
+
 ## [0.12.0] - 2026-11-27
 
 Rilis tunggal Epic A (DX onboarding) + Epic B (siklus dokumen) + Epic C (CRUD persona/skill).

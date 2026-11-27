@@ -9,6 +9,7 @@ import {
   JSONRPC_VERSION,
   type JsonRpcErrorResponse,
   type JsonRpcId,
+  type JsonRpcMessage,
   type JsonRpcSuccessResponse,
   type McpTransport,
 } from "./stdio.js";
@@ -156,14 +157,22 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
     }
   };
 
-  const sendResult = async (transport: McpTransport, id: JsonRpcId, result: unknown) => {
+  const safeSend = async (transport: McpTransport, msg: JsonRpcMessage) => {
     if (activeTransport !== transport) return;
+    try {
+      await transport.send(msg);
+    } catch (err) {
+      log(`Transport send failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const sendResult = async (transport: McpTransport, id: JsonRpcId, result: unknown) => {
     const msg: JsonRpcSuccessResponse = {
       jsonrpc: JSONRPC_VERSION,
       id,
       result: result as JsonRpcSuccessResponse["result"],
     };
-    await transport.send(msg);
+    await safeSend(transport, msg);
   };
 
   const sendError = async (
@@ -172,13 +181,12 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
     code: number,
     message: string,
   ) => {
-    if (activeTransport !== transport) return;
     const msg: JsonRpcErrorResponse = {
       jsonrpc: JSONRPC_VERSION,
       id,
       error: { code, message },
     };
-    await transport.send(msg);
+    await safeSend(transport, msg);
   };
 
   const handleMessage = async (transport: McpTransport, raw: unknown) => {
@@ -271,6 +279,14 @@ export function createCatenextMcpServer(opts: ServerOptions): CatenextMcpServer 
       activeTransport = transport;
       transport.onparseerror = () => {
         void sendError(transport, null, JSONRPC_PARSE_ERROR, "Parse error.");
+      };
+      transport.onframeerror = (err) => {
+        void sendError(
+          transport,
+          null,
+          JSONRPC_INVALID_REQUEST,
+          err.message || "Message exceeds maximum allowed size.",
+        );
       };
       transport.onmessage = (msg) => {
         void handleMessage(transport, msg);

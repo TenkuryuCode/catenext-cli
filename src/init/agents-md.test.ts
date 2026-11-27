@@ -1,6 +1,26 @@
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { renderMasterPrompt } from "../agents/entry-pointers.js";
 import { BLOCK_START, removeAgentsBlock, upsertAgentsBlock } from "./agents-md.js";
+
+const CLI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+function findAgentsMdFiles(dir: string): string[] {
+  const skip = new Set(["node_modules", "dist", ".turbo", ".git"]);
+  const found: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (skip.has(entry.name)) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...findAgentsMdFiles(full));
+    } else if (entry.name === "AGENTS.md") {
+      found.push(full);
+    }
+  }
+  return found;
+}
 
 describe("blok AGENTS.md", () => {
   it("membuat file baru dan idempoten", () => {
@@ -40,5 +60,19 @@ describe("blok AGENTS.md", () => {
   it("remove mengembalikan isi semula atau null bila hanya berisi blok", () => {
     expect(removeAgentsBlock(upsertAgentsBlock(null))).toBeNull();
     expect(removeAgentsBlock(upsertAgentsBlock("# Tim\n\nA\n"))).toBe("# Tim\n\nA\n");
+  });
+});
+
+describe("apps/cli hygiene", () => {
+  it("tidak menyisakan AGENTS.md usang yang merujuk Cloud/dashboard di dalam apps/cli", () => {
+    expect(existsSync(join(CLI_DIR, "AGENTS.md"))).toBe(false);
+    const lingering = findAgentsMdFiles(CLI_DIR);
+    expect(lingering).toEqual([]);
+    for (const file of lingering) {
+      const content = readFileSync(file, "utf8");
+      expect(content).not.toMatch(
+        /indeks dokumen Cloud|menyetujuinya di Web|project_repos|bambang/i,
+      );
+    }
   });
 });

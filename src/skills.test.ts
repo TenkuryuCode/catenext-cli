@@ -108,7 +108,9 @@ describe("skills lokal", () => {
       await skillRemove(root, "guide", { json: true });
       const removeLine = logs.at(-1);
       expect(removeLine).toBeDefined();
-      expect(JSON.parse(removeLine ?? "")).toEqual({ path: ".catenext/skills/guide.md" });
+      expect(JSON.parse(removeLine ?? "")).toEqual({
+        path: join(".catenext", "skills", "guide.md"),
+      });
     } finally {
       vi.restoreAllMocks();
     }

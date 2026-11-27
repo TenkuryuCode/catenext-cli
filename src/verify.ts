@@ -173,7 +173,7 @@ export async function inspectLocalSkills(root: string): Promise<CheckLine[]> {
     return [{ id: "skills.valid", ok: true, label: `Skill lokal valid: ${skills.length}` }];
   }
   return invalid.map(({ file, error }) => {
-    const path = file === SKILLS_DIR ? file : `${SKILLS_DIR}/${file}`;
+    const path = file === SKILLS_DIR ? file : join(SKILLS_DIR, file);
     const slug = file === SKILLS_DIR ? "dir" : file.replace(/\.md$/i, "");
     return {
       id: `skills.invalid.${slug}`,

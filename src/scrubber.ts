@@ -15,7 +15,13 @@ const RULES: Rule[] = [
   {
     kind: "private_key",
     pattern:
-      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+      /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----|$)/g,
+  },
+  {
+    kind: "url_password",
+    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@"[\]()<>'`{},;]*:)([^\s@/"[\]()<>'`{},;]+)(@)/gi,
+    replace: (m, pre, pw, at) =>
+      pw.includes("[REDACTED:") ? m : `${pre}${redact("url_password")}${at}`,
   },
   { kind: "catenext_key", pattern: /\bctnx_[A-Za-z0-9_-]{8,}/g },
   { kind: "aws_key", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
@@ -23,20 +29,25 @@ const RULES: Rule[] = [
     kind: "github_token",
     pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g,
   },
-  { kind: "slack_token", pattern: /\bxox[abposr]-[A-Za-z0-9-]{10,}/g },
-  { kind: "stripe_key", pattern: /\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}/g },
-  { kind: "llm_api_key", pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g },
-  { kind: "google_api_key", pattern: /\bAIza[0-9A-Za-z_-]{35}/g },
-  { kind: "jwt", pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g },
+  { kind: "npm_token", pattern: /\bnpm_[A-Za-z0-9]{20,}/g },
   {
-    kind: "url_password",
-    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)([^\s@/]+)(@)/gi,
-    replace: (_m, pre, _pw, at) => `${pre}${redact("url_password")}${at}`,
+    kind: "slack_token",
+    pattern: /\b(?:xox[abposr]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{10,})/g,
   },
+  { kind: "stripe_key", pattern: /\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}/g },
+  {
+    kind: "llm_api_key",
+    pattern: /\bsk-(?:(?:ant|proj|svcacct|admin)-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_-]{20,})/g,
+  },
+  { kind: "google_api_key", pattern: /\bAIza[0-9A-Za-z_-]{20,}/g },
+  { kind: "huggingface_token", pattern: /\bhf_[A-Za-z0-9]{20,}/g },
+  { kind: "gitlab_token", pattern: /\bglpat-[A-Za-z0-9_-]{20,}/g },
+  { kind: "pypi_token", pattern: /\bpypi-[A-Za-z0-9_-]{20,}/g },
+  { kind: "jwt", pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g },
   {
     kind: "bearer_token",
     pattern: /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})/gi,
-    replace: (_m, pre) => `${pre}${redact("bearer_token")}`,
+    replace: (m, pre, tok) => (tok.includes("[REDACTED:") ? m : `${pre}${redact("bearer_token")}`),
   },
   {
     // KEY=value / password: value / "api_key": "secret-val". Nilai dianggap secret bila >= 12 karakter,

@@ -13,7 +13,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { devNull, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -30,6 +30,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { z } from "zod";
 
 let scratch: string;
+let gitConfig: string;
 let fixtureDir: string;
 let root: string;
 let entry: string;
@@ -49,26 +50,26 @@ function resolveSharedEntry(): string {
 
 beforeAll(async () => {
   scratch = await realpath(await mkdtemp(join(tmpdir(), "catenext-cli-stdio-")));
+  gitConfig = join(scratch, "gitconfig");
+  await writeFile(gitConfig, "");
   // Simulate an npx cache to catch regressions that launch npx from generated MCP entries.
   const bundleDir = join(scratch, "_npx", "launcher");
   await mkdir(bundleDir, { recursive: true });
-  await symlink(
-    fileURLToPath(new URL("../node_modules", import.meta.url)),
-    join(bundleDir, "node_modules"),
-    "junction",
-  );
   entry = join(bundleDir, "catenext.mjs");
   await build({
     entryPoints: [fileURLToPath(new URL("./index.ts", import.meta.url))],
     outfile: entry,
     bundle: true,
     format: "esm",
+    mainFields: ["module", "main"],
     platform: "node",
     target: "node22",
     alias: {
       "@catenext/shared": resolveSharedEntry(),
     },
-    packages: "external",
+    banner: {
+      js: 'import { createRequire as __catenextCreateRequire } from "node:module"; const require = __catenextCreateRequire(import.meta.url);',
+    },
   });
 });
 
@@ -81,7 +82,7 @@ beforeEach(async () => {
     PATH: process.env.PATH ?? "",
     HOME: home,
     USERPROFILE: home,
-    GIT_CONFIG_GLOBAL: devNull,
+    GIT_CONFIG_GLOBAL: gitConfig,
     GIT_CONFIG_NOSYSTEM: "1",
     npm_config_offline: "true",
     ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
@@ -614,39 +615,43 @@ describe("CLI dan MCP stdio lokal", () => {
     expect((await lstat(active.worktree.worktree_path)).isDirectory()).toBe(true);
   }, 60_000);
 
-  it("writes stable ServBay/nvm Node launchers into MCP config", async () => {
-    async function installVersionedNode(versioned: string, current: string) {
-      await mkdir(dirname(versioned), { recursive: true });
-      await mkdir(dirname(current), { recursive: true });
-      await copyFile(process.execPath, versioned);
-      await chmod(versioned, 0o755);
-      await symlink(versioned, current);
-    }
+  it.skipIf(process.platform === "win32")(
+    "writes stable ServBay/nvm Node launchers into MCP config",
+    async () => {
+      async function installVersionedNode(versioned: string, current: string) {
+        await mkdir(dirname(versioned), { recursive: true });
+        await mkdir(dirname(current), { recursive: true });
+        await copyFile(process.execPath, versioned);
+        await chmod(versioned, 0o755);
+        await symlink(versioned, current);
+      }
 
-    const runtime = join(fixtureDir, "runtime");
-    const servbayVersioned = join(runtime, "ServBay/package/node/24/24.21.0/bin/node");
-    const servbayCurrent = join(runtime, "ServBay/package/node/current/bin/node");
-    const nvmVersioned = join(runtime, "home/.nvm/versions/node/v22.11.0/bin/node");
-    const nvmCurrent = join(runtime, "home/.nvm/current/bin/node");
-    await installVersionedNode(servbayVersioned, servbayCurrent);
-    await installVersionedNode(nvmVersioned, nvmCurrent);
+      const runtime = join(fixtureDir, "runtime");
+      const servbayVersioned = join(runtime, "ServBay/package/node/24/24.21.0/bin/node");
+      const servbayCurrent = join(runtime, "ServBay/package/node/current/bin/node");
+      const nvmVersioned = join(runtime, "home/.nvm/versions/node/v22.11.0/bin/node");
+      const nvmCurrent = join(runtime, "home/.nvm/current/bin/node");
+      await installVersionedNode(servbayVersioned, servbayCurrent);
+      await installVersionedNode(nvmVersioned, nvmCurrent);
 
-    // Hide PATH executables so init must prefer the unversioned ServBay current link.
-    const emptyBin = join(runtime, "empty-bin");
-    await mkdir(emptyBin, { recursive: true });
-    env = { ...env, PATH: emptyBin };
-    cli(["init", "--platform", "claude-code"], undefined, { command: servbayVersioned });
-    const servbayLaunch = await readClaudeLaunch();
-    expect(servbayLaunch.command).toBe(servbayCurrent);
-    expect(servbayLaunch.command).not.toContain("24.21.0");
-    expect(servbayLaunch.args[0]).toBe(await realpath(entry));
+      // Hide PATH executables so init must prefer the unversioned ServBay current link.
+      const emptyBin = join(runtime, "empty-bin");
+      await mkdir(emptyBin, { recursive: true });
+      env = { ...env, PATH: emptyBin };
+      cli(["init", "--platform", "claude-code"], undefined, { command: servbayVersioned });
+      const servbayLaunch = await readClaudeLaunch();
+      expect(servbayLaunch.command).toBe(servbayCurrent);
+      expect(servbayLaunch.command).not.toContain("24.21.0");
+      expect(servbayLaunch.args[0]).toBe(await realpath(entry));
 
-    await rm(join(root, ".mcp.json"));
-    cli(["init", "--platform", "claude-code", "--yes"], undefined, { command: nvmVersioned });
-    const nvmLaunch = await readClaudeLaunch();
-    expect(nvmLaunch.command).toBe(nvmCurrent);
-    expect(nvmLaunch.command).not.toMatch(/v22\.11\.0/);
-  }, 30_000);
+      await rm(join(root, ".mcp.json"));
+      cli(["init", "--platform", "claude-code", "--yes"], undefined, { command: nvmVersioned });
+      const nvmLaunch = await readClaudeLaunch();
+      expect(nvmLaunch.command).toBe(nvmCurrent);
+      expect(nvmLaunch.command).not.toMatch(/v22\.11\.0/);
+    },
+    30_000,
+  );
 
   it("covers doc archive, restore, list --include-archived, and get --outline|--section", async () => {
     git("init", "-b", "main");

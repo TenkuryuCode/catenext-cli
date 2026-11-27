@@ -21,7 +21,12 @@ import {
 import { z } from "zod";
 import { LocalServiceError } from "../errors.js";
 import { emptyExtendedProject, saveProject } from "./project-codec.js";
-import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
+import {
+  CODE_SEARCH_FILES_SQL,
+  CODE_SEARCH_FTS_SQL,
+  SCHEMA_SQL,
+  SCHEMA_VERSION,
+} from "./schema.js";
 
 const LeaseTokenSchema = z.string().min(1).max(128);
 
@@ -185,6 +190,14 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       }
     },
   },
+  {
+    version: 6,
+    description: "Add SQLite FTS5 code search tables (code_search_files and code_search_fts)",
+    up(db) {
+      db.exec(CODE_SEARCH_FILES_SQL);
+      tryEnableCodeSearchFts(db);
+    },
+  },
 ];
 
 function hasCode(error: unknown, code: string): boolean {
@@ -196,6 +209,37 @@ function tableExists(db: DatabaseSync, tableName: string): boolean {
     .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(tableName) as { ok: number } | undefined;
   return Boolean(row);
+}
+
+/** Check whether the `code_search_fts` virtual table is present in SQLite. */
+export function hasCodeSearchFts(db: DatabaseSync): boolean {
+  return tableExists(db, "code_search_fts");
+}
+
+/**
+ * Best-effort initialization of `code_search_fts`. Returns `false` cleanly if SQLite
+ * was built without FTS5 so callers can fall back to `code_search_files`.
+ */
+export function tryEnableCodeSearchFts(
+  db: DatabaseSync,
+  ftsSql: string = CODE_SEARCH_FTS_SQL,
+): boolean {
+  if (ftsSql === CODE_SEARCH_FTS_SQL && hasCodeSearchFts(db)) return true;
+  const sp = "sp_fts5_init";
+  const inTx = db.isTransaction;
+  db.exec(inTx ? `SAVEPOINT ${sp}` : "BEGIN IMMEDIATE");
+  try {
+    db.exec(ftsSql);
+    db.exec(inTx ? `RELEASE SAVEPOINT ${sp}` : "COMMIT");
+    return true;
+  } catch (error) {
+    db.exec(inTx ? `ROLLBACK TO SAVEPOINT ${sp}; RELEASE SAVEPOINT ${sp}` : "ROLLBACK");
+    const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    if (msg.includes("fts5") || msg.includes("no such module")) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function readMetaSchemaVersion(db: DatabaseSync): number {
@@ -271,6 +315,9 @@ export function runSchemaMigrations(
   if (fromVersion === 0) {
     runInTransaction(db, "schema_init", () => {
       db.exec(SCHEMA_SQL);
+      if (targetVersion >= 6) {
+        tryEnableCodeSearchFts(db);
+      }
       setSchemaVersion(db, targetVersion);
     });
     return { fromVersion: 0, toVersion: targetVersion, applied: [] };

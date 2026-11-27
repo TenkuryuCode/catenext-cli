@@ -274,7 +274,10 @@ describe("server MCP catenext", () => {
     });
     expect(res.isError).toBeFalsy();
     const first = (res as { content: { text: string }[] }).content[0]?.text ?? "{}";
-    expect(JSON.parse(first)).toEqual({ path: ".catenext/skills/db-migrations.md", created: true });
+    expect(JSON.parse(first)).toEqual({
+      path: join(".catenext", "skills", "db-migrations.md"),
+      created: true,
+    });
     expect(textOf(res)).toMatch(/disensor|REDACTED|secret/i);
     const file = await readFile(join(dir, ".catenext/skills/db-migrations.md"), "utf8");
     expect(file).toContain("name: db-migrations");
@@ -386,5 +389,39 @@ describe("server MCP catenext", () => {
     const worker = await setup(undefined, undefined, "worker");
     const workerList = await worker.client.listTools();
     expect(workerList.tools.map((t) => t.name).sort()).toEqual([...ROLE_TOOLS.worker].sort());
+  });
+
+  it("menangani onframeerror, onparseerror, dan kegagalan transport.send tanpa unhandled rejection", async () => {
+    const logs: string[] = [];
+    const sent: unknown[] = [];
+    let failSend = false;
+    const server = createCatenextMcpServer({
+      version: "test",
+      context: async () => ({ ok: false, error: "not init" }),
+      log: (m) => logs.push(m),
+    });
+    const fakeTransport: McpTransport = {
+      async start() {},
+      async close() {},
+      async send(msg) {
+        if (failSend) throw new Error("EPIPE");
+        sent.push(msg);
+      },
+    };
+    await server.connect(fakeTransport);
+
+    fakeTransport.onparseerror?.();
+    fakeTransport.onframeerror?.(new Error("Frame too large"));
+    await Promise.resolve();
+    expect(sent).toEqual([
+      { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error." } },
+      { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Frame too large" } },
+    ]);
+
+    failSend = true;
+    fakeTransport.onmessage?.({ jsonrpc: "2.0", id: 9, method: "ping" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(logs.some((l) => l.includes("EPIPE"))).toBe(true);
+    await server.close();
   });
 });

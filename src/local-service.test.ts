@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   type CatenextConfig,
@@ -513,7 +514,7 @@ describe("LocalService approval gate", () => {
     const realDir = join(root, "real-dir");
     const linkDir = join(root, "link-dir");
     await mkdir(realDir);
-    await symlink(realDir, linkDir);
+    await symlink(realDir, linkDir, "junction");
     await expect(
       service.callTool("manage_roots", { action: "add", path: linkDir }),
     ).rejects.toMatchObject({ code: "permission_denied" });
@@ -1133,7 +1134,7 @@ describe("LocalService state persistence", () => {
       const { stdout } = await exec(
         process.execPath,
         ["--import", "tsx", "--input-type=module", "--eval", script, name, JSON.stringify(input)],
-        { cwd: dirname(new URL("../package.json", import.meta.url).pathname) },
+        { cwd: fileURLToPath(new URL("..", import.meta.url)) },
       );
       return JSON.parse(stdout);
     };

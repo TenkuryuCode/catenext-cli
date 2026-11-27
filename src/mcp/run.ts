@@ -1,4 +1,5 @@
 import { ConfigError, findProjectRoot, readConfig } from "../config.js";
+import { checkpointDatabaseFile } from "../db/open.js";
 import { LocalService } from "../local-service.js";
 import { type McpRole, mcpCrudEnabled } from "./catalog.js";
 import { createCatenextMcpServer, type ServerContext } from "./server.js";
@@ -24,6 +25,7 @@ export async function runMcpServer(opts: {
 }) {
   const allowCrud = mcpCrudEnabled(opts.role, opts.allowCrud);
   let cached: Promise<ServerContext> | undefined;
+  let stateFile: string | undefined;
 
   const load = async (): Promise<ServerContext> => {
     try {
@@ -44,6 +46,7 @@ export async function runMcpServer(opts: {
       const config = await readConfig(root);
       // MCP selalu agen: approve/approve_plan ditolak di LocalService.
       const service = new LocalService(root, config, "agent", { allowCrud });
+      stateFile = service.stateFile;
       process.stderr.write(
         `[catenext] repo "${config.repo_name}" (project ${config.project_id}) dari ${root}\n`,
       );
@@ -71,5 +74,44 @@ export async function runMcpServer(opts: {
       }
     },
   });
+
+  let shuttingDown = false;
+  const runCheckpoint = () => {
+    if (!stateFile) return;
+    try {
+      checkpointDatabaseFile(stateFile, { onlyIfSidecarExists: true });
+    } catch {
+      /* ignore checkpoint errors on shutdown */
+    }
+  };
+
+  const onBeforeExit = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    void server.close().catch(() => undefined);
+    runCheckpoint();
+  };
+
+  const onSignal = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.off("beforeExit", onBeforeExit);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    void server
+      .close()
+      .catch(() => undefined)
+      .finally(() => {
+        runCheckpoint();
+        process.exit(0);
+      });
+  };
+
+  process.once("beforeExit", onBeforeExit);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
   await server.connect(new StdioServerTransport());
 }

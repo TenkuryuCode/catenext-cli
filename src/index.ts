@@ -12,7 +12,15 @@ import {
   SUPPORTED_PLATFORMS,
 } from "@catenext/shared";
 import { Command, InvalidArgumentError } from "commander";
-import { ConfigError, configuredPlatforms, findProjectRoot, readConfig } from "./config.js";
+import { BackupError, backupDatabase, restoreDatabase } from "./backup.js";
+import {
+  ConfigError,
+  configuredPlatforms,
+  findProjectRoot,
+  readConfig,
+  stateFilePath,
+} from "./config.js";
+import { checkpointDatabaseFile } from "./db/open.js";
 import { formatDoctorReport, runDoctor } from "./doctor.js";
 import {
   type ClaimOptions,
@@ -112,7 +120,8 @@ async function friendly(fn: () => Promise<void>) {
       err instanceof SkillError ||
       err instanceof PlanningInputError ||
       err instanceof TemplateBundleError ||
-      err instanceof WorktreeError
+      err instanceof WorktreeError ||
+      err instanceof BackupError
     ) {
       console.error(`✗ ${err.message}`);
       process.exitCode = 1;
@@ -1346,6 +1355,55 @@ program
   });
 
 program
+  .command("backup")
+  .description("Create a consistent SQLite snapshot of local Catenext state (0600)")
+  .argument("<out>", "Output backup file path")
+  .option("--force", "Overwrite existing non-empty target file")
+  .option("--json", "Print machine-readable JSON output")
+  .action((out: string, opts: { force?: boolean; json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot(true);
+      const config = await readConfig(root);
+      const result = await backupDatabase({
+        stateFile: stateFilePath(root, config),
+        outPath: out,
+        force: Boolean(opts.force),
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`✓ Backup written to ${result.out} (${result.bytes} bytes)`);
+    }),
+  );
+
+program
+  .command("restore")
+  .description("Validate and restore local Catenext SQLite state from a backup")
+  .argument("<file>", "Source backup SQLite file path")
+  .option("--force", "Replace existing SQLite state after saving a timestamped safety copy")
+  .option("--json", "Print machine-readable JSON output")
+  .action((file: string, opts: { force?: boolean; json?: boolean }) =>
+    friendly(async () => {
+      const root = await requireRoot(true);
+      const config = await readConfig(root);
+      const result = await restoreDatabase({
+        stateFile: stateFilePath(root, config),
+        fromPath: file,
+        force: Boolean(opts.force),
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`✓ State restored to ${result.stateFile} (schema v${result.schemaVersion})`);
+      if (result.safetyBackup) {
+        console.log(`  Safety backup saved: ${result.safetyBackup}`);
+      }
+    }),
+  );
+
+program
   .command("mcp")
   .description("Jalankan server MCP lokal (stdio)")
   .option(
@@ -1382,5 +1440,24 @@ program
       throw err;
     }
   });
+
+const READ_ONLY_OR_DAEMON_TOP_COMMANDS = new Set(["doctor", "watch", "mcp", "config", "verify"]);
+
+program.hook("postAction", async (_thisCommand, actionCommand) => {
+  if (
+    actionCommand.parent === program &&
+    READ_ONLY_OR_DAEMON_TOP_COMMANDS.has(actionCommand.name())
+  ) {
+    return;
+  }
+  try {
+    const root = await findProjectRoot(undefined, { managedWorktree: true });
+    if (!root) return;
+    const config = await readConfig(root);
+    checkpointDatabaseFile(stateFilePath(root, config), { onlyIfSidecarExists: true });
+  } catch {
+    /* ignore shutdown checkpoint errors; never fail CLI exit */
+  }
+});
 
 await program.parseAsync();

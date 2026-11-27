@@ -84,13 +84,15 @@ describe("openDatabaseAt WAL & readOnly mode", () => {
       db.close();
     }
 
-    const dbStat = await stat(dbPath);
-    expect(dbStat.mode & 0o777).toBe(0o600);
-    if (existsSync(`${dbPath}-wal`)) {
-      expect((await stat(`${dbPath}-wal`)).mode & 0o777).toBe(0o600);
-    }
-    if (existsSync(`${dbPath}-shm`)) {
-      expect((await stat(`${dbPath}-shm`)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      const dbStat = await stat(dbPath);
+      expect(dbStat.mode & 0o777).toBe(0o600);
+      if (existsSync(`${dbPath}-wal`)) {
+        expect((await stat(`${dbPath}-wal`)).mode & 0o777).toBe(0o600);
+      }
+      if (existsSync(`${dbPath}-shm`)) {
+        expect((await stat(`${dbPath}-shm`)).mode & 0o777).toBe(0o600);
+      }
     }
   });
 
@@ -226,13 +228,30 @@ describe("LocalStore lock metadata & stale lock recovery", () => {
     const target = join(dir, "other.txt");
     await writeFile(target, "x");
     const lockPath = `${dbPath}.lock`;
-    await symlink(target, lockPath);
-
     const store = new LocalStore(dbPath, { lockTimeoutMs: 200, staleLockMs: 50 });
-    await expect(store.transaction(projectId, "catenext", () => {})).rejects.toMatchObject({
-      code: "invalid_state_file",
-    });
-    await rm(lockPath, { force: true });
+
+    let symlinkCreated = false;
+    try {
+      await symlink(target, lockPath);
+      symlinkCreated = true;
+    } catch (error) {
+      if (
+        !(
+          process.platform === "win32" &&
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "EPERM"
+        )
+      ) {
+        throw error;
+      }
+    }
+    if (symlinkCreated) {
+      await expect(store.transaction(projectId, "catenext", () => {})).rejects.toMatchObject({
+        code: "invalid_state_file",
+      });
+      await rm(lockPath, { force: true });
+    }
 
     const db = openDatabaseAt(dbPath);
     db.close();

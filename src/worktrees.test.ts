@@ -15,7 +15,9 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  for (const path of tempDirs.splice(0)) await rm(path, { recursive: true, force: true });
+  for (const path of tempDirs.splice(0)) {
+    await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 });
 
 function git(cwd: string, ...args: string[]) {
@@ -110,6 +112,7 @@ it.each(["change", "remove"])(
     expect(git(root, "branch", "--show-current")).toBe("main");
     expect(git(root, "show-ref", "--verify", `refs/heads/${flags.branch}`)).toContain(flags.branch);
   },
+  20_000,
 );
 
 it("prune protects an active worktree and previews an orphan before applying", async () => {
@@ -122,7 +125,10 @@ it("prune protects an active worktree and previews an orphan before applying", a
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
   await taskClaim(service, id, active);
-  expect(log.mock.calls.at(-1)?.[0]).toContain(active.path);
+  const claimed = JSON.parse(String(log.mock.calls.at(-1)?.[0] ?? "{}")) as {
+    worktree?: { worktree_path?: string };
+  };
+  expect(claimed.worktree?.worktree_path).toBe(active.path);
   expect(await findProjectRoot(active.path, { managedWorktree: true })).toBe(root);
   // A rejected claim leaves its checkout for explicit recovery; it never takes a second lease.
   await expect(taskClaim(service, id, orphan)).rejects.toMatchObject({ code: "already_claimed" });
@@ -160,7 +166,7 @@ it("prune protects an active worktree and previews an orphan before applying", a
   expect(git(root, "show-ref", "--verify", `refs/heads/${removable.branch}`)).toContain(
     removable.branch,
   );
-});
+}, 30_000);
 
 it("rechecks lease state after preview while waiting for the writer lock", async () => {
   const { root, service, newTask, opts, options } = await fixture();
@@ -192,5 +198,7 @@ it("rechecks lease state after preview while waiting for the writer lock", async
     expect.objectContaining({ path: draft.path, eligible: true }),
   );
   expect(result).toMatchObject({ removed: [], skipped: [draft.path] });
-  expect(git(root, "worktree", "list", "--porcelain")).toContain(draft.path);
-});
+  expect(git(root, "worktree", "list", "--porcelain").replaceAll("\\", "/")).toContain(
+    draft.path.replaceAll("\\", "/"),
+  );
+}, 20_000);

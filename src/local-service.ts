@@ -1981,7 +1981,11 @@ class LocalWorkflow {
         })),
       };
       try {
-        const res = await searchLocalCode(this.root, input.query, input.limit, rootOpts);
+        const res = await searchLocalCode(this.root, input.query, input.limit, {
+          ...rootOpts,
+          db: this.db,
+          projectId: this.config.project_id,
+        });
         codeHits = res.hits;
         degraded = res.degraded;
         if (codeHits.length === 0) {

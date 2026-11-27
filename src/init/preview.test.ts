@@ -29,9 +29,9 @@ it("previews matched seed personas and agent stubs without IO beyond planning", 
   expect(preview.personaAliases).toEqual(expect.arrayContaining(["be", "reviewer"]));
   expect(preview.stubEdits.map((e) => e.path)).toEqual(
     expect.arrayContaining([
-      ".claude/agents/orchestrator.md",
-      ".cursor/agents/orchestrator.md",
-      ".claude/agents/be.md",
+      join(".claude", "agents", "orchestrator.md"),
+      join(".cursor", "agents", "orchestrator.md"),
+      join(".claude", "agents", "be.md"),
     ]),
   );
   const lines = formatInitDryRunPreview(preview);

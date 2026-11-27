@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
   briefText,
@@ -105,10 +105,10 @@ export async function readGitState(cwd: string = process.cwd()): Promise<GitStat
   const dirty = (await git(["diff", "--name-only", "HEAD"], cwd)) ?? "";
   const porcelain = (await gitRaw(["status", "--porcelain"], cwd)) ?? "";
   const dirtyFiles = [
-    ...new Set([...dirty.split("\n").filter(Boolean), ...parsePorcelainPaths(porcelain)]),
+    ...new Set([...dirty.split(/\r?\n/).filter(Boolean), ...parsePorcelainPaths(porcelain)]),
   ];
   const changedFiles = [
-    ...new Set([...dirty.split("\n"), ...lastCommit.split("\n")].filter(Boolean)),
+    ...new Set([...dirty.split(/\r?\n/), ...lastCommit.split(/\r?\n/)].filter(Boolean)),
   ];
   return { branch, commit, changedFiles, ...(dirtyFiles.length ? { dirtyFiles } : {}) };
 }
@@ -272,9 +272,8 @@ export async function taskClaim(service: LocalService, taskId: string, opts: Cla
   const branch = opts.worktree ? await git(["symbolic-ref", "--short", "HEAD"], cwd) : null;
   if (opts.worktree && !branch)
     throw new PlanningInputError("Checkout branch kerja sebelum memakai --worktree.");
-  const worktreeRoot = opts.worktree
-    ? ((await git(["rev-parse", "--show-toplevel"], cwd)) ?? cwd)
-    : undefined;
+  const rawTop = opts.worktree ? await git(["rev-parse", "--show-toplevel"], cwd) : null;
+  const worktreeRoot = opts.worktree ? (rawTop ? resolve(rawTop) : cwd) : undefined;
   const managed = worktreeRoot ? (await readManagedWorktree(worktreeRoot))?.marker : undefined;
   const sessionId =
     managed?.session_id ??

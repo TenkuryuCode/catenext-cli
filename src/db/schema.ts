@@ -1,6 +1,31 @@
-/** SQLite DDL for local Catenext orchestration (schema version 5). */
+/** SQLite DDL for local Catenext orchestration (schema version 6). */
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
+
+export const CODE_SEARCH_FILES_SQL = `
+CREATE TABLE IF NOT EXISTS code_search_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  root_id TEXT,
+  path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  mtime_ms INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  UNIQUE (project_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_search_files_project
+  ON code_search_files(project_id);
+`;
+
+export const CODE_SEARCH_FTS_SQL = `
+CREATE VIRTUAL TABLE IF NOT EXISTS code_search_fts USING fts5(
+  path,
+  content,
+  tokens,
+  tokenize = 'unicode61'
+);
+`;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -166,4 +191,6 @@ CREATE INDEX IF NOT EXISTS idx_task_events_project_task_created
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project_id, kind);
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(project_id, path);
+
+${CODE_SEARCH_FILES_SQL}
 `;

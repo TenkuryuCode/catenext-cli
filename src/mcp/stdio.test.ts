@@ -2,7 +2,7 @@ import { PassThrough } from "node:stream";
 import type { McpToolName } from "@catenext/shared";
 import { describe, expect, it } from "vitest";
 import { createCatenextMcpServer, LOCAL_TOOLS, type ServerContext } from "./server.js";
-import { ReadBuffer, StdioServerTransport } from "./stdio.js";
+import { ReadBuffer, StdioBufferError, StdioServerTransport } from "./stdio.js";
 
 function createTestServer(ctxOverride?: ServerContext) {
   const calls: Array<{ name: McpToolName; body: unknown }> = [];
@@ -24,13 +24,14 @@ async function sendAndCollect(
   lines: string[],
   expectedResponses: number,
   ctxOverride?: ServerContext,
+  transportOptions?: { maxBufferSize?: number; maxLineSize?: number },
 ) {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const errors: Error[] = [];
   const received: Array<Record<string, unknown>> = [];
 
-  const transport = new StdioServerTransport(stdin, stdout);
+  const transport = new StdioServerTransport(stdin, stdout, transportOptions);
   const { server, calls } = createTestServer(ctxOverride);
 
   let outBuf = "";
@@ -46,7 +47,7 @@ async function sendAndCollect(
     );
     stdout.on("data", (chunk: Buffer) => {
       outBuf += chunk.toString("utf8");
-      const parts = outBuf.split("\n");
+      const parts = outBuf.split(/\r?\n/);
       outBuf = parts.pop() ?? "";
       for (const part of parts) {
         if (!part.trim()) continue;
@@ -94,6 +95,93 @@ describe("ReadBuffer & StdioServerTransport", () => {
   it("menolak chunk yang melampaui maxBufferSize", () => {
     const rb = new ReadBuffer({ maxBufferSize: 16 });
     expect(() => rb.append("x".repeat(17))).toThrow(/maximum size/i);
+    expect(() => new ReadBuffer({ maxBufferSize: 0 })).toThrow(RangeError);
+    expect(() => new ReadBuffer({ maxBufferSize: 16, maxLineSize: 32 })).toThrow(RangeError);
+  });
+
+  it("menolak baris yang melampaui maxLineSize tanpa membocorkan buffer ke baris berikutnya", () => {
+    const rb = new ReadBuffer({ maxBufferSize: 100, maxLineSize: 16 });
+    rb.append(`${"x".repeat(20)}\n{"ok":true}\n`);
+    expect(() => rb.readLine()).toThrow(StdioBufferError);
+    expect(rb.readLine()).toBe('{"ok":true}');
+    expect(rb.readLine()).toBeNull();
+
+    // Incomplete oversized line clears buffer immediately
+    rb.append("y".repeat(20));
+    expect(() => rb.readLine()).toThrow(StdioBufferError);
+    expect(rb.readLine()).toBeNull();
+  });
+
+  it("mengembalikan JSON-RPC -32600 saat frame atau buffer melampaui batas dan tetap melayani request berikutnya", async () => {
+    const oversizedLine = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ping",
+      params: { pad: "a".repeat(200) },
+    });
+    const ping = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" });
+
+    // Case 1: line > maxLineSize (120) while total chunk <= maxBufferSize (512)
+    const lineLimit = await sendAndCollect([`${oversizedLine}\n`, `${ping}\n`], 2, undefined, {
+      maxBufferSize: 512,
+      maxLineSize: 120,
+    });
+    expect(lineLimit.errors).toHaveLength(1);
+    expect(lineLimit.received).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: expect.stringMatching(/maximum size/i) },
+      },
+      { jsonrpc: "2.0", id: 2, result: {} },
+    ]);
+
+    // Case 2: multi-chunk incomplete oversized line (> maxLineSize) discarded until newline, then recovers
+    const chunkedLimit = await sendAndCollect(
+      ["a".repeat(80), "b".repeat(80), "c".repeat(80), "\n", `${ping}\n`],
+      2,
+      undefined,
+      { maxBufferSize: 512, maxLineSize: 120 },
+    );
+    expect(chunkedLimit.errors).toHaveLength(1);
+    expect(chunkedLimit.received).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: expect.stringMatching(/maximum size/i) },
+      },
+      { jsonrpc: "2.0", id: 2, result: {} },
+    ]);
+
+    // Case 3: single chunk > maxBufferSize (120) returns -32600 and recovers on next valid message
+    const bufferLimit = await sendAndCollect([`${oversizedLine}\n`, `${ping}\n`], 2, undefined, {
+      maxBufferSize: 120,
+      maxLineSize: 120,
+    });
+    expect(bufferLimit.errors).toHaveLength(1);
+    expect(bufferLimit.received).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: expect.stringMatching(/maximum size/i) },
+      },
+      { jsonrpc: "2.0", id: 2, result: {} },
+    ]);
+  });
+
+  it("menolak send setelah close dan menangani error stdout tanpa crash", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const transport = new StdioServerTransport(stdin, stdout);
+    const errors: Error[] = [];
+    transport.onerror = (err) => errors.push(err);
+    await transport.start();
+    stdout.emit("error", new Error("broken pipe"));
+    expect(errors.map((e) => e.message)).toContain("broken pipe");
+    await transport.close();
+    await expect(transport.send({ jsonrpc: "2.0", id: 1, result: {} })).rejects.toThrow(/closed/i);
+    stdin.end();
+    stdout.end();
   });
 
   it("melayani initialize, notifications/initialized, ping, tools/list, dan tools/call lewat NDJSON", async () => {

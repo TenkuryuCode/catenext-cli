@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { CatenextConfigSchema } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalService } from "../local-service.js";
+import { DEFAULT_MAX_FILE_BYTES } from "../workspace-walk.js";
 import {
   graphNeighbors,
   indexProjectGraph,
@@ -132,11 +133,14 @@ describe("resolveImport & parseImports", () => {
   });
 });
 
-describe("walk dot-dir skip", () => {
-  it("skips .next, .venv, .git, .catenext, node_modules, and dist directories", async () => {
+describe("walk dot-dir skip, gitignore, size cap & symlink boundary", () => {
+  it("skips .next, .venv, .nuxt, target, out, .git, .catenext, node_modules, and dist directories", async () => {
     for (const dir of [
       ".next/server",
       ".venv/lib",
+      ".nuxt/dist",
+      "target/debug",
+      "out/static",
       ".git/hooks",
       ".catenext",
       "node_modules/pkg",
@@ -147,6 +151,9 @@ describe("walk dot-dir skip", () => {
     }
     await writeFile(join(root, ".next/server/app.js"), "export function bad1() {}\n");
     await writeFile(join(root, ".venv/lib/site.py"), "def bad2():\n  pass\n");
+    await writeFile(join(root, ".nuxt/dist/entry.js"), "export function badNuxt() {}\n");
+    await writeFile(join(root, "target/debug/main.rs"), "pub fn bad_rust() {}\n");
+    await writeFile(join(root, "out/static/chunk.js"), "export function badOut() {}\n");
     await writeFile(join(root, ".git/hooks/pre.js"), "export function bad3() {}\n");
     await writeFile(join(root, ".catenext/gen.ts"), "export function bad4() {}\n");
     await writeFile(join(root, "node_modules/pkg/index.js"), "export function bad5() {}\n");
@@ -159,6 +166,90 @@ describe("walk dot-dir skip", () => {
     expect(symbolSearch(dbPath, projectId, "goodFn", 20)).toEqual([
       { name: "goodFn", kind: "function", path: "src/good.ts", line: 1 },
     ]);
+  });
+
+  it("honors root and nested .gitignore rules including negation", async () => {
+    await mkdir(join(root, "src/gen"), { recursive: true });
+    await writeFile(
+      join(root, ".gitignore"),
+      ["*.gen.ts", "src/gen/*", "!src/gen/keep.ts", ""].join("\n"),
+    );
+    await writeFile(join(root, "src/ignored.gen.ts"), "export function ignoredGen() {}\n");
+    await writeFile(join(root, "src/gen/drop.ts"), "export function droppedGen() {}\n");
+    await writeFile(join(root, "src/gen/keep.ts"), "export function keptGen() {}\n");
+
+    await mkdir(join(root, "src/nested"), { recursive: true });
+    await writeFile(join(root, "src/nested/.gitignore"), "skip.ts\n");
+    await writeFile(join(root, "src/nested/skip.ts"), "export function nestedSkip() {}\n");
+    await writeFile(join(root, "src/nested/ok.ts"), "export function nestedOk() {}\n");
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(2);
+    expect(symbolSearch(dbPath, projectId, "ignoredGen", 10)).toEqual([]);
+    expect(symbolSearch(dbPath, projectId, "droppedGen", 10)).toEqual([]);
+    expect(symbolSearch(dbPath, projectId, "nestedSkip", 10)).toEqual([]);
+    expect(symbolSearch(dbPath, projectId, "keptGen", 10).map((h) => h.name)).toEqual(["keptGen"]);
+    expect(symbolSearch(dbPath, projectId, "nestedOk", 10).map((h) => h.name)).toEqual([
+      "nestedOk",
+    ]);
+  });
+
+  it("skips oversized files exceeding max file byte cap before readFile", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/normal.ts"), "export function normalSizedFn() {}\n");
+    await writeFile(
+      join(root, "src/oversized.ts"),
+      `export function oversizedFn() {}\n// ${"a".repeat(DEFAULT_MAX_FILE_BYTES + 64)}\n`,
+    );
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(1);
+    expect(symbolSearch(dbPath, projectId, "oversizedFn", 10)).toEqual([]);
+    expect(symbolSearch(dbPath, projectId, "normalSizedFn", 10)).toHaveLength(1);
+  });
+
+  it("rejects symlink loops and symlink escapes outside workspace root", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "catenext-graph-outside-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      await writeFile(join(root, "src/safe.ts"), "export function safeGraphFn() {}\n");
+      await writeFile(join(outside, "leak.ts"), "export function escapedGraphFn() {}\n");
+
+      let hasFileSymlink = false;
+      try {
+        await symlink(join(outside, "leak.ts"), join(root, "src/escape.ts"));
+        hasFileSymlink = true;
+      } catch (error) {
+        if (
+          !(
+            process.platform === "win32" &&
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "EPERM"
+          )
+        ) {
+          throw error;
+        }
+      }
+      await symlink(outside, join(root, "src/escape-dir"), "junction");
+      await symlink(join(root, "src"), join(root, "src/loop"), "junction");
+
+      const res = await indexProjectGraph(dbPath, projectId, root);
+      expect(res.files).toBe(1);
+      expect(symbolSearch(dbPath, projectId, "escapedGraphFn", 10)).toEqual([]);
+      expect(symbolSearch(dbPath, projectId, "safeGraphFn", 10)).toHaveLength(1);
+      if (hasFileSymlink) {
+        expect(resolveImport(join(root, "src/safe.ts"), "./escape", root)).not.toBe(
+          "src/escape.ts",
+        );
+      }
+      expect(resolveImport(join(root, "src/safe.ts"), "./escape-dir/leak", root)).not.toBe(
+        "src/escape-dir/leak.ts",
+      );
+      expect(resolveImport(join(root, "src/safe.ts"), "../../outside/leak", root)).toBeNull();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
 

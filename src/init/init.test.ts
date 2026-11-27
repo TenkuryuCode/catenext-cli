@@ -12,13 +12,14 @@ import { CURSOR_WORKSPACE_FOLDER, inspectMcp, selectedAdapters } from "./mcp-con
 const CMD = { command: "node", args: ["cli.js"] };
 const PROJECT = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 const PLATFORMS: PlatformId[] = [...DEFAULT_PLATFORMS, "opencode", "vscode"];
+const REPO_DIR = process.platform === "win32" ? "Repo (spaces)" : 'Repo "spaces"';
 let workspace: string;
 let root: string;
 let home: string;
 
 beforeEach(async () => {
   workspace = await mkdtemp(join(tmpdir(), "catenext-init-"));
-  root = join(workspace, 'Repo "spaces"');
+  root = join(workspace, REPO_DIR);
   home = join(workspace, "fake-home");
   await mkdir(root);
   await mkdir(join(home, ".gemini", "config"), { recursive: true });
@@ -55,7 +56,7 @@ it("plans default adapters without writing, then applies repo-scoped launches", 
   const config = await readConfig(root);
   expect(config).toMatchObject({
     repo_name: "repo-spaces",
-    project_name: 'Repo "spaces"',
+    project_name: REPO_DIR,
     stack: ["node", "hono"],
     platforms: DEFAULT_PLATFORMS,
   });
@@ -146,7 +147,7 @@ it("refuses broken configs, foreign entires, symlink paths and global-only Winds
   await expect(planInit({ root, platforms: ["claude-code"], mcpCommand: CMD })).rejects.toThrow(
     /JSON/,
   );
-  await symlink(join(home, ".gemini/config"), join(root, ".agents"), "dir");
+  await symlink(join(home, ".gemini/config"), join(root, ".agents"), "junction");
   await expect(planInit({ root, platforms: ["antigravity"], mcpCommand: CMD })).rejects.toThrow(
     /symlink/,
   );

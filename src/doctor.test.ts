@@ -329,7 +329,7 @@ describe("doctor", () => {
         id: "skills.invalid.raw",
         status: "warning",
         message: expect.stringContaining("tidak punya frontmatter"),
-        path: ".catenext/skills/raw.md",
+        path: join(".catenext", "skills", "raw.md"),
       }),
     );
     const text = formatDoctorReport(report);
