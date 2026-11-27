@@ -353,4 +353,86 @@ describe("local code search", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("indexes polyglot files (.php, .blade.php, .vue, .svelte, .astro, .graphql, .proto) via FTS5 and cleans standalone WAL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-code-polyglot-"));
+    try {
+      await mkdir(join(root, "app/Services"), { recursive: true });
+      await mkdir(join(root, "resources/views"), { recursive: true });
+      await mkdir(join(root, "src/components"), { recursive: true });
+      await mkdir(join(root, "schema"), { recursive: true });
+
+      await writeFile(
+        join(root, "app/Services/InvoiceMailer.php"),
+        "<?php\nnamespace App\\Services;\nclass InvoiceMailer { public function sendInvoiceReceipt(): void {} }\n",
+      );
+      await writeFile(
+        join(root, "resources/views/invoice.blade.php"),
+        "<div>{{ $invoiceTotalBanner }}</div>\n",
+      );
+      await writeFile(
+        join(root, "src/components/InvoiceCard.vue"),
+        '<script setup lang="ts">\nconst renderVueInvoiceWidget = true;\n</script>\n',
+      );
+      await writeFile(
+        join(root, "src/components/Badge.svelte"),
+        '<script lang="ts">\nexport const svelteStatusBadge = "paid";\n</script>\n',
+      );
+      await writeFile(
+        join(root, "src/components/Layout.astro"),
+        "---\nconst astroPageShell = true;\n---\n<slot />\n",
+      );
+      await writeFile(
+        join(root, "schema/billing.graphql"),
+        "type BillingSummary { invoiceCount: Int! }\n",
+      );
+      await writeFile(
+        join(root, "schema/billing.proto"),
+        "message InvoiceCreatedEvent { string invoice_id = 1; }\n",
+      );
+
+      const phpRes = await searchLocalCode(root, "sendInvoiceReceipt");
+      expect(phpRes.degraded).toBe(false);
+      expect(phpRes.hits.map((h) => h.ref)).toEqual(["app/Services/InvoiceMailer.php"]);
+
+      const bladeRes = await searchLocalCode(root, "invoiceTotalBanner");
+      expect(bladeRes.degraded).toBe(false);
+      expect(bladeRes.hits.map((h) => h.ref)).toEqual(["resources/views/invoice.blade.php"]);
+
+      const vueRes = await searchLocalCode(root, "renderVueInvoiceWidget");
+      expect(vueRes.degraded).toBe(false);
+      expect(vueRes.hits.map((h) => h.ref)).toEqual(["src/components/InvoiceCard.vue"]);
+
+      expect((await searchLocalCode(root, "svelteStatusBadge")).hits.map((h) => h.ref)).toEqual([
+        "src/components/Badge.svelte",
+      ]);
+      expect((await searchLocalCode(root, "astroPageShell")).hits.map((h) => h.ref)).toEqual([
+        "src/components/Layout.astro",
+      ]);
+      expect((await searchLocalCode(root, "BillingSummary")).hits.map((h) => h.ref)).toEqual([
+        "schema/billing.graphql",
+      ]);
+      expect((await searchLocalCode(root, "InvoiceCreatedEvent")).hits.map((h) => h.ref)).toEqual([
+        "schema/billing.proto",
+      ]);
+
+      // Standalone WAL sidecars are checkpointed and removed on close
+      const dbPath = join(root, ".catenext/cache/code-search.sqlite");
+      expect(existsSync(`${dbPath}-wal`)).toBe(false);
+      expect(existsSync(`${dbPath}-shm`)).toBe(false);
+
+      // Verify data is durable in main sqlite file when opened read-only
+      const roDb = openDatabaseAt(dbPath, { readOnly: true });
+      try {
+        const count = (
+          roDb.prepare("SELECT COUNT(*) AS c FROM code_search_files").get() as { c: number }
+        ).c;
+        expect(count).toBe(7);
+      } finally {
+        roDb.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

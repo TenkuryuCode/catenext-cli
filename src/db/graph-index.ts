@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { collectRootTargets } from "../workspace-roots.js";
 import {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_SKIP_DIRS,
   isSafeRegularFileSync,
+  isWithinRoot,
   readBoundedUtf8File,
   walkWorkspaceFiles,
 } from "../workspace-walk.js";
-import { openDatabaseAt } from "./open.js";
+import { checkpointWalAndClose, openDatabaseAt } from "./open.js";
 
 const CODE_EXT = new Set([
   ".ts",
@@ -26,9 +27,13 @@ const CODE_EXT = new Set([
   ".rs",
   ".java",
   ".kt",
+  ".php",
+  ".vue",
+  ".svelte",
 ]);
 
 const TS_JS_EXT = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
+const SFC_EXT = new Set([".vue", ".svelte"]);
 
 const TS_JS_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
   [
@@ -68,11 +73,63 @@ const RUST_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
   [/^(?:pub(?:\s*\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Za-z_]\w*)/, "trait"],
 ];
 
+const PHP_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
+  [/^\s*namespace\s+([A-Za-z_][A-Za-z0-9_\\]*)\s*[;{]/, "namespace"],
+  [/^\s*(?:(?:abstract|final|readonly)\s+)*class\s+([A-Za-z_]\w*)/, "class"],
+  [/^\s*interface\s+([A-Za-z_]\w*)/, "interface"],
+  [/^\s*trait\s+([A-Za-z_]\w*)/, "trait"],
+  [/^\s*enum\s+([A-Za-z_]\w*)/, "enum"],
+  [
+    /^\s*(?:(?:public|protected|private|static|final|abstract)\s+)*function\s+&?([A-Za-z_]\w*)\s*\(/,
+    "function",
+  ],
+];
+
+const JAVA_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
+  [
+    /^\s*(?:(?:public|protected|private|abstract|final|static|sealed|non-sealed|strictfp)\s+)*(?:class|record)\s+([A-Za-z_]\w*)/,
+    "class",
+  ],
+  [
+    /^\s*(?:(?:public|protected|private|abstract|static|sealed|non-sealed)\s+)*@?interface\s+([A-Za-z_]\w*)/,
+    "interface",
+  ],
+  [/^\s*(?:(?:public|protected|private|static)\s+)*enum\s+([A-Za-z_]\w*)/, "enum"],
+  [
+    /^\s*(?:@[A-Za-z_]\w*(?:\([^)]*\))?\s+)*(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)*(?:<[^>{};]+>\s+)?(?:[^=;{}()]+\s+)?([A-Za-z_]\w*)\s*\(/,
+    "function",
+  ],
+  [
+    /^\s*(?!(?:return|throw|new|if|else|for|while|switch|catch|try|do|case|assert|package|import|super|this)\b)(?:<[^>{};]+>\s+)?[A-Za-z_][\w$.<>[\],\s?]*\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:throws\s+[A-Za-z0-9_.,\s]+)?(?:\{.*|;)\s*$/,
+    "function",
+  ],
+];
+
+const KOTLIN_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
+  [/^\s*(?:(?:public|private|protected|internal)\s+)*enum\s+class\s+([A-Za-z_]\w*)/, "enum"],
+  [
+    /^\s*(?:(?:public|private|protected|internal|sealed|fun)\s+)*interface\s+([A-Za-z_]\w*)/,
+    "interface",
+  ],
+  [
+    /^\s*(?:(?:public|private|protected|internal|open|abstract|final|sealed|data|inner|value|annotation|expect|actual)\s+)*class\s+([A-Za-z_]\w*)/,
+    "class",
+  ],
+  [/^\s*(?:(?:public|private|protected|internal|companion)\s+)*object\s+([A-Za-z_]\w*)/, "class"],
+  [
+    /^\s*(?:(?:public|private|protected|internal|override|open|final|abstract|suspend|inline|infix|operator|tailrec|external|expect|actual)\s+)*fun\s+(?:<[^>]+>\s+)?(?:[A-Za-z_][\w.<>?,\s]*\.)?([A-Za-z_]\w*)\s*(?:<[^>]+>)?\s*\(/,
+    "function",
+  ],
+];
+
 const ALL_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
   ...TS_JS_SYMBOL_PATTERNS,
   ...PYTHON_SYMBOL_PATTERNS,
   ...RUST_SYMBOL_PATTERNS,
   ...GO_SYMBOL_PATTERNS,
+  ...PHP_SYMBOL_PATTERNS,
+  ...KOTLIN_SYMBOL_PATTERNS,
+  ...JAVA_SYMBOL_PATTERNS,
 ];
 
 function hash(content: string): string {
@@ -93,7 +150,7 @@ function withDatabase<T>(dbOrPath: DatabaseSync | string, fn: (db: DatabaseSync)
   try {
     return fn(db);
   } finally {
-    db.close();
+    checkpointWalAndClose(db);
   }
 }
 
@@ -106,11 +163,38 @@ async function withDatabaseAsync<T>(
   try {
     return await fn(db);
   } finally {
-    db.close();
+    checkpointWalAndClose(db);
   }
 }
 
-export function parseImports(content: string): string[] {
+function extractSfcScriptBlocks(content: string): Array<{ code: string; startLine: number }> {
+  const blocks: Array<{ code: string; startLine: number }> = [];
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  for (const match of content.matchAll(re)) {
+    const attrs = match[1] ?? "";
+    const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']+)["']/i);
+    if (typeMatch?.[1]) {
+      const mime = typeMatch[1].trim().toLowerCase();
+      if (
+        mime !== "module" &&
+        mime !== "text/javascript" &&
+        mime !== "application/javascript" &&
+        mime !== "text/typescript" &&
+        mime !== "application/typescript"
+      ) {
+        continue;
+      }
+    }
+    const code = match[2] ?? "";
+    const openEnd = match[0].indexOf(">") + 1;
+    const codeStart = (match.index ?? 0) + openEnd;
+    const startLine = content.slice(0, codeStart).split(/\r?\n/).length;
+    blocks.push({ code, startLine });
+  }
+  return blocks;
+}
+
+function parseTsJsImports(content: string): string[] {
   const hits: string[] = [];
   const re =
     /(?:import|export)\s+(?:[^'";]+?\s+from\s+)?["']([^"']+)["']|(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
@@ -121,12 +205,383 @@ export function parseImports(content: string): string[] {
   return [...new Set(hits)];
 }
 
+function parsePhpImports(content: string): string[] {
+  const hits: string[] = [];
+  const groupRe =
+    /^\s*use\s+(?!(?:function|const)\b)([\\A-Za-z_][\\A-Za-z0-9_]*\\)\s*\{([^}]+)\}\s*;/gm;
+  for (const match of content.matchAll(groupRe)) {
+    const prefix = (match[1] ?? "").replace(/^\\+/, "");
+    const body = match[2] ?? "";
+    for (const rawItem of body.split(",")) {
+      const trimmed = rawItem.trim();
+      if (!trimmed || /^(?:function|const)\s+/i.test(trimmed)) continue;
+      const fqn = trimmed
+        .replace(/\s+as\s+[A-Za-z_]\w*$/i, "")
+        .replace(/^\\+/, "")
+        .trim();
+      if (fqn) hits.push(`${prefix}${fqn}`);
+    }
+  }
+
+  const singleRe =
+    /^\s*use\s+(?!(?:function|const)\b)([\\A-Za-z_][\\A-Za-z0-9_]*(?:\s+as\s+[A-Za-z_]\w*)?(?:\s*,\s*[\\A-Za-z_][\\A-Za-z0-9_]*(?:\s+as\s+[A-Za-z_]\w*)?)*)\s*;/gm;
+  for (const match of content.matchAll(singleRe)) {
+    const clause = match[1] ?? "";
+    for (const rawItem of clause.split(",")) {
+      const fqn = rawItem
+        .trim()
+        .replace(/\s+as\s+[A-Za-z_]\w*$/i, "")
+        .replace(/^\\+/, "")
+        .trim();
+      if (fqn) hits.push(fqn);
+    }
+  }
+  return [...new Set(hits)];
+}
+
+const MAX_GO_PACKAGE_FILES = 32;
+
+function stripGoComments(content: string): string {
+  let out = "";
+  let i = 0;
+  while (i < content.length) {
+    const ch = content[i] ?? "";
+    const next = content[i + 1] ?? "";
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < content.length && content[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < content.length && !(content[i] === "*" && content[i + 1] === "/")) {
+        if (content[i] === "\n") out += "\n";
+        i++;
+      }
+      i += 2;
+      out += " ";
+      continue;
+    }
+    if (ch === '"') {
+      out += ch;
+      i++;
+      while (i < content.length) {
+        const sc = content[i] ?? "";
+        out += sc;
+        i++;
+        if (sc === "\\") {
+          if (i < content.length) {
+            out += content[i] ?? "";
+            i++;
+          }
+          continue;
+        }
+        if (sc === '"') break;
+      }
+      continue;
+    }
+    if (ch === "`") {
+      out += ch;
+      i++;
+      while (i < content.length) {
+        const rc = content[i] ?? "";
+        out += rc;
+        i++;
+        if (rc === "`") break;
+      }
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function parseGoImports(content: string): string[] {
+  const cleaned = stripGoComments(content);
+  const hits: string[] = [];
+
+  const groupRe = /^\s*import\s*\(([\s\S]*?)\)/gm;
+  for (const match of cleaned.matchAll(groupRe)) {
+    const body = match[1] ?? "";
+    for (const strMatch of body.matchAll(/"([^"\n]+)"|`([^`\n]+)`/g)) {
+      const spec = (strMatch[1] ?? strMatch[2] ?? "").trim();
+      if (spec) hits.push(spec);
+    }
+  }
+
+  const singleRe = /^\s*import\s+(?:(?:[A-Za-z_]\w*|\.|_)\s+)?(?:"([^"\n]+)"|`([^`\n]+)`)/gm;
+  for (const match of cleaned.matchAll(singleRe)) {
+    const spec = (match[1] ?? match[2] ?? "").trim();
+    if (spec) hits.push(spec);
+  }
+
+  return [...new Set(hits)];
+}
+
+function sanitizeRustCode(content: string): string {
+  let out = "";
+  let i = 0;
+  while (i < content.length) {
+    const ch = content[i] ?? "";
+    const next = content[i + 1] ?? "";
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < content.length && content[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      let depth = 1;
+      i += 2;
+      while (i < content.length && depth > 0) {
+        if (content[i] === "/" && content[i + 1] === "*") {
+          depth++;
+          i += 2;
+          continue;
+        }
+        if (content[i] === "*" && content[i + 1] === "/") {
+          depth--;
+          i += 2;
+          continue;
+        }
+        if (content[i] === "\n") out += "\n";
+        i++;
+      }
+      out += " ";
+      continue;
+    }
+    if (ch === "r" && (next === '"' || next === "#")) {
+      let hashes = 0;
+      let j = i + 1;
+      while (j < content.length && content[j] === "#") {
+        hashes++;
+        j++;
+      }
+      if (content[j] === '"') {
+        j++;
+        while (j < content.length) {
+          if (content[j] === '"') {
+            let matchHashes = 0;
+            while (matchHashes < hashes && content[j + 1 + matchHashes] === "#") {
+              matchHashes++;
+            }
+            if (matchHashes === hashes) {
+              j += 1 + hashes;
+              break;
+            }
+          }
+          if (content[j] === "\n") out += "\n";
+          j++;
+        }
+        out += " ";
+        i = j;
+        continue;
+      }
+    }
+    if (ch === '"') {
+      i++;
+      while (i < content.length) {
+        const sc = content[i] ?? "";
+        i++;
+        if (sc === "\\") {
+          i++;
+          continue;
+        }
+        if (sc === "\n") out += "\n";
+        if (sc === '"') break;
+      }
+      out += " ";
+      continue;
+    }
+    if (ch === "'") {
+      if (next === "\\") {
+        let j = i + 2;
+        while (j < content.length && content[j] !== "'" && content[j] !== "\n") {
+          if (j - i > 8) break;
+          j++;
+        }
+        if (content[j] === "'") {
+          out += " ";
+          i = j + 1;
+          continue;
+        }
+      } else if (next && next !== "'" && content[i + 2] === "'") {
+        out += " ";
+        i += 3;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function expandRustUseTree(prefix: string, tree: string, out: string[]): void {
+  const cleaned = tree.trim();
+  if (!cleaned) return;
+  const braceStart = cleaned.indexOf("{");
+  if (braceStart === -1) {
+    let leaf = cleaned.replace(/\s+as\s+[A-Za-z_]\w*$/g, "").trim();
+    if (leaf === "*") {
+      if (prefix) out.push(prefix);
+      return;
+    }
+    if (leaf.endsWith("::*")) {
+      leaf = leaf.slice(0, -3).trim();
+    }
+    if (!leaf || leaf === "self") {
+      if (prefix) out.push(prefix);
+      return;
+    }
+    const full = prefix ? `${prefix}::${leaf}` : leaf;
+    out.push(full.replace(/^::+|::+$/g, ""));
+    return;
+  }
+
+  const head = cleaned
+    .slice(0, braceStart)
+    .replace(/::\s*$/, "")
+    .trim();
+  const nextPrefix = head ? (prefix ? `${prefix}::${head}` : head) : prefix;
+
+  let depth = 0;
+  let braceEnd = -1;
+  for (let i = braceStart; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        braceEnd = i;
+        break;
+      }
+    }
+  }
+  if (braceEnd === -1) return;
+
+  const inner = cleaned.slice(braceStart + 1, braceEnd);
+  const items: string[] = [];
+  let itemStart = 0;
+  let innerDepth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "{") innerDepth++;
+    else if (ch === "}") innerDepth--;
+    else if (ch === "," && innerDepth === 0) {
+      items.push(inner.slice(itemStart, i));
+      itemStart = i + 1;
+    }
+  }
+  items.push(inner.slice(itemStart));
+
+  for (const item of items) {
+    expandRustUseTree(nextPrefix, item, out);
+  }
+}
+
+function parseRustImports(content: string): string[] {
+  const cleaned = sanitizeRustCode(content);
+  const hits: string[] = [];
+
+  const modRe = /(?:^|[;{}])\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*;/gm;
+  for (const match of cleaned.matchAll(modRe)) {
+    const name = match[1];
+    if (name) hits.push(`mod::${name}`);
+  }
+
+  const useRe = /(?:^|[;{}])\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);/gm;
+  for (const match of cleaned.matchAll(useRe)) {
+    const tree = match[1] ?? "";
+    const expanded: string[] = [];
+    expandRustUseTree("", tree, expanded);
+    for (const item of expanded) {
+      const normalized = item.replace(/\s+/g, "").replace(/^::+/, "");
+      if (
+        normalized.startsWith("crate::") ||
+        normalized.startsWith("super::") ||
+        normalized.startsWith("self::")
+      ) {
+        hits.push(normalized);
+      }
+    }
+  }
+
+  return [...new Set(hits)];
+}
+
+function parsePythonImports(content: string): string[] {
+  const hits: string[] = [];
+
+  const relRe = /^\s*from\s+(\.+)([A-Za-z_][A-Za-z0-9_.]*)?\s+import\b/gm;
+  for (const match of content.matchAll(relRe)) {
+    const dots = match[1] ?? ".";
+    const mod = match[2] ?? "";
+    const prefix = dots.length === 1 ? "./" : "../".repeat(dots.length - 1);
+    if (mod) {
+      hits.push(`${prefix}${mod.replaceAll(".", "/")}`);
+    } else {
+      hits.push(dots.length === 1 ? "." : prefix.slice(0, -1));
+    }
+  }
+
+  const fromRe = /^\s*from\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s+import\b/gm;
+  for (const match of content.matchAll(fromRe)) {
+    const mod = match[1];
+    if (mod) hits.push(mod);
+  }
+
+  const importRe = /^\s*import\s+([^\n#;]+)/gm;
+  for (const match of content.matchAll(importRe)) {
+    const clause = match[1] ?? "";
+    for (const rawItem of clause.split(",")) {
+      const mod = rawItem
+        .trim()
+        .replace(/\s+as\s+[A-Za-z_]\w*$/, "")
+        .trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(mod)) {
+        hits.push(mod);
+      }
+    }
+  }
+
+  return [...new Set(hits)];
+}
+
+export function parseImports(content: string, ext?: string): string[] {
+  const normalizedExt = ext?.toLowerCase();
+  if (normalizedExt && SFC_EXT.has(normalizedExt)) {
+    const hits: string[] = [];
+    for (const block of extractSfcScriptBlocks(content)) {
+      hits.push(...parseTsJsImports(block.code));
+    }
+    return [...new Set(hits)];
+  }
+  if (normalizedExt === ".php") {
+    return parsePhpImports(content);
+  }
+  if (normalizedExt === ".py") {
+    return parsePythonImports(content);
+  }
+  if (normalizedExt === ".go") {
+    return parseGoImports(content);
+  }
+  if (normalizedExt === ".rs") {
+    return parseRustImports(content);
+  }
+  return parseTsJsImports(content);
+}
+
 function patternsForExt(ext?: string): Array<[RegExp, string]> {
-  if (!ext) return ALL_SYMBOL_PATTERNS;
-  if (TS_JS_EXT.has(ext)) return TS_JS_SYMBOL_PATTERNS;
-  if (ext === ".py") return PYTHON_SYMBOL_PATTERNS;
-  if (ext === ".go") return GO_SYMBOL_PATTERNS;
-  if (ext === ".rs") return RUST_SYMBOL_PATTERNS;
+  const normalizedExt = ext?.toLowerCase();
+  if (!normalizedExt) return ALL_SYMBOL_PATTERNS;
+  if (TS_JS_EXT.has(normalizedExt) || SFC_EXT.has(normalizedExt)) return TS_JS_SYMBOL_PATTERNS;
+  if (normalizedExt === ".py") return PYTHON_SYMBOL_PATTERNS;
+  if (normalizedExt === ".go") return GO_SYMBOL_PATTERNS;
+  if (normalizedExt === ".rs") return RUST_SYMBOL_PATTERNS;
+  if (normalizedExt === ".php") return PHP_SYMBOL_PATTERNS;
+  if (normalizedExt === ".java") return JAVA_SYMBOL_PATTERNS;
+  if (normalizedExt === ".kt") return KOTLIN_SYMBOL_PATTERNS;
   return ALL_SYMBOL_PATTERNS;
 }
 
@@ -134,9 +589,29 @@ export function parseSymbols(
   content: string,
   ext?: string,
 ): Array<{ name: string; kind: string; line: number }> {
+  const normalizedExt = ext?.toLowerCase();
+  if (normalizedExt && SFC_EXT.has(normalizedExt)) {
+    const symbols: Array<{ name: string; kind: string; line: number }> = [];
+    for (const block of extractSfcScriptBlocks(content)) {
+      const lines = block.code.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] ?? "";
+        for (const [re, kind] of TS_JS_SYMBOL_PATTERNS) {
+          const match = line.match(re);
+          if (match?.[1]) {
+            symbols.push({ name: match[1], kind, line: block.startLine + i });
+            break;
+          }
+        }
+        if (symbols.length >= 80) return symbols.slice(0, 80);
+      }
+    }
+    return symbols.slice(0, 80);
+  }
+
   const symbols: Array<{ name: string; kind: string; line: number }> = [];
   const lines = content.split(/\r?\n/);
-  const patterns = patternsForExt(ext);
+  const patterns = patternsForExt(normalizedExt);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
     for (const [re, kind] of patterns) {
@@ -150,7 +625,10 @@ export function parseSymbols(
   return symbols.slice(0, 80);
 }
 
-function importCandidates(base: string, spec: string): string[] {
+function importCandidates(base: string, spec: string, fromExt?: string): string[] {
+  if (fromExt === ".py") {
+    return [`${base}.py`, join(base, "__init__.py")];
+  }
   const candidates = [base];
   if (spec.endsWith(".js")) {
     const stem = base.slice(0, -3);
@@ -172,6 +650,9 @@ function importCandidates(base: string, spec: string): string[] {
     `${base}.jsx`,
     `${base}.mjs`,
     `${base}.cjs`,
+    `${base}.vue`,
+    `${base}.svelte`,
+    `${base}.py`,
     join(base, "index.ts"),
     join(base, "index.tsx"),
     join(base, "index.mts"),
@@ -180,6 +661,7 @@ function importCandidates(base: string, spec: string): string[] {
     join(base, "index.jsx"),
     join(base, "index.mjs"),
     join(base, "index.cjs"),
+    join(base, "__init__.py"),
   );
   return candidates;
 }
@@ -190,17 +672,395 @@ function toRelInsideRoot(absRoot: string, candidate: string): string | null {
   return rel;
 }
 
+export type ComposerPsr4Entry = {
+  prefix: string;
+  dirs: string[];
+};
+
+function parsePsr4Section(section: unknown, merged: Map<string, string[]>): void {
+  if (!section || typeof section !== "object" || Array.isArray(section)) return;
+  for (const [rawPrefix, rawDirs] of Object.entries(section)) {
+    const trimmed = rawPrefix.replace(/^\\+/, "");
+    const prefix = trimmed && !trimmed.endsWith("\\") ? `${trimmed}\\` : trimmed;
+    const dirList = Array.isArray(rawDirs)
+      ? rawDirs.filter((d): d is string => typeof d === "string")
+      : typeof rawDirs === "string"
+        ? [rawDirs]
+        : [];
+    if (dirList.length === 0) continue;
+    const existing = merged.get(prefix) ?? [];
+    for (const dir of dirList) {
+      const cleanDir = dir.replaceAll("\\", "/").replace(/\/+$/, "");
+      if (!existing.includes(cleanDir)) existing.push(cleanDir);
+    }
+    merged.set(prefix, existing);
+  }
+}
+
+export function loadComposerPsr4(root: string): ComposerPsr4Entry[] {
+  const absRoot = resolve(root);
+  const realRoot = safeRealpathSync(absRoot);
+  const composerPath = join(absRoot, "composer.json");
+  if (!isSafeRegularFileSync(realRoot, composerPath)) return [];
+  try {
+    const stat = lstatSync(composerPath);
+    if (stat.size > DEFAULT_MAX_FILE_BYTES) return [];
+    const raw = readFileSync(composerPath, "utf8");
+    if (Buffer.byteLength(raw, "utf8") > DEFAULT_MAX_FILE_BYTES) return [];
+    const parsed = JSON.parse(raw) as {
+      autoload?: { "psr-4"?: unknown };
+      "autoload-dev"?: { "psr-4"?: unknown };
+    };
+    const merged = new Map<string, string[]>();
+    parsePsr4Section(parsed.autoload?.["psr-4"], merged);
+    parsePsr4Section(parsed["autoload-dev"]?.["psr-4"], merged);
+    return [...merged.entries()]
+      .map(([prefix, dirs]) => ({ prefix, dirs }))
+      .sort((a, b) => b.prefix.length - a.prefix.length);
+  } catch {
+    return [];
+  }
+}
+
+function resolvePhpPsr4Import(
+  spec: string,
+  absRoot: string,
+  realRoot: string,
+  psr4Entries: readonly ComposerPsr4Entry[],
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  const cleanSpec = spec.replace(/^\\+/, "");
+  if (!cleanSpec || psr4Entries.length === 0) return null;
+  for (const entry of psr4Entries) {
+    if (entry.prefix && !cleanSpec.startsWith(entry.prefix)) continue;
+    const remainder = cleanSpec.slice(entry.prefix.length);
+    if (!remainder) continue;
+    const relClass = `${remainder.replaceAll("\\", "/")}.php`;
+    for (const dir of entry.dirs) {
+      const candidate = dir ? resolve(absRoot, dir, relClass) : resolve(absRoot, relClass);
+      const rel = toRelInsideRoot(absRoot, candidate);
+      if (!rel) continue;
+      const exists = knownFiles ? knownFiles.has(rel) : isSafeRegularFileSync(realRoot, candidate);
+      if (exists) return rel;
+    }
+  }
+  return null;
+}
+
+function fileExistsInScope(
+  candidate: string,
+  absRoot: string,
+  realRoot: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  const rel = toRelInsideRoot(absRoot, candidate);
+  if (!rel) return null;
+  const exists = knownFiles ? knownFiles.has(rel) : isSafeRegularFileSync(realRoot, candidate);
+  return exists ? rel : null;
+}
+
+export function loadGoModule(root: string): string | null {
+  const absRoot = resolve(root);
+  const realRoot = safeRealpathSync(absRoot);
+  const goModPath = join(absRoot, "go.mod");
+  if (!isSafeRegularFileSync(realRoot, goModPath)) return null;
+  try {
+    const stat = lstatSync(goModPath);
+    if (stat.size > DEFAULT_MAX_FILE_BYTES) return null;
+    const raw = readFileSync(goModPath, "utf8");
+    if (Buffer.byteLength(raw, "utf8") > DEFAULT_MAX_FILE_BYTES) return null;
+    for (const rawLine of raw.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("//")) continue;
+      const match = line.match(/^module\s+(?:"([^"\s]+)"|`([^`\s]+)`|([^\s]+))/);
+      if (!match) continue;
+      const rawMod = match[1] ?? match[2] ?? match[3] ?? "";
+      const mod = rawMod.replace(/\/\/.*$/, "").replace(/\/+$/, "");
+      if (mod) return mod;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveGoImport(
+  spec: string,
+  absRoot: string,
+  realRoot: string,
+  goModule: string | null,
+  knownFiles?: ReadonlySet<string>,
+): string[] {
+  if (!goModule) return [];
+  if (spec !== goModule && !spec.startsWith(`${goModule}/`)) return [];
+  const subDir = spec === goModule ? "" : spec.slice(goModule.length + 1);
+  if (subDir.startsWith("/") || subDir.split("/").includes("..")) return [];
+
+  if (knownFiles) {
+    const prefix = subDir ? `${subDir}/` : "";
+    const matches: string[] = [];
+    for (const rel of knownFiles) {
+      if (!rel.startsWith(prefix)) continue;
+      const rest = rel.slice(prefix.length);
+      if (!rest || rest.includes("/")) continue;
+      if (!rest.endsWith(".go") || rest.endsWith("_test.go")) continue;
+      matches.push(rel);
+    }
+    matches.sort();
+    return matches.slice(0, MAX_GO_PACKAGE_FILES);
+  }
+
+  const targetDir = subDir ? resolve(absRoot, subDir) : absRoot;
+  if (subDir && !toRelInsideRoot(absRoot, targetDir)) return [];
+  let dirReal: string;
+  try {
+    const dirStat = lstatSync(targetDir);
+    if (subDir && dirStat.isSymbolicLink()) return [];
+    if (!dirStat.isDirectory()) return [];
+    dirReal = realpathSync(targetDir);
+  } catch {
+    return [];
+  }
+  if (!isWithinRoot(realRoot, dirReal)) return [];
+
+  let names: string[];
+  try {
+    names = readdirSync(targetDir);
+  } catch {
+    return [];
+  }
+  const matches: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".go") || name.endsWith("_test.go")) continue;
+    const candidate = join(targetDir, name);
+    if (!isSafeRegularFileSync(realRoot, candidate)) continue;
+    const rel = toRelInsideRoot(absRoot, candidate);
+    if (rel) matches.push(rel);
+  }
+  matches.sort();
+  return matches.slice(0, MAX_GO_PACKAGE_FILES);
+}
+
+function findRustCrateDirs(
+  fromDir: string,
+  absRoot: string,
+  realRoot: string,
+  knownFiles?: ReadonlySet<string>,
+): string[] {
+  const dirs: string[] = [];
+  const seen = new Set<string>();
+  const pushDir = (dir: string) => {
+    if (seen.has(dir)) return;
+    if (dir !== absRoot && !toRelInsideRoot(absRoot, dir)) return;
+    seen.add(dir);
+    dirs.push(dir);
+  };
+
+  let cur = fromDir;
+  while (cur === absRoot || toRelInsideRoot(absRoot, cur) !== null) {
+    if (isSafeRegularFileSync(realRoot, join(cur, "Cargo.toml"))) {
+      pushDir(join(cur, "src"));
+      pushDir(cur);
+      return dirs;
+    }
+    if (
+      basename(cur) === "src" &&
+      (fileExistsInScope(join(cur, "lib.rs"), absRoot, realRoot, knownFiles) ||
+        fileExistsInScope(join(cur, "main.rs"), absRoot, realRoot, knownFiles))
+    ) {
+      pushDir(cur);
+      return dirs;
+    }
+    if (cur === absRoot) break;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  pushDir(join(absRoot, "src"));
+  pushDir(absRoot);
+  return dirs;
+}
+
+function resolveRustSegmentsInDir(
+  baseDir: string,
+  segments: readonly string[],
+  absRoot: string,
+  realRoot: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  if (segments.length === 0) return null;
+  for (let len = segments.length; len >= 1; len--) {
+    const sub = segments.slice(0, len);
+    if (sub.some((s) => !s || s === "." || s === ".." || s.includes("/") || s.includes("\\"))) {
+      continue;
+    }
+    const stemPath = resolve(baseDir, ...sub);
+    const modRs = fileExistsInScope(`${stemPath}.rs`, absRoot, realRoot, knownFiles);
+    if (modRs) return modRs;
+    const dirModRs = fileExistsInScope(join(stemPath, "mod.rs"), absRoot, realRoot, knownFiles);
+    if (dirModRs) return dirModRs;
+  }
+  return null;
+}
+
+function resolveRustImport(
+  fromFile: string,
+  spec: string,
+  absRoot: string,
+  realRoot: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  const absFrom = isAbsolute(fromFile) ? resolve(fromFile) : resolve(absRoot, fromFile);
+  const fromRel = toRelInsideRoot(absRoot, absFrom);
+  const fromDir = dirname(absFrom);
+  const fromBase = basename(absFrom);
+  const isDirModule = fromBase === "lib.rs" || fromBase === "main.rs" || fromBase === "mod.rs";
+  const selfDir = isDirModule ? fromDir : join(fromDir, fromBase.replace(/\.rs$/i, ""));
+
+  if (spec.startsWith("mod::")) {
+    const modName = spec.slice("mod::".length);
+    if (!/^[A-Za-z_]\w*$/.test(modName)) return null;
+    const stemPath = join(selfDir, modName);
+    const modRs = fileExistsInScope(`${stemPath}.rs`, absRoot, realRoot, knownFiles);
+    if (modRs && modRs !== fromRel) return modRs;
+    const dirModRs = fileExistsInScope(join(stemPath, "mod.rs"), absRoot, realRoot, knownFiles);
+    return dirModRs && dirModRs !== fromRel ? dirModRs : null;
+  }
+
+  if (spec.startsWith("self::")) {
+    const segments = spec.slice("self::".length).split("::").filter(Boolean);
+    const hit = resolveRustSegmentsInDir(selfDir, segments, absRoot, realRoot, knownFiles);
+    return hit && hit !== fromRel ? hit : null;
+  }
+
+  if (spec.startsWith("super::")) {
+    const parts = spec.split("::").filter(Boolean);
+    let superCount = 0;
+    while (superCount < parts.length && parts[superCount] === "super") {
+      superCount++;
+    }
+    const rest = parts.slice(superCount);
+    let targetDir = isDirModule ? dirname(fromDir) : fromDir;
+    for (let i = 1; i < superCount; i++) {
+      targetDir = dirname(targetDir);
+    }
+    if (targetDir !== absRoot && !toRelInsideRoot(absRoot, targetDir)) return null;
+
+    if (rest.length > 0) {
+      const hit = resolveRustSegmentsInDir(targetDir, rest, absRoot, realRoot, knownFiles);
+      if (hit && hit !== fromRel) return hit;
+    }
+    if (rest.length <= 1) {
+      const parentCandidates = [
+        join(targetDir, "mod.rs"),
+        targetDir !== absRoot ? `${targetDir}.rs` : null,
+        join(targetDir, "lib.rs"),
+        join(targetDir, "main.rs"),
+      ];
+      for (const cand of parentCandidates) {
+        if (!cand) continue;
+        const hit = fileExistsInScope(cand, absRoot, realRoot, knownFiles);
+        if (hit && hit !== fromRel) return hit;
+      }
+    }
+    return null;
+  }
+
+  if (spec.startsWith("crate::")) {
+    const segments = spec.slice("crate::".length).split("::").filter(Boolean);
+    if (segments.length === 0) return null;
+    const crateDirs = findRustCrateDirs(fromDir, absRoot, realRoot, knownFiles);
+    for (const crateDir of crateDirs) {
+      const hit = resolveRustSegmentsInDir(crateDir, segments, absRoot, realRoot, knownFiles);
+      if (hit && hit !== fromRel) return hit;
+      if (segments.length === 1) {
+        for (const rootFile of [join(crateDir, "lib.rs"), join(crateDir, "main.rs")]) {
+          const rootHit = fileExistsInScope(rootFile, absRoot, realRoot, knownFiles);
+          if (rootHit && rootHit !== fromRel) return rootHit;
+        }
+      }
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function resolvePythonImport(
+  fromFile: string,
+  spec: string,
+  absRoot: string,
+  realRoot: string,
+  knownFiles?: ReadonlySet<string>,
+): string | null {
+  const parts = spec.split(".").filter(Boolean);
+  if (parts.length === 0 || parts.some((p) => p === "." || p === ".." || p.includes("/"))) {
+    return null;
+  }
+  const modRel = parts.join("/");
+  const baseDirs: string[] = [absRoot, join(absRoot, "src")];
+
+  const absFrom = isAbsolute(fromFile) ? resolve(fromFile) : resolve(absRoot, fromFile);
+  let cur = dirname(absFrom);
+  while (cur !== absRoot && toRelInsideRoot(absRoot, cur) !== null) {
+    if (
+      isSafeRegularFileSync(realRoot, join(cur, "pyproject.toml")) ||
+      isSafeRegularFileSync(realRoot, join(cur, "setup.py")) ||
+      isSafeRegularFileSync(realRoot, join(cur, "setup.cfg"))
+    ) {
+      baseDirs.push(cur, join(cur, "src"));
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  for (const baseDir of baseDirs) {
+    const modFile = resolve(baseDir, `${modRel}.py`);
+    const modHit = fileExistsInScope(modFile, absRoot, realRoot, knownFiles);
+    if (modHit) return modHit;
+
+    const initFile = resolve(baseDir, modRel, "__init__.py");
+    const initHit = fileExistsInScope(initFile, absRoot, realRoot, knownFiles);
+    if (initHit) return initHit;
+  }
+
+  return null;
+}
+
 export function resolveImport(
   fromFile: string,
   spec: string,
   root: string,
   knownFiles?: ReadonlySet<string>,
+  psr4Entries?: readonly ComposerPsr4Entry[],
+  goModule?: string | null,
 ): string | null {
   const absRoot = resolve(root);
   const realRoot = safeRealpathSync(absRoot);
+  const fromExt = extname(fromFile).toLowerCase();
+  if (!spec.startsWith(".")) {
+    if (fromExt === ".php" || spec.includes("\\")) {
+      const entries = psr4Entries ?? loadComposerPsr4(absRoot);
+      return resolvePhpPsr4Import(spec, absRoot, realRoot, entries, knownFiles);
+    }
+    if (fromExt === ".go") {
+      const modPath = goModule === undefined ? loadGoModule(absRoot) : goModule;
+      const matches = resolveGoImport(spec, absRoot, realRoot, modPath, knownFiles);
+      return matches[0] ?? null;
+    }
+    if (fromExt === ".rs") {
+      return resolveRustImport(fromFile, spec, absRoot, realRoot, knownFiles);
+    }
+    if (fromExt === ".py") {
+      return resolvePythonImport(fromFile, spec, absRoot, realRoot, knownFiles);
+    }
+    return null;
+  }
   const absFrom = isAbsolute(fromFile) ? resolve(fromFile) : resolve(absRoot, fromFile);
   const base = resolve(dirname(absFrom), spec);
-  for (const candidate of importCandidates(base, spec)) {
+  for (const candidate of importCandidates(base, spec, fromExt)) {
     const rel = toRelInsideRoot(absRoot, candidate);
     if (!rel) continue;
     const exists = knownFiles ? knownFiles.has(rel) : isSafeRegularFileSync(realRoot, candidate);
@@ -276,7 +1136,7 @@ export async function indexProjectGraph(
           full: file.full,
           relInRoot,
           rel,
-          ext: extname(file.full),
+          ext: file.ext,
           mtimeMs: file.mtimeMs,
         });
       }
@@ -348,12 +1208,52 @@ export async function indexProjectGraph(
     }> = [];
     const refreshedEdges: Array<{ id: number; rel: string; imports: string[] }> = [];
 
+    const psr4ByRoot = new Map<string, ComposerPsr4Entry[]>();
+    const getPsr4ForRoot = (realRoot: string): ComposerPsr4Entry[] => {
+      let cached = psr4ByRoot.get(realRoot);
+      if (!cached) {
+        cached = loadComposerPsr4(realRoot);
+        psr4ByRoot.set(realRoot, cached);
+      }
+      return cached;
+    };
+
+    const goModuleByRoot = new Map<string, string | null>();
+    const getGoModuleForRoot = (realRoot: string): string | null => {
+      if (goModuleByRoot.has(realRoot)) {
+        return goModuleByRoot.get(realRoot) ?? null;
+      }
+      const mod = loadGoModule(realRoot);
+      goModuleByRoot.set(realRoot, mod);
+      return mod;
+    };
+
     const resolveImportsForEntry = (entry: WalkedEntry, content: string): string[] => {
       const rootKnown = knownFilesByRoot.get(entry.rootId);
-      return parseImports(content)
-        .map((spec) => resolveImport(entry.full, spec, entry.realRoot, rootKnown))
-        .filter((to): to is string => Boolean(to))
-        .map((to) => (entry.prefix ? `${entry.prefix}/${to}` : to));
+      const psr4 = entry.ext === ".php" ? getPsr4ForRoot(entry.realRoot) : undefined;
+      const goMod = entry.ext === ".go" ? getGoModuleForRoot(entry.realRoot) : undefined;
+      const resolvedTargets: string[] = [];
+      for (const spec of parseImports(content, entry.ext)) {
+        if (entry.ext === ".go") {
+          for (const target of resolveGoImport(
+            spec,
+            entry.realRoot,
+            entry.realRoot,
+            goMod ?? null,
+            rootKnown,
+          )) {
+            if (target !== entry.relInRoot) {
+              resolvedTargets.push(entry.prefix ? `${entry.prefix}/${target}` : target);
+            }
+          }
+          continue;
+        }
+        const to = resolveImport(entry.full, spec, entry.realRoot, rootKnown, psr4, goMod);
+        if (to && to !== entry.relInRoot) {
+          resolvedTargets.push(entry.prefix ? `${entry.prefix}/${to}` : to);
+        }
+      }
+      return [...new Set(resolvedTargets)];
     };
 
     for (const entry of entries) {

@@ -82,6 +82,7 @@ export const SCRUB_TOOL_FIELDS: Partial<Record<McpToolName, readonly string[]>> 
   manage_roots: ["action", "persona", "root_id", "path"],
   graph_neighbors: ["path"],
   symbol_search: ["query"],
+  graph_summary: [],
 };
 
 export const DEFAULT_SCRUB_SKIP_KEYS: ReadonlySet<string> = new Set([

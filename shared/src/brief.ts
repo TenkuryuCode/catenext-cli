@@ -120,6 +120,50 @@ export const SymbolSearchOutput = z.object({
   hits: z.array(SymbolHitSchema).max(40),
 });
 
+export const GraphSummaryInput = z.object({
+  depth: z.number().int().min(1).max(3).default(2),
+  max_hubs: z.number().int().min(1).max(30).default(12),
+  include_mermaid: z.boolean().default(true),
+});
+export type GraphSummaryInputType = z.infer<typeof GraphSummaryInput>;
+
+export const GraphSummaryGroupSchema = z.object({
+  group: z.string(),
+  files: z.number().int().min(0),
+  symbols: z.number().int().min(0),
+  edges_in: z.number().int().min(0),
+  edges_out: z.number().int().min(0),
+});
+
+export const GraphSummaryGroupEdgeSchema = z.object({
+  from: z.string(),
+  to: z.string(),
+  count: z.number().int().min(1),
+});
+
+export const GraphSummaryHubSchema = z.object({
+  path: z.string(),
+  group: z.string(),
+  in_edges: z.number().int().min(0),
+  out_edges: z.number().int().min(0),
+  symbol_count: z.number().int().min(0),
+  key_symbols: z.array(z.string()).max(6),
+});
+
+export const GraphSummaryOutput = z.object({
+  indexed: z.boolean(),
+  totals: z.object({
+    files: z.number().int().min(0),
+    symbols: z.number().int().min(0),
+    edges: z.number().int().min(0),
+  }),
+  groups: z.array(GraphSummaryGroupSchema),
+  group_edges: z.array(GraphSummaryGroupEdgeSchema),
+  hubs: z.array(GraphSummaryHubSchema),
+  mermaid: z.string().optional(),
+});
+export type GraphSummaryOutputType = z.infer<typeof GraphSummaryOutput>;
+
 /** Optional compact flags shared by board/context readers. */
 export const CompactQueryFields = {
   verbose: z.boolean().optional(),

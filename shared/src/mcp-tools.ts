@@ -3,6 +3,8 @@ import { ReleaseTaskInput, SetDependenciesInput, UpdateEpicInput, UpdateTaskInpu
 import {
   GraphNeighborsInput,
   GraphNeighborsOutput,
+  GraphSummaryInput,
+  GraphSummaryOutput,
   InterviewSetupInput,
   InterviewSetupOutput,
   ManageRootsInput,
@@ -693,6 +695,11 @@ export const MCP_TOOLS = {
     "Search indexed symbols in the local SQLite code graph. Compact hits only.",
     SymbolSearchInput,
     SymbolSearchOutput,
+  ),
+  graph_summary: tool(
+    "Compact SQLite code-graph architecture map: module groups, inter-module edges, top hub files, and Mermaid diagram.",
+    GraphSummaryInput,
+    GraphSummaryOutput,
   ),
 } as const;
 

@@ -34,6 +34,7 @@ import type { z } from "zod";
 import { HUMAN_APPROVAL_COMMANDS, requireHumanApproval } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { graphNeighbors, symbolSearch } from "./db/graph-index.js";
+import { summarizeProjectGraph } from "./db/graph-summary.js";
 import { LocalStore, newRootId } from "./db/store.js";
 import {
   insertTaskEvents,
@@ -910,6 +911,7 @@ class LocalWorkflow {
     symbol_search: (input) => ({
       hits: symbolSearch(this.db, this.config.project_id, input.query, input.limit),
     }),
+    graph_summary: (input) => summarizeProjectGraph(this.db, this.config.project_id, input),
   };
 
   /** Only the exact lease_id holder renews its own lease; expired leases are returned first. */

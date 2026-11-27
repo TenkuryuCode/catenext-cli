@@ -10,6 +10,18 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.14.0] - 2026-11-27
+
+### Ditambahkan
+- Polyglot code graph & FTS5 search: dukungan `.php` (resolusi `use` via `composer.json` PSR-4 `autoload`/`autoload-dev` dalam batas `realRoot`), `.vue`/`.svelte` (ekstraksi blok `<script>` dengan offset baris), ekstraksi simbol `.java`/`.kt`, serta resolusi import lokal untuk Go (`go.mod`), Rust (`mod`, `crate::`, `super::`, `self::`), dan Python lokal/relatif tanpa membuat edge palsu ke stdlib/dependensi eksternal.
+- Ekstensi FTS5 `TEXT_EXT` di `code-search.ts`: `.php`, `.vue`, `.svelte`, `.astro`, `.graphql`, dan `.proto`.
+- Peta arsitektur hemat-token: tool MCP read-only `graph_summary` (`depth`, `max_hubs`, `include_mermaid`) pada katalog `orchestrator` & `worker` (total 28 tool default; 32 dengan `--allow-crud`), serta flag `catenext index --summary`, `--write-doc [slug]` (default `architecture`, `kind: "architecture"`), `--depth <n>`, `--max-hubs <n>`, dan `--json`.
+- Smoke check bundle terisolasi (`--version`, `init`, dan `mcp` JSON-RPC `initialize`) pada `apps/cli/mirror/.github/workflows/ci.yml`.
+
+### Diubah
+- Penutupan handle SQLite mandiri di `code-search.ts`, `graph-index.ts`, dan `graph-summary.ts` memakai `checkpointWalAndClose` untuk mencegah file `-wal`/`-shm` tertinggal, serta sanitasi cell tabel Markdown (`|`, backtick, CR/LF) di `renderArchitectureMarkdown`.
+- Penyelarasan dokumentasi `README.md`, `apps/cli/README.md`, `apps/cli/mirror/README.md`, `docs/blueprint.md`, dan `docs/STATUS.md`.
+
 ## [0.13.0] - 2026-11-27
 
 ### Ditambahkan

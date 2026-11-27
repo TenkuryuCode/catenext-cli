@@ -35,6 +35,7 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "manage_roots",
     "graph_neighbors",
     "symbol_search",
+    "graph_summary",
     "review_pull_request",
   ],
   worker: [
@@ -51,6 +52,7 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "save_repo_skill",
     "graph_neighbors",
     "symbol_search",
+    "graph_summary",
   ],
 };
 
@@ -89,6 +91,8 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   manage_roots: "List, add, or remove external workspace roots owned by a persona.",
   graph_neighbors: "List compact code-graph import and symbol neighbors for a file.",
   symbol_search: "Search indexed symbols in the local SQLite code graph.",
+  graph_summary:
+    "Summarize project module architecture, dependency groups, hubs, and Mermaid graph.",
 };
 
 export interface CompactToolInputSchema {

@@ -5,7 +5,7 @@ import { join, relative } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { hasCodeSearchFts, tryEnableCodeSearchFts } from "./db/migrate.js";
-import { openDatabaseAt } from "./db/open.js";
+import { checkpointWalAndClose, openDatabaseAt } from "./db/open.js";
 import { scrubText } from "./scrubber.js";
 import { collectRootTargets, type RegisteredRoot } from "./workspace-roots.js";
 import {
@@ -66,6 +66,12 @@ const TEXT_EXT = new Set([
   ".swift",
   ".sql",
   ".sh",
+  ".php",
+  ".vue",
+  ".svelte",
+  ".astro",
+  ".graphql",
+  ".proto",
 ]);
 
 function tokenize(text: string): string[] {
@@ -669,10 +675,8 @@ export async function searchLocalCode(
       note: "FTS5 tidak tersedia; memakai fallback SQLite LIKE.",
     };
   } finally {
-    try {
-      ownedDb?.close();
-    } catch {
-      // ignore close errors
+    if (ownedDb) {
+      checkpointWalAndClose(ownedDb);
     }
   }
 }

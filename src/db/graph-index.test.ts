@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { DEFAULT_MAX_FILE_BYTES } from "../workspace-walk.js";
 import {
   graphNeighbors,
   indexProjectGraph,
+  loadGoModule,
   parseImports,
   parseSymbols,
   resolveImport,
@@ -330,6 +332,340 @@ describe("parseSymbols multi-language", () => {
       { name: "open", kind: "function", line: 12 },
     ]);
   });
+
+  it("extracts PHP namespace, class, interface, trait, enum, and function/method symbols", () => {
+    const php = [
+      "<?php",
+      "namespace App\\Http\\Controllers;",
+      "interface Authenticatable {",
+      "  public function getAuthId(): int;",
+      "}",
+      "trait HasTimestamps {",
+      "  public function touchTimestamp(): void {}",
+      "}",
+      "enum Status: string {",
+      "  case Active = 'active';",
+      "}",
+      "final class UserController {",
+      "  public function __construct() {}",
+      "  protected static function buildKey(): string { return 'k'; }",
+      "}",
+      "function helperFn(string $v): string { return $v; }",
+    ].join("\n");
+
+    expect(parseSymbols(php, ".php")).toEqual([
+      { name: "App\\Http\\Controllers", kind: "namespace", line: 2 },
+      { name: "Authenticatable", kind: "interface", line: 3 },
+      { name: "getAuthId", kind: "function", line: 4 },
+      { name: "HasTimestamps", kind: "trait", line: 6 },
+      { name: "touchTimestamp", kind: "function", line: 7 },
+      { name: "Status", kind: "enum", line: 9 },
+      { name: "UserController", kind: "class", line: 12 },
+      { name: "__construct", kind: "function", line: 13 },
+      { name: "buildKey", kind: "function", line: 14 },
+      { name: "helperFn", kind: "function", line: 16 },
+    ]);
+  });
+
+  it("extracts Java class, record, interface, enum, and method symbols without control-flow noise", () => {
+    const java = [
+      "package com.example.orders;",
+      "public interface OrderRepo {",
+      "  Order findById(String id);",
+      "}",
+      "public enum OrderState { NEW, PAID }",
+      "public record OrderId(String value) {}",
+      "public final class OrderService {",
+      "  private static final String PREFIX = makePrefix();",
+      "  public OrderService(OrderRepo repo) {}",
+      "  public <T> List<T> loadItems(String id) {",
+      "    if (id == null) { return List.of(); }",
+      "    return fetchItems();",
+      "  }",
+      "  void internalSync() {}",
+      "}",
+    ].join("\n");
+
+    expect(parseSymbols(java, ".java")).toEqual([
+      { name: "OrderRepo", kind: "interface", line: 2 },
+      { name: "findById", kind: "function", line: 3 },
+      { name: "OrderState", kind: "enum", line: 5 },
+      { name: "OrderId", kind: "class", line: 6 },
+      { name: "OrderService", kind: "class", line: 7 },
+      { name: "OrderService", kind: "function", line: 9 },
+      { name: "loadItems", kind: "function", line: 10 },
+      { name: "internalSync", kind: "function", line: 14 },
+    ]);
+  });
+
+  it("extracts Kotlin class, interface, enum, object, and fun symbols", () => {
+    const kt = [
+      "package com.example.users",
+      "enum class Role { ADMIN, USER }",
+      "interface UserStore {",
+      "  suspend fun find(id: String): UserDto?",
+      "}",
+      "data class UserDto(val id: String)",
+      "object Defaults {",
+      "  fun defaultRole() = Role.USER",
+      "}",
+      "class Helper {",
+      "  companion object {",
+      "    fun create() = Helper()",
+      "  }",
+      "}",
+      "private fun String.slugify(): String = lowercase()",
+    ].join("\n");
+
+    expect(parseSymbols(kt, ".kt")).toEqual([
+      { name: "Role", kind: "enum", line: 2 },
+      { name: "UserStore", kind: "interface", line: 3 },
+      { name: "find", kind: "function", line: 4 },
+      { name: "UserDto", kind: "class", line: 6 },
+      { name: "Defaults", kind: "class", line: 7 },
+      { name: "defaultRole", kind: "function", line: 8 },
+      { name: "Helper", kind: "class", line: 10 },
+      { name: "create", kind: "function", line: 12 },
+      { name: "slugify", kind: "function", line: 15 },
+    ]);
+  });
+
+  it("extracts Vue and Svelte <script> symbols with accurate line offsets and relative imports", () => {
+    const vue = [
+      "<template>",
+      "  <div>{{ title }}</div>",
+      "</template>",
+      '<script setup lang="ts">',
+      'import { ref } from "vue";',
+      'import Badge from "./Badge.vue";',
+      "export interface CardProps {",
+      "  title: string;",
+      "}",
+      "function formatTitle(v: string) { return v; }",
+      "const activeCount = ref(0);",
+      "</script>",
+    ].join("\n");
+
+    expect(parseSymbols(vue, ".vue")).toEqual([
+      { name: "CardProps", kind: "interface", line: 7 },
+      { name: "formatTitle", kind: "function", line: 10 },
+      { name: "activeCount", kind: "variable", line: 11 },
+    ]);
+    expect(parseImports(vue, ".vue")).toEqual(["./Badge.vue"]);
+
+    const svelte = [
+      '<script context="module" lang="ts">',
+      "export type ItemKind = 'a' | 'b';",
+      "</script>",
+      '<script lang="ts">',
+      'import { loadItem } from "./loader";',
+      "export function selectItem() {}",
+      "</script>",
+      "<main>hi</main>",
+    ].join("\n");
+
+    expect(parseSymbols(svelte, ".svelte")).toEqual([
+      { name: "ItemKind", kind: "type", line: 2 },
+      { name: "selectItem", kind: "function", line: 6 },
+    ]);
+    expect(parseImports(svelte, ".svelte")).toEqual(["./loader"]);
+  });
+});
+
+describe("PHP PSR-4, Python relative imports, SFC graph & standalone WAL cleanup", () => {
+  it("parses PHP use statements and resolves composer.json PSR-4 within realRoot boundaries", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "catenext-php-outside-"));
+    try {
+      await mkdir(join(root, "app/Http/Controllers"), { recursive: true });
+      await mkdir(join(root, "app/Models"), { recursive: true });
+      await mkdir(join(root, "app/Services"), { recursive: true });
+      await mkdir(join(root, "tests/Unit"), { recursive: true });
+      await writeFile(join(outside, "Secret.php"), "<?php\nnamespace Outside;\nclass Secret {}\n");
+
+      await writeFile(
+        join(root, "composer.json"),
+        JSON.stringify({
+          autoload: {
+            "psr-4": {
+              "App\\": "app/",
+              "Escape\\": "../outside/",
+            },
+          },
+          "autoload-dev": {
+            "psr-4": {
+              "Tests\\": ["tests/"],
+            },
+          },
+        }),
+      );
+
+      const controllerPhp = [
+        "<?php",
+        "namespace App\\Http\\Controllers;",
+        "use App\\Models\\User;",
+        "use App\\Services\\{BillingService, AuditLogger as Logger};",
+        "use function App\\Helpers\\formatCurrency;",
+        "use Symfony\\Component\\HttpFoundation\\Request;",
+        "use Escape\\Secret;",
+        "class UserController {",
+        "  public function index() {",
+        "    $fn = function () use ($a) { return $a; };",
+        "  }",
+        "}",
+      ].join("\n");
+
+      expect(parseImports(controllerPhp, ".php")).toEqual([
+        "App\\Services\\BillingService",
+        "App\\Services\\AuditLogger",
+        "App\\Models\\User",
+        "Symfony\\Component\\HttpFoundation\\Request",
+        "Escape\\Secret",
+      ]);
+
+      await writeFile(join(root, "app/Http/Controllers/UserController.php"), controllerPhp);
+      await writeFile(
+        join(root, "app/Models/User.php"),
+        "<?php\nnamespace App\\Models;\nclass User {}\n",
+      );
+      await writeFile(
+        join(root, "app/Services/BillingService.php"),
+        "<?php\nnamespace App\\Services;\nclass BillingService {}\n",
+      );
+      await writeFile(
+        join(root, "app/Services/AuditLogger.php"),
+        "<?php\nnamespace App\\Services;\nclass AuditLogger {}\n",
+      );
+      await writeFile(
+        join(root, "tests/Unit/UserTest.php"),
+        "<?php\nnamespace Tests\\Unit;\nuse App\\Models\\User;\nclass UserTest {}\n",
+      );
+
+      // Symlinked PHP class inside app/Models pointing outside root must be rejected
+      try {
+        await symlink(join(outside, "Secret.php"), join(root, "app/Models/Leaked.php"));
+      } catch (error) {
+        if (
+          !(
+            process.platform === "win32" &&
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "EPERM"
+          )
+        ) {
+          throw error;
+        }
+      }
+      expect(
+        resolveImport(
+          join(root, "app/Http/Controllers/UserController.php"),
+          "App\\Models\\Leaked",
+          root,
+        ),
+      ).toBeNull();
+      expect(
+        resolveImport(
+          join(root, "app/Http/Controllers/UserController.php"),
+          "Escape\\Secret",
+          root,
+        ),
+      ).toBeNull();
+
+      const res = await indexProjectGraph(dbPath, projectId, root);
+      expect(res.files).toBe(5);
+      expect(res.edges).toBe(4);
+
+      expect(
+        graphNeighbors(dbPath, projectId, "app/Http/Controllers/UserController.php", 10, 1),
+      ).toEqual([
+        {
+          kind: "imports",
+          from: "app/Http/Controllers/UserController.php",
+          to: "app/Services/BillingService.php",
+          label: "app/Services/BillingService.php",
+        },
+        {
+          kind: "imports",
+          from: "app/Http/Controllers/UserController.php",
+          to: "app/Services/AuditLogger.php",
+          label: "app/Services/AuditLogger.php",
+        },
+        {
+          kind: "imports",
+          from: "app/Http/Controllers/UserController.php",
+          to: "app/Models/User.php",
+          label: "app/Models/User.php",
+        },
+      ]);
+
+      expect(graphNeighbors(dbPath, projectId, "tests/Unit/UserTest.php", 10, 1)).toEqual([
+        {
+          kind: "imports",
+          from: "tests/Unit/UserTest.php",
+          to: "app/Models/User.php",
+          label: "app/Models/User.php",
+        },
+      ]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("indexes Vue, Svelte, Python relative imports, Java, and Kotlin files and checkpoints standalone WAL", async () => {
+    await mkdir(join(root, "web"), { recursive: true });
+    await mkdir(join(root, "py/pkg"), { recursive: true });
+    await mkdir(join(root, "jvm"), { recursive: true });
+
+    await writeFile(
+      join(root, "web/App.vue"),
+      '<script setup lang="ts">\nimport Card from "./Card.svelte";\nexport function mountApp() {}\n</script>\n',
+    );
+    await writeFile(
+      join(root, "web/Card.svelte"),
+      '<script lang="ts">\nexport interface CardState { open: boolean; }\n</script>\n',
+    );
+    await writeFile(
+      join(root, "py/pkg/runner.py"),
+      "from .helper import run_step\ndef start_runner():\n  return run_step()\n",
+    );
+    await writeFile(join(root, "py/pkg/helper.py"), "def run_step():\n  return 1\n");
+    await writeFile(
+      join(root, "jvm/Main.java"),
+      "public class Main {\n  public static void runJava() {}\n}\n",
+    );
+    await writeFile(join(root, "jvm/App.kt"), "class KotlinApp {\n  fun bootKotlin() {}\n}\n");
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(6);
+
+    // Standalone WAL sidecars are checkpointed & cleaned up
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+
+    expect(graphNeighbors(dbPath, projectId, "web/App.vue", 10, 1)).toEqual([
+      {
+        kind: "imports",
+        from: "web/App.vue",
+        to: "web/Card.svelte",
+        label: "web/Card.svelte",
+      },
+    ]);
+    expect(graphNeighbors(dbPath, projectId, "py/pkg/runner.py", 10, 1)).toEqual([
+      {
+        kind: "imports",
+        from: "py/pkg/runner.py",
+        to: "py/pkg/helper.py",
+        label: "py/pkg/helper.py",
+      },
+    ]);
+
+    expect(symbolSearch(dbPath, projectId, "mountApp", 10)).toHaveLength(1);
+    expect(symbolSearch(dbPath, projectId, "CardState", 10)).toHaveLength(1);
+    expect(symbolSearch(dbPath, projectId, "runJava", 10)).toHaveLength(1);
+    expect(symbolSearch(dbPath, projectId, "bootKotlin", 10)).toHaveLength(1);
+
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+  });
 });
 
 describe("graphNeighbors depth & LocalService connection reuse", () => {
@@ -557,5 +893,312 @@ describe("incremental indexing", () => {
     } finally {
       await rm(extRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Go, Rust & Python local import resolution", () => {
+  it("parses Go imports and resolves go.mod local packages without dangling stdlib edges", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "catenext-go-outside-"));
+    try {
+      await mkdir(join(root, "cmd/api"), { recursive: true });
+      await mkdir(join(root, "internal/auth"), { recursive: true });
+      await mkdir(join(root, "pkg/types"), { recursive: true });
+      await writeFile(join(outside, "leak.go"), "package auth\nfunc Leak() {}\n");
+
+      await writeFile(
+        join(root, "go.mod"),
+        ["// comment", "module example.com/myapp // trailing comment", "", "go 1.23.0", ""].join(
+          "\n",
+        ),
+      );
+      expect(loadGoModule(root)).toBe("example.com/myapp");
+
+      const mainGo = [
+        "package main",
+        "",
+        "import (",
+        '\t"fmt"',
+        '\t_ "net/http/pprof"',
+        '\tauth "example.com/myapp/internal/auth" // local',
+        '\t/* block */ . "example.com/myapp/pkg/types"',
+        '\t"github.com/external/pkg"',
+        ")",
+        'import "example.com/myapp/internal/missing"',
+        '// import "example.com/myapp/commented"',
+        "",
+        "func main() { _ = auth.Verify; fmt.Println() }",
+      ].join("\n");
+
+      expect(parseImports(mainGo, ".go")).toEqual([
+        "fmt",
+        "net/http/pprof",
+        "example.com/myapp/internal/auth",
+        "example.com/myapp/pkg/types",
+        "github.com/external/pkg",
+        "example.com/myapp/internal/missing",
+      ]);
+
+      await writeFile(join(root, "cmd/api/main.go"), mainGo);
+      await writeFile(
+        join(root, "internal/auth/auth.go"),
+        "package auth\nfunc Verify() bool { return true }\n",
+      );
+      await writeFile(
+        join(root, "internal/auth/tokens.go"),
+        'package auth\nfunc IssueToken() string { return "t" }\n',
+      );
+      await writeFile(
+        join(root, "internal/auth/auth_test.go"),
+        'package auth\nimport "testing"\nfunc TestVerify(t *testing.T) {}\n',
+      );
+      await writeFile(join(root, "pkg/types/user.go"), "package types\ntype User struct{}\n");
+
+      try {
+        await symlink(join(outside, "leak.go"), join(root, "internal/auth/leak.go"));
+      } catch (error) {
+        if (
+          !(
+            process.platform === "win32" &&
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "EPERM"
+          )
+        ) {
+          throw error;
+        }
+      }
+
+      expect(resolveImport(join(root, "cmd/api/main.go"), "fmt", root)).toBeNull();
+      expect(
+        resolveImport(join(root, "cmd/api/main.go"), "example.com/myapp/internal/auth", root),
+      ).toBe("internal/auth/auth.go");
+      expect(
+        resolveImport(join(root, "cmd/api/main.go"), "example.com/myapp/internal/missing", root),
+      ).toBeNull();
+
+      const res = await indexProjectGraph(dbPath, projectId, root);
+      expect(res.files).toBe(5);
+      expect(res.edges).toBe(3);
+
+      expect(graphNeighbors(dbPath, projectId, "cmd/api/main.go", 10, 1)).toEqual([
+        {
+          kind: "imports",
+          from: "cmd/api/main.go",
+          to: "internal/auth/auth.go",
+          label: "internal/auth/auth.go",
+        },
+        {
+          kind: "imports",
+          from: "cmd/api/main.go",
+          to: "internal/auth/tokens.go",
+          label: "internal/auth/tokens.go",
+        },
+        {
+          kind: "imports",
+          from: "cmd/api/main.go",
+          to: "pkg/types/user.go",
+          label: "pkg/types/user.go",
+        },
+      ]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("parses and resolves Rust mod, crate::, super::, and self:: imports within root boundaries", async () => {
+    await mkdir(join(root, "src/routes/users"), { recursive: true });
+    await mkdir(join(root, "src/parent"), { recursive: true });
+    await writeFile(join(root, "Cargo.toml"), '[package]\nname = "app"\nversion = "0.1.0"\n');
+
+    const libRs = [
+      "mod config;",
+      "pub mod routes;",
+      "pub(crate) mod parent;",
+      "mod inline_only {",
+      "  pub fn stay_inline() {}",
+      "}",
+      "// mod commented_out;",
+      'const TEXT: &str = "use crate::fake;";',
+      "pub struct AppState;",
+    ].join("\n");
+
+    expect(parseImports(libRs, ".rs")).toEqual(["mod::config", "mod::routes", "mod::parent"]);
+
+    const routesModRs = [
+      "pub mod users;",
+      "use crate::config::Settings;",
+      "use crate::routes::users::{self, list::{self, Handler as ListHandler}};",
+      "use super::AppState;",
+      "use std::collections::HashMap;",
+    ].join("\n");
+
+    expect(parseImports(routesModRs, ".rs")).toEqual([
+      "mod::users",
+      "crate::config::Settings",
+      "crate::routes::users",
+      "crate::routes::users::list",
+      "crate::routes::users::list::Handler",
+      "super::AppState",
+    ]);
+
+    const usersModRs = [
+      "pub mod list;",
+      "use self::list::Handler;",
+      "use super::super::config::Settings;",
+      "use serde::Serialize;",
+    ].join("\n");
+
+    const parentRs = [
+      "mod child;",
+      "use self::child::ChildItem;",
+      "use super::config::Settings;",
+    ].join("\n");
+
+    await writeFile(join(root, "src/lib.rs"), libRs);
+    await writeFile(join(root, "src/config.rs"), "pub struct Settings;\n");
+    await writeFile(join(root, "src/routes/mod.rs"), routesModRs);
+    await writeFile(join(root, "src/routes/users/mod.rs"), usersModRs);
+    await writeFile(join(root, "src/routes/users/list.rs"), "pub struct Handler;\n");
+    await writeFile(join(root, "src/parent.rs"), parentRs);
+    await writeFile(join(root, "src/parent/child.rs"), "pub struct ChildItem;\n");
+
+    expect(resolveImport(join(root, "src/lib.rs"), "mod::config", root)).toBe("src/config.rs");
+    expect(resolveImport(join(root, "src/lib.rs"), "mod::routes", root)).toBe("src/routes/mod.rs");
+    expect(resolveImport(join(root, "src/lib.rs"), "mod::missing", root)).toBeNull();
+    expect(resolveImport(join(root, "src/parent.rs"), "mod::child", root)).toBe(
+      "src/parent/child.rs",
+    );
+    expect(resolveImport(join(root, "src/routes/mod.rs"), "super::AppState", root)).toBe(
+      "src/lib.rs",
+    );
+    expect(
+      resolveImport(join(root, "src/routes/users/mod.rs"), "super::super::config::Settings", root),
+    ).toBe("src/config.rs");
+    expect(
+      resolveImport(join(root, "src/routes/mod.rs"), "std::collections::HashMap", root),
+    ).toBeNull();
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(7);
+
+    const libNeighbors = graphNeighbors(dbPath, projectId, "src/lib.rs", 10, 1);
+    expect(libNeighbors).toHaveLength(4);
+    expect(libNeighbors).toEqual(
+      expect.arrayContaining([
+        { kind: "imports", from: "src/lib.rs", to: "src/config.rs", label: "src/config.rs" },
+        {
+          kind: "imports",
+          from: "src/lib.rs",
+          to: "src/routes/mod.rs",
+          label: "src/routes/mod.rs",
+        },
+        { kind: "imports", from: "src/lib.rs", to: "src/parent.rs", label: "src/parent.rs" },
+        { kind: "imports", from: "src/routes/mod.rs", to: "src/lib.rs", label: "src/lib.rs" },
+      ]),
+    );
+
+    const parentNeighbors = graphNeighbors(dbPath, projectId, "src/parent.rs", 10, 1);
+    expect(parentNeighbors).toHaveLength(3);
+    expect(parentNeighbors).toEqual(
+      expect.arrayContaining([
+        {
+          kind: "imports",
+          from: "src/parent.rs",
+          to: "src/parent/child.rs",
+          label: "src/parent/child.rs",
+        },
+        { kind: "imports", from: "src/parent.rs", to: "src/config.rs", label: "src/config.rs" },
+        { kind: "imports", from: "src/lib.rs", to: "src/parent.rs", label: "src/parent.rs" },
+      ]),
+    );
+
+    const usersNeighbors = graphNeighbors(dbPath, projectId, "src/routes/users/mod.rs", 10, 1);
+    expect(usersNeighbors).toHaveLength(3);
+    expect(usersNeighbors).toEqual(
+      expect.arrayContaining([
+        {
+          kind: "imports",
+          from: "src/routes/users/mod.rs",
+          to: "src/routes/users/list.rs",
+          label: "src/routes/users/list.rs",
+        },
+        {
+          kind: "imports",
+          from: "src/routes/users/mod.rs",
+          to: "src/config.rs",
+          label: "src/config.rs",
+        },
+        {
+          kind: "imports",
+          from: "src/routes/mod.rs",
+          to: "src/routes/users/mod.rs",
+          label: "src/routes/users/mod.rs",
+        },
+      ]),
+    );
+  });
+
+  it("parses and resolves Python package and relative imports while ignoring stdlib/third-party", async () => {
+    await mkdir(join(root, "pkg/util"), { recursive: true });
+    await mkdir(join(root, "pkg/sub"), { recursive: true });
+
+    const mainPy = [
+      "import json, pkg.util as pu",
+      "import pytest",
+      "from pkg.sub import fn",
+      "from .local import local_fn",
+      "from os.path import join",
+      "",
+      "def run():",
+      "  return fn()",
+    ].join("\n");
+
+    expect(parseImports(mainPy, ".py")).toEqual([
+      "./local",
+      "pkg.sub",
+      "os.path",
+      "json",
+      "pkg.util",
+      "pytest",
+    ]);
+
+    await writeFile(join(root, "pkg/__init__.py"), "");
+    await writeFile(join(root, "pkg/main.py"), mainPy);
+    await writeFile(join(root, "pkg/local.py"), "def local_fn():\n  return 1\n");
+    await writeFile(join(root, "pkg/sub.py"), "def fn():\n  return 2\n");
+    await writeFile(join(root, "pkg/util/__init__.py"), "def util_fn():\n  return 3\n");
+    await writeFile(join(root, "pkg/sub/nested.py"), "from ..util import util_fn\n");
+
+    expect(resolveImport(join(root, "pkg/main.py"), "json", root)).toBeNull();
+    expect(resolveImport(join(root, "pkg/main.py"), "pytest", root)).toBeNull();
+    expect(resolveImport(join(root, "pkg/main.py"), "pkg.sub", root)).toBe("pkg/sub.py");
+    expect(resolveImport(join(root, "pkg/main.py"), "pkg.util", root)).toBe("pkg/util/__init__.py");
+    expect(resolveImport(join(root, "pkg/main.py"), "./local", root)).toBe("pkg/local.py");
+    expect(resolveImport(join(root, "pkg/sub/nested.py"), "../util", root)).toBe(
+      "pkg/util/__init__.py",
+    );
+
+    const res = await indexProjectGraph(dbPath, projectId, root);
+    expect(res.files).toBe(6);
+    expect(res.edges).toBe(4);
+
+    expect(graphNeighbors(dbPath, projectId, "pkg/main.py", 10, 1)).toEqual([
+      { kind: "imports", from: "pkg/main.py", to: "pkg/local.py", label: "pkg/local.py" },
+      { kind: "imports", from: "pkg/main.py", to: "pkg/sub.py", label: "pkg/sub.py" },
+      {
+        kind: "imports",
+        from: "pkg/main.py",
+        to: "pkg/util/__init__.py",
+        label: "pkg/util/__init__.py",
+      },
+    ]);
+    expect(graphNeighbors(dbPath, projectId, "pkg/sub/nested.py", 10, 1)).toEqual([
+      {
+        kind: "imports",
+        from: "pkg/sub/nested.py",
+        to: "pkg/util/__init__.py",
+        label: "pkg/util/__init__.py",
+      },
+    ]);
   });
 });

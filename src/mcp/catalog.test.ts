@@ -76,7 +76,7 @@ describe("MCP tool catalog compaction & role filtering", () => {
 
   it("filters tool lists by role and preserves full default tool set", () => {
     expect(toolsForRole()).toEqual(MCP_TOOL_NAMES.filter((name) => !isMcpCrudTool(name)));
-    expect(toolsForRole()).toHaveLength(27);
+    expect(toolsForRole()).toHaveLength(28);
 
     const orch = toolsForRole("orchestrator");
     expect(orch).toEqual([...ROLE_TOOLS.orchestrator]);

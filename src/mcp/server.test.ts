@@ -365,7 +365,7 @@ describe("server MCP catenext", () => {
   it("tools/list mengembalikan schema ringkas tanpa regex UUID panjang namun validasi runtime tetap ketat", async () => {
     const { client, calls } = await setup();
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(27);
+    expect(tools).toHaveLength(28);
     for (const t of tools) {
       expect(t.description ?? "").not.toContain("\n");
       expect((t.description ?? "").trim().split(/\s+/).length).toBeLessThanOrEqual(12);

@@ -692,6 +692,53 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(cli(["doc", "list"])).not.toContain("[arsip]");
   }, 20_000);
 
+  it("covers index --summary and index --write-doc create/update", async () => {
+    git("init", "-b", "main");
+    cli(["init", "--platform", "claude-code"]);
+    await mkdir(join(root, "src/core"), { recursive: true });
+    await mkdir(join(root, "src/api"), { recursive: true });
+    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
+    await writeFile(
+      join(root, "src/api/route.ts"),
+      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
+    );
+
+    const textOut = cli(["index", "--summary", "--depth", "2", "--max-hubs", "5"]);
+    expect(textOut).toContain("✓ indexed files=2 symbols=2 edges=1");
+    expect(textOut).toContain("# Project architecture");
+    expect(textOut).toContain("```mermaid");
+    expect(textOut).toContain("## Architectural Hubs");
+
+    const jsonOut = JSON.parse(cli(["index", "--summary", "--json"])) as {
+      files: number;
+      symbols: number;
+      edges: number;
+      summary: { indexed: boolean; mermaid?: string; groups: unknown[] };
+    };
+    expect(jsonOut).toMatchObject({ files: 2, symbols: 2, edges: 1 });
+    expect(jsonOut.summary.indexed).toBe(true);
+    expect(jsonOut.summary.mermaid).toContain("flowchart LR");
+    expect(jsonOut.summary.groups).toHaveLength(2);
+
+    const createdOut = cli(["index", "--write-doc"]);
+    expect(createdOut).toContain('✓ Dokumen "architecture" dibuat (v1).');
+    const savedDoc = cli(["doc", "get", "architecture"]);
+    expect(savedDoc).toContain("# Project architecture");
+    expect(savedDoc).toContain("## Module Dependency Graph");
+
+    // Re-running --write-doc updates the existing document version cleanly.
+    const updatedOut = JSON.parse(cli(["index", "--write-doc", "--json"])) as {
+      created: boolean;
+      document: { slug: string; kind: string; version: number };
+    };
+    expect(updatedOut.created).toBe(false);
+    expect(updatedOut.document).toMatchObject({
+      slug: "architecture",
+      kind: "architecture",
+      version: 2,
+    });
+  }, 20_000);
+
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {
       const result = runCli([command, "--platform", "unknown-platform"]);

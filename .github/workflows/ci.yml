@@ -29,3 +29,35 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      - name: Smoke check isolated dist bundle
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { execFileSync, spawnSync } = require('node:child_process');
+          const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'catenext-ci-smoke-'));
+          try {
+            fs.cpSync('dist', path.join(tmp, 'dist'), { recursive: true });
+            const bin = path.join(tmp, 'dist', 'index.js');
+            const version = execFileSync(process.execPath, [bin, '--version'], { cwd: tmp, encoding: 'utf8' }).trim();
+            assert.match(version, /^\d+\.\d+\.\d+/);
+            const repo = path.join(tmp, 'repo');
+            fs.mkdirSync(repo);
+            execFileSync(process.execPath, [bin, 'init', '--platform', 'cursor', '--yes'], { cwd: repo, encoding: 'utf8' });
+            assert.equal(fs.existsSync(path.join(repo, '.cursor', 'mcp.json')), true);
+            const initReq = JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'initialize',
+              params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'ci-smoke', version: '1.0' } },
+            }) + '\n';
+            const mcp = spawnSync(process.execPath, [bin, 'mcp', '--root', repo], { cwd: tmp, encoding: 'utf8', input: initReq, timeout: 5000 });
+            assert.equal(mcp.status, 0, mcp.stderr);
+            const res = JSON.parse(mcp.stdout.trim().split(/\r?\n/)[0]);
+            assert.equal(res.result?.serverInfo?.name, 'catenext');
+          } finally {
+            fs.rmSync(tmp, { recursive: true, force: true });
+          }
+          "

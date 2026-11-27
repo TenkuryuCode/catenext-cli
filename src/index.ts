@@ -670,23 +670,122 @@ permCmd
     ),
   );
 
+function parseIntRange(flag: string, min: number, max: number) {
+  return (value: string): number => {
+    if (!/^\d+$/.test(value.trim())) {
+      throw new InvalidArgumentError(`${flag} harus bilangan bulat ${min}..${max}.`);
+    }
+    const n = Number.parseInt(value, 10);
+    if (n < min || n > max) {
+      throw new InvalidArgumentError(`${flag} harus antara ${min} dan ${max}.`);
+    }
+    return n;
+  };
+}
+
 program
   .command("index")
   .description("Bangun ulang indeks graf kode lokal (file/symbol/import) di SQLite")
-  .action(() =>
-    friendly(async () => {
-      const root = await requireRoot();
-      const config = await readConfig(root);
-      const { stateFilePath } = await import("./config.js");
-      const { indexProjectGraph } = await import("./db/graph-index.js");
-      const dbPath = stateFilePath(root, config);
-      // Ensure DB + project row exist.
-      await (await cliService(root)).callTool("session_brief", {});
-      const result = await indexProjectGraph(dbPath, config.project_id, root);
-      console.log(
-        `✓ indexed files=${result.files} symbols=${result.symbols} edges=${result.edges}`,
-      );
-    }),
+  .option("--summary", "Cetak ringkasan arsitektur graf kode")
+  .option(
+    "--write-doc [slug]",
+    "Simpan ringkasan arsitektur ke dokumen proyek (default: architecture)",
+  )
+  .option("--depth <n>", "Kedalaman kelompok direktori (1-3)", parseIntRange("--depth", 1, 3), 2)
+  .option(
+    "--max-hubs <n>",
+    "Jumlah maksimal hub arsitektur (1-30)",
+    parseIntRange("--max-hubs", 1, 30),
+    12,
+  )
+  .option("--json", "Keluaran JSON")
+  .action(
+    (opts: {
+      summary?: boolean;
+      writeDoc?: string | boolean;
+      depth: number;
+      maxHubs: number;
+      json?: boolean;
+    }) =>
+      friendly(async () => {
+        const root = await requireRoot();
+        const config = await readConfig(root);
+        const dbPath = stateFilePath(root, config);
+        const service = await cliService(root);
+        // Ensure DB + project row exist.
+        await service.callTool("session_brief", {});
+        const { indexProjectGraph } = await import("./db/graph-index.js");
+        const result = await indexProjectGraph(dbPath, config.project_id, root);
+
+        const wantDoc = opts.writeDoc !== undefined && opts.writeDoc !== false;
+        const wantSummary = Boolean(opts.summary || wantDoc);
+        let summary: Awaited<ReturnType<typeof service.callTool<"graph_summary">>> | undefined;
+        let savedDoc: Awaited<ReturnType<typeof service.callTool<"save_document">>> | undefined;
+
+        if (wantSummary) {
+          summary = await service.callTool("graph_summary", {
+            depth: opts.depth,
+            max_hubs: opts.maxHubs,
+            include_mermaid: true,
+          });
+        }
+
+        if (wantDoc && summary) {
+          const { renderArchitectureMarkdown } = await import("./db/graph-summary.js");
+          const docSlug =
+            typeof opts.writeDoc === "string" && opts.writeDoc.trim()
+              ? opts.writeDoc.trim()
+              : "architecture";
+          const content = renderArchitectureMarkdown(summary, { depth: opts.depth });
+          let expectedVersion: number | undefined;
+          try {
+            const existing = await service.callTool("get_document", {
+              slug: docSlug,
+              outline_only: true,
+            });
+            expectedVersion = existing.version;
+          } catch (error) {
+            if (!(error instanceof LocalServiceError && error.code === "not_found")) {
+              throw error;
+            }
+          }
+          savedDoc = await service.callTool("save_document", {
+            slug: docSlug,
+            title: "Project architecture",
+            kind: "architecture",
+            content,
+            ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
+          });
+        }
+
+        if (opts.json) {
+          console.log(
+            JSON.stringify(
+              {
+                ...result,
+                ...(summary ? { summary } : {}),
+                ...(savedDoc ? { document: savedDoc.document, created: savedDoc.created } : {}),
+              },
+              null,
+              2,
+            ),
+          );
+          return;
+        }
+
+        console.log(
+          `✓ indexed files=${result.files} symbols=${result.symbols} edges=${result.edges}`,
+        );
+        if (opts.summary && summary) {
+          const { renderArchitectureMarkdown } = await import("./db/graph-summary.js");
+          console.log(`\n${renderArchitectureMarkdown(summary, { depth: opts.depth }).trimEnd()}`);
+        }
+        if (savedDoc) {
+          console.log(
+            `✓ Dokumen "${savedDoc.document.slug}" ${savedDoc.created ? "dibuat" : "diperbarui"} (v${savedDoc.document.version}).`,
+          );
+        }
+      }),
   );
 
 const doc = program

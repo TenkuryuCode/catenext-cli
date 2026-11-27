@@ -292,10 +292,14 @@ Portabilitas lintas repo: [template export/import](#template-lintas-proyek).
 
 ```bash
 catenext index
+catenext index --summary --depth 2 --max-hubs 12
+catenext index --write-doc architecture      # simpan peta arsitektur ke dokumen lokal (default: architecture)
 catenext search "login handler" --code
 ```
 
-Indeks graf dan pencarian `--code` memakai SQLite FTS5 (`unicode61`, fallback `LIKE` yang aman) dengan penelusuran file yang menghormati `.gitignore`, batas ukuran 256 KiB per file, serta guard `lstat`/`realpath` terhadap symlink.
+- **Graf poliglot:** mendukung JS/TS (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`), `.vue`/`.svelte` (blok `<script>`), Python (impor lokal + relatif), Go (`go.mod`), Rust (`mod`, `crate::`, `super::`, `self::`), PHP (`composer.json` PSR-4 dalam batas `realRoot`), serta simbol `.java`/`.kt`.
+- **Peta arsitektur hemat token:** tool MCP `graph_summary` (`depth` 1–3 default 2, `max_hubs` 1–30 default 12, `include_mermaid` default `true`) tersedia read-only untuk `orchestrator` dan `worker` (28 tool MCP default; 32 dengan `--allow-crud`), bersama `graph_neighbors`, `symbol_search`, dan `search_context` (`sources: ["code"]`).
+- **Pencarian FTS5:** SQLite FTS5 (`unicode61`, fallback `LIKE`) termasuk `.php`, `.vue`, `.svelte`, `.astro`, `.graphql`, `.proto`, dengan penelusuran `.gitignore`-aware, batas 256 KiB per file, guard symlink `lstat`/`realpath`, dan checkpoint WAL bersih saat koneksi ditutup.
 
 ## Data lokal
 
@@ -336,7 +340,7 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `doctor` | - | Diagnostik read-only |
 | `backup` / `restore` | - | Snapshot SQLite konsisten (`0600`) & pulihkan dengan cek integritas |
 | `mcp` | - | Stdio MCP (`--allow-crud` opt-in) |
-| `index` / `search` | code search tools | Graf & pencarian FTS5 |
+| `index` / `search` | `graph_summary` / `graph_neighbors` / `symbol_search` / `search_context` | Graf poliglot, peta arsitektur (`--summary`, `--write-doc`), & pencarian FTS5 |
 | `log` / `permission …` / `root …` | - | Audit, izin, roots |
 
 Semua perintah CLI menerima `--json`. `catenext --help` untuk opsi lengkap.

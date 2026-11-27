@@ -5,6 +5,7 @@ import {
   CreateTasksInput,
   findCycle,
   GetReadyTasksInput,
+  GraphSummaryInput,
   ManageTaskInput,
   MCP_TOOL_NAMES,
   SearchContextInput,
@@ -29,6 +30,7 @@ describe("registry tool MCP", () => {
         "get_project_context",
         "get_ready_tasks",
         "graph_neighbors",
+        "graph_summary",
         "interview_setup",
         "list_epics",
         "list_personas",
@@ -125,6 +127,18 @@ describe("registry tool MCP", () => {
         sources: ["document", "skill", "task", "code"],
       }).sources,
     ).toEqual(["document", "skill", "task", "code"]);
+  });
+
+  it("graph_summary applies defaults and enforces depth and max_hubs bounds", () => {
+    expect(GraphSummaryInput.parse({})).toEqual({
+      depth: 2,
+      max_hubs: 12,
+      include_mermaid: true,
+    });
+    expect(GraphSummaryInput.safeParse({ depth: 0 }).success).toBe(false);
+    expect(GraphSummaryInput.safeParse({ depth: 4 }).success).toBe(false);
+    expect(GraphSummaryInput.safeParse({ max_hubs: 0 }).success).toBe(false);
+    expect(GraphSummaryInput.safeParse({ max_hubs: 31 }).success).toBe(false);
   });
 
   it("claim_task menerima worktree tanpa atau dengan worktree_path dan base_branch", () => {
