@@ -1,8 +1,20 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { listSkills, loadSkill, parseSkill, renderSkill, saveSkill } from "./skills.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  listSkills,
+  loadSkill,
+  parseSkill,
+  removeSkill,
+  renderSkill,
+  saveSkill,
+  skillCreate,
+  skillList,
+  skillRemove,
+  skillSet,
+  writeSkill,
+} from "./skills.js";
 
 let root: string;
 afterEach(async () => {
@@ -59,5 +71,52 @@ describe("skills lokal", () => {
     await expect(
       saveSkill(root, { name: "../x", when_to_use: "x", content: "y" }),
     ).rejects.toThrow();
+  });
+
+  it("writeSkill sama dengan saveSkill dan removeSkill menghapus file", async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-skills-"));
+    const saved = await writeSkill(root, { name: "tmp", when_to_use: "uji", content: "isi" });
+    expect(saved.created).toBe(true);
+    await removeSkill(root, "tmp");
+    await expect(loadSkill(root, "tmp")).rejects.toThrow(/tidak ada/);
+  });
+
+  it("CLI create/set/remove/list", async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-skills-"));
+    const body = join(root, "body.md");
+    await writeFile(body, "Instruksi singkat.");
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    try {
+      await skillCreate(root, "guide", { whenToUse: "Saat onboarding", file: body });
+      expect(logs.at(-1)).toMatch(/dibuat/);
+      logs.length = 0;
+      await expect(skillCreate(root, "guide", { whenToUse: "lagi", file: body })).rejects.toThrow(
+        /sudah ada/,
+      );
+      await writeFile(body, "Instruksi diperbarui.");
+      await skillSet(root, "guide", { file: body });
+      expect(logs.at(-1)).toMatch(/diperbarui/);
+      await skillList(root, { json: true });
+      const listLine = logs.at(-1);
+      expect(listLine).toBeDefined();
+      expect(JSON.parse(listLine ?? "")).toMatchObject({
+        skills: [{ name: "guide", when_to_use: "Saat onboarding" }],
+      });
+      await skillRemove(root, "guide", { json: true });
+      const removeLine = logs.at(-1);
+      expect(removeLine).toBeDefined();
+      expect(JSON.parse(removeLine ?? "")).toEqual({ path: ".catenext/skills/guide.md" });
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("skill set menolak update tanpa argumen pada skill yang ada", async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-skills-"));
+    await saveSkill(root, { name: "x", when_to_use: "a", content: "b" });
+    await expect(skillSet(root, "x", {})).rejects.toThrow(/--when-to-use/);
   });
 });

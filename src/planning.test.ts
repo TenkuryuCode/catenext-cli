@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatenextConfigSchema, EPIC_TEMPLATES } from "@catenext/shared";
@@ -9,8 +10,10 @@ import { z } from "zod";
 import { LocalService } from "./local-service.js";
 import {
   boardShow,
+  docArchive,
   docGet,
   docList,
+  docRestore,
   docSave,
   epicCreate,
   epicList,
@@ -18,15 +21,18 @@ import {
   epicUpdate,
   PlanningInputError,
   personaList,
+  personaRemove,
   personaSet,
   prepare,
   readJsonInput,
+  regenPersonaSubagents,
   searchShow,
   taskCancel,
   taskCreate,
   taskDeps,
   taskUpdate,
 } from "./planning.js";
+import { SUBAGENT_MARKER } from "./subagents.js";
 
 let root: string;
 let service: LocalService;
@@ -44,7 +50,10 @@ beforeEach(async () => {
     project_id: randomUUID(),
     project_name: "PlanningTest",
     repo_name: "be",
+    platforms: ["cursor"],
   });
+  await mkdir(join(root, ".catenext"), { recursive: true });
+  await writeFile(join(root, ".catenext", "config.yaml"), JSON.stringify(config));
   service = new LocalService(root, config);
 });
 
@@ -344,6 +353,23 @@ describe("persona, board, doc, and search handlers", () => {
     expect(logs.at(-1)).toContain('✓ Persona "be" (backend) dibuat');
 
     logs.length = 0;
+    await regenPersonaSubagents(root, service, { platforms: ["cursor"] });
+    const stubPath = join(root, ".cursor", "agents", "be.md");
+    expect(existsSync(stubPath)).toBe(true);
+    await expect(readFile(stubPath, "utf8")).resolves.toContain(SUBAGENT_MARKER);
+    expect(logs.join("\n")).toContain("Mulai ulang klien MCP/IDE");
+
+    logs.length = 0;
+    await personaRemove(service, "be", false);
+    expect(logs.at(-1)).toContain('✓ Persona "be" dihapus');
+
+    logs.length = 0;
+    await regenPersonaSubagents(root, service, { platforms: ["cursor"] });
+    expect(existsSync(stubPath)).toBe(false);
+
+    await personaSet(service, "be", "backend", ["Write tests"], false, ["be"]);
+
+    logs.length = 0;
     await personaList(service, false);
     expect(logs.join("\n")).toContain("be (backend, repo be, proyek)");
     expect(logs.join("\n")).toContain("- Write tests");
@@ -362,11 +388,11 @@ describe("persona, board, doc, and search handlers", () => {
     expect(logs.join("\n")).toContain("BoardTask");
 
     logs.length = 0;
-    await docList(service, false);
+    await docList(service, { json: false });
     expect(logs.at(-1)).toContain("Belum ada dokumen proyek");
 
     const docFile = join(root, "blueprint.md");
-    await writeFile(docFile, "# Blueprint\nDetails\n");
+    await writeFile(docFile, "# Blueprint\nDetails\n\n## Scope\n\nNarrow.\n");
     await docSave(service, "blueprint", {
       file: docFile,
       title: "Blueprint",
@@ -376,9 +402,38 @@ describe("persona, board, doc, and search handlers", () => {
     expect(logs.at(-1)).toContain('✓ Dokumen "blueprint" dibuat (v1)');
 
     logs.length = 0;
-    await docGet(service, "blueprint", false);
+    await docGet(service, "blueprint", { json: false });
     expect(logs.join("\n")).toContain("<!-- blueprint v1 (blueprint) -->");
     expect(logs.join("\n")).toContain("# Blueprint");
+
+    logs.length = 0;
+    await docGet(service, "blueprint", { json: false, outline: true });
+    expect(logs.join("\n")).toContain("· outline");
+    expect(logs.join("\n")).toContain("# Blueprint");
+    expect(logs.join("\n")).toContain("## Scope");
+
+    logs.length = 0;
+    await docGet(service, "blueprint", { json: false, section: "Scope" });
+    expect(logs.join("\n")).toContain("· bagian: Scope");
+    expect(logs.join("\n")).toContain("Narrow.");
+
+    await expect(
+      docGet(service, "blueprint", { json: false, outline: true, section: "Scope" }),
+    ).rejects.toThrow(/Jangan gabungkan --outline dengan --section/);
+
+    await docArchive(service, "blueprint", false);
+    expect(logs.at(-1)).toContain('✓ Dokumen "blueprint" diarsipkan');
+
+    logs.length = 0;
+    await docList(service, { json: false });
+    expect(logs.join("\n")).not.toContain("blueprint");
+
+    await docList(service, { json: false, includeArchived: true });
+    expect(logs.join("\n")).toContain("blueprint");
+    expect(logs.join("\n")).toContain("[arsip]");
+
+    await docRestore(service, "blueprint", false);
+    expect(logs.at(-1)).toContain('✓ Dokumen "blueprint" dipulihkan');
 
     await expect(searchShow("auth", { source: ["bogus"] })).rejects.toThrow(
       /Sumber pencarian tidak valid: bogus/,

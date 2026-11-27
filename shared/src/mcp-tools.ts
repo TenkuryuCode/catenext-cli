@@ -22,9 +22,13 @@ import {
 } from "./common.js";
 import { findCycle } from "./dag.js";
 import {
+  ArchiveDocumentInput,
+  ArchiveDocumentOutput,
   DocumentIndexEntrySchema,
   GetDocumentInput,
   GetDocumentOutput,
+  RestoreDocumentInput,
+  RestoreDocumentOutput,
   SaveDocumentInput,
   SaveDocumentOutput,
 } from "./documents.js";
@@ -87,7 +91,12 @@ const ClaimDependencyHandoffSchema = z.object({
 
 // --- get_project_context ----------------------------------------------------
 
-export const GetProjectContextInput = z.object({ ...PersonaFilter, lease_id: IdSchema.optional() });
+export const GetProjectContextInput = z.object({
+  ...PersonaFilter,
+  lease_id: IdSchema.optional(),
+  /** Sertakan dokumen yang sudah diarsipkan dalam indeks; default hanya dokumen aktif. */
+  include_archived: z.boolean().optional(),
+});
 export const GetProjectContextOutput = z.object({
   project: z.object({
     id: IdSchema,
@@ -507,6 +516,12 @@ export const UpsertPersonaOutput = z.object({
   created: z.boolean(),
 });
 
+export const RemovePersonaInput = z.object({ alias: AgentAliasSchema });
+export const RemovePersonaOutput = z.object({
+  alias: AgentAliasSchema,
+  removed: z.literal(true),
+});
+
 // --- Registry ---------------------------------------------------------------
 
 export interface McpToolContract<I extends z.ZodType, O extends z.ZodType> {
@@ -548,6 +563,16 @@ export const MCP_TOOLS = {
     "Buat/perbarui dokumen proyek lokal agar sesi/IDE/CLI lain tidak kehilangan konteks. Markdown ringkas, tanpa code dump atau secret. Kirim expected_version dari versi yang Anda baca (0 = baru).",
     SaveDocumentInput,
     SaveDocumentOutput,
+  ),
+  archive_document: tool(
+    "Arsipkan dokumen proyek (soft-archive: set archived_at). Dokumen terarsip tidak muncul di indeks get_project_context, search_context, atau doc list kecuali include_archived.",
+    ArchiveDocumentInput,
+    ArchiveDocumentOutput,
+  ),
+  restore_document: tool(
+    "Pulihkan dokumen yang diarsipkan (hapus archived_at) agar kembali terlihat di indeks default.",
+    RestoreDocumentInput,
+    RestoreDocumentOutput,
   ),
   manage_task: tool(
     "Khusus orchestrator (agen utama, bukan subagent persona): request_revision memindahkan task NEEDS_REVIEW/DONE ke kolom Revisi dengan feedback; assign mengatur persona/role; return_to_draft menarik kembali TODO; unblock mengembalikan BLOCKED -> TODO. Persetujuan hanya lewat CLI manusia: `catenext task approve <id>` atau `catenext review approve <id>`.",
@@ -628,6 +653,11 @@ export const MCP_TOOLS = {
     "Buat atau perbarui persona proyek ini (alias unik, role, aturan, repo yang dipegang).",
     UpsertPersonaInput,
     UpsertPersonaOutput,
+  ),
+  remove_persona: tool(
+    "Hapus persona proyek ini. Ditolak bila masih ada lease aktif pada task milik alias atau workspace root dengan owner_persona = alias.",
+    RemovePersonaInput,
+    RemovePersonaOutput,
   ),
   load_skill: tool(
     "Muat isi lengkap skill repo dari .catenext/skills/<name>.md saat relevan dengan task aktif.",

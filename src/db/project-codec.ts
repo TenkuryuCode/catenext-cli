@@ -11,6 +11,12 @@ function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   }
 }
 
+function documentsSelectSql(db: DatabaseSync): string {
+  const columns = db.prepare("PRAGMA table_info(documents)").all() as { name: string }[];
+  const base = "slug, title, kind, version, updated_by, updated_at, size, content";
+  return columns.some((col) => col.name === "archived_at") ? `${base}, archived_at` : base;
+}
+
 export function emptyExtendedProject(): LocalProject {
   return {
     repos: [],
@@ -122,12 +128,10 @@ export function loadProjectState(
     repos: reposByAlias.get(row.alias) ?? [],
   }));
 
+  const documentSelect = documentsSelectSql(db);
   project.documents = (
     db
-      .prepare(
-        `SELECT slug, title, kind, version, updated_by, updated_at, size, content
-         FROM documents WHERE project_id = ? ORDER BY slug`,
-      )
+      .prepare(`SELECT ${documentSelect} FROM documents WHERE project_id = ? ORDER BY slug`)
       .all(projectId) as {
       slug: string;
       title: string;
@@ -137,6 +141,7 @@ export function loadProjectState(
       updated_at: string;
       size: number;
       content: string;
+      archived_at?: string | null;
     }[]
   ).map((row) => ({
     slug: row.slug,
@@ -147,6 +152,7 @@ export function loadProjectState(
     updated_at: row.updated_at,
     size: row.size,
     content: row.content,
+    archived_at: row.archived_at ?? null,
   }));
 
   const depRows = db
@@ -320,10 +326,7 @@ export function loadDocument(
   slug: string,
 ): ProjectDocument | undefined {
   const row = db
-    .prepare(
-      `SELECT slug, title, kind, version, updated_by, updated_at, size, content
-       FROM documents WHERE project_id = ? AND slug = ?`,
-    )
+    .prepare(`SELECT ${documentsSelectSql(db)} FROM documents WHERE project_id = ? AND slug = ?`)
     .get(projectId, slug) as
     | {
         slug: string;
@@ -334,6 +337,7 @@ export function loadDocument(
         updated_at: string;
         size: number;
         content: string;
+        archived_at?: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -346,6 +350,7 @@ export function loadDocument(
     updated_at: row.updated_at,
     size: row.size,
     content: row.content,
+    archived_at: row.archived_at ?? null,
   };
 }
 
@@ -353,8 +358,8 @@ export function loadDocument(
 export function saveDocumentRow(db: DatabaseSync, projectId: string, doc: ProjectDocument): void {
   db.prepare(
     `INSERT INTO documents
-      (project_id, slug, title, kind, version, updated_by, updated_at, size, content)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (project_id, slug, title, kind, version, updated_by, updated_at, size, content, archived_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_id, slug) DO UPDATE SET
        title = excluded.title,
        kind = excluded.kind,
@@ -362,7 +367,8 @@ export function saveDocumentRow(db: DatabaseSync, projectId: string, doc: Projec
        updated_by = excluded.updated_by,
        updated_at = excluded.updated_at,
        size = excluded.size,
-       content = excluded.content`,
+       content = excluded.content,
+       archived_at = excluded.archived_at`,
   ).run(
     projectId,
     doc.slug,
@@ -373,6 +379,7 @@ export function saveDocumentRow(db: DatabaseSync, projectId: string, doc: Projec
     doc.updated_at,
     doc.size,
     doc.content,
+    doc.archived_at ?? null,
   );
 }
 
@@ -588,8 +595,8 @@ export function saveProjectDiff(
     if (!prev) {
       insDoc ??= db.prepare(
         `INSERT INTO documents
-          (project_id, slug, title, kind, version, updated_by, updated_at, size, content)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (project_id, slug, title, kind, version, updated_by, updated_at, size, content, archived_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       insDoc.run(
         projectId,
@@ -601,6 +608,7 @@ export function saveProjectDiff(
         doc.updated_at,
         doc.size,
         doc.content,
+        doc.archived_at ?? null,
       );
     } else if (
       prev.title !== doc.title ||
@@ -609,11 +617,12 @@ export function saveProjectDiff(
       prev.updated_by !== doc.updated_by ||
       prev.updated_at !== doc.updated_at ||
       prev.size !== doc.size ||
-      prev.content !== doc.content
+      prev.content !== doc.content ||
+      (prev.archived_at ?? null) !== (doc.archived_at ?? null)
     ) {
       updDoc ??= db.prepare(
         `UPDATE documents
-         SET title = ?, kind = ?, version = ?, updated_by = ?, updated_at = ?, size = ?, content = ?
+         SET title = ?, kind = ?, version = ?, updated_by = ?, updated_at = ?, size = ?, content = ?, archived_at = ?
          WHERE project_id = ? AND slug = ?`,
       );
       updDoc.run(
@@ -624,6 +633,7 @@ export function saveProjectDiff(
         doc.updated_at,
         doc.size,
         doc.content,
+        doc.archived_at ?? null,
         projectId,
         doc.slug,
       );
@@ -866,8 +876,8 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
 
   const insertDoc = db.prepare(
     `INSERT INTO documents
-      (project_id, slug, title, kind, version, updated_by, updated_at, size, content)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (project_id, slug, title, kind, version, updated_by, updated_at, size, content, archived_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const doc of project.documents) {
     insertDoc.run(
@@ -880,6 +890,7 @@ export function saveProject(db: DatabaseSync, projectId: string, project: LocalP
       doc.updated_at,
       doc.size,
       doc.content,
+      doc.archived_at ?? null,
     );
   }
 

@@ -236,7 +236,7 @@ describe("SQLite schema migrations", () => {
       expect(colsBefore.some((c) => c.name === "integrated_commit_json")).toBe(false);
 
       const result1 = runSchemaMigrations(db);
-      expect(result1).toEqual({ fromVersion: 1, toVersion: SCHEMA_VERSION, applied: [2, 3, 4] });
+      expect(result1).toEqual({ fromVersion: 1, toVersion: SCHEMA_VERSION, applied: [2, 3, 4, 5] });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
       expect(colsAfter.some((c) => c.name === "integrated_commit_json")).toBe(true);
@@ -345,12 +345,52 @@ describe("SQLite schema migrations", () => {
           .all()
           .some(({ name }) => name === "position"),
       ).toBe(false);
-      expect(runSchemaMigrations(db)).toEqual({ fromVersion: 3, toVersion: 4, applied: [4] });
+      expect(runSchemaMigrations(db, { targetVersion: 4 })).toEqual({
+        fromVersion: 3,
+        toVersion: 4,
+        applied: [4],
+      });
       const tasks = loadProject(db, first.projectId).tasks;
       expect(tasks.map(({ id, position }) => [id, position])).toEqual(
         [first.taskId, ...next].map((id, position) => [id, position]),
       );
       expect(loadProject(db, otherProject).tasks[0]?.position).toBe(0);
+      expect(runSchemaMigrations(db, { targetVersion: 4 }).applied).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("adds documents.archived_at on v5 migration and leaves existing rows NULL", () => {
+    const dbPath = join(dir, "docs-v4.sqlite");
+    const { projectId } = createV1Database(dbPath);
+    const db = new DatabaseSync(dbPath);
+    const stamp = "2026-01-15T12:00:00.000Z";
+    try {
+      runSchemaMigrations(db, { targetVersion: 4 });
+      db.prepare(
+        `INSERT INTO documents
+          (project_id, slug, title, kind, version, updated_by, updated_at, size, content)
+         VALUES (?, 'blueprint', 'Blueprint', 'blueprint', 1, 'be', ?, 8, 'body')`,
+      ).run(projectId, stamp);
+      expect(
+        db
+          .prepare("PRAGMA table_info(documents)")
+          .all()
+          .some(({ name }) => name === "archived_at"),
+      ).toBe(false);
+
+      expect(runSchemaMigrations(db)).toEqual({ fromVersion: 4, toVersion: 5, applied: [5] });
+      const docCols = (
+        db.prepare("PRAGMA table_info(documents)").all() as { name: string; dflt_value: unknown }[]
+      ).find((c) => c.name === "archived_at");
+      expect(docCols?.name).toBe("archived_at");
+
+      const row = db
+        .prepare("SELECT archived_at FROM documents WHERE project_id = ? AND slug = 'blueprint'")
+        .get(projectId) as { archived_at: string | null };
+      expect(row.archived_at).toBeNull();
+      expect(loadProject(db, projectId).documents[0]?.archived_at ?? null).toBeNull();
       expect(runSchemaMigrations(db).applied).toEqual([]);
     } finally {
       db.close();

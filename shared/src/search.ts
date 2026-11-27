@@ -9,6 +9,8 @@ export const SearchContextInput = z.object({
   query: z.string().trim().min(1).max(500),
   sources: z.array(SearchSourceSchema).min(1).max(4).default(["document", "skill", "task"]),
   limit: z.number().int().min(1).max(20).default(8),
+  /** Sertakan dokumen yang sudah diarsipkan; default hanya dokumen aktif. */
+  include_archived: z.boolean().optional(),
 });
 export type SearchContextInputType = z.input<typeof SearchContextInput>;
 

@@ -103,6 +103,9 @@ it("supports OpenCode workspace JSONC and VS Code editor-managed workspace confi
       catenext: { type: "stdio", command: "node", args: ["cli.js", "mcp", "--root", root] },
     },
   });
+  const vscodeEntry = await readFile(join(root, ".vscode/CATENEXT.md"), "utf8");
+  expect(vscodeEntry).toContain("VS Code · Catenext entry");
+  expect(vscodeEntry).toContain(".github/agents/");
   expect(await planInit({ root, mcpCommand: CMD })).toEqual([]);
 });
 

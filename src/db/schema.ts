@@ -1,6 +1,6 @@
-/** SQLite DDL for local Catenext orchestration (schema version 4). */
+/** SQLite DDL for local Catenext orchestration (schema version 5). */
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS documents (
   updated_at TEXT NOT NULL,
   size INTEGER NOT NULL,
   content TEXT NOT NULL,
+  archived_at TEXT,
   PRIMARY KEY (project_id, slug)
 );
 

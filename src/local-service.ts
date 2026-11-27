@@ -139,6 +139,18 @@ function recordIndex(doc: ProjectDocument) {
   return DocumentIndexEntrySchema.parse(doc);
 }
 
+function isDocumentArchived(doc: ProjectDocument): boolean {
+  return doc.archived_at != null && doc.archived_at.length > 0;
+}
+
+function filterVisibleDocuments(
+  documents: ProjectDocument[],
+  includeArchived?: boolean,
+): ProjectDocument[] {
+  if (includeArchived) return documents;
+  return documents.filter((doc) => !isDocumentArchived(doc));
+}
+
 function extractMarkdownOutline(content: string): DocumentHeading[] {
   const headings: DocumentHeading[] = [];
   const lines = content.split(/\r?\n/);
@@ -867,6 +879,7 @@ class LocalWorkflow {
       })),
     }),
     upsert_persona: (input) => this.upsertPersona(input),
+    remove_persona: (input) => this.removePersona(input),
     get_project_board: (input) => this.board(input),
     get_project_context: (input) => this.context(input),
     get_ready_tasks: (input) => ({
@@ -878,6 +891,8 @@ class LocalWorkflow {
     complete_handoff: (input) => this.handoff(input),
     get_document: (input) => this.document(input),
     save_document: (input) => this.saveDocument(input),
+    archive_document: (input) => this.archiveDocument(input),
+    restore_document: (input) => this.restoreDocument(input),
     search_context: (input) => this.search(input),
     review_pull_request: ({ request }) => this.review(request),
     load_skill: async ({ name, revision }) => {
@@ -1087,6 +1102,45 @@ class LocalWorkflow {
     } else this.project.personas.push(persona);
     this.dirty();
     return { persona, created: !existing };
+  }
+
+  private removePersona(input: Parsed<"remove_persona">): McpToolOutput<"remove_persona"> {
+    if (this.caller === "agent") {
+      const allowed = (this.project.permissions ?? []).some(
+        (row) => row.action === "upsert_persona" && row.principal === "orchestrator",
+      );
+      if (!allowed) fail("permission_denied", "remove_persona requires edit permission.");
+    }
+    const idx = this.project.personas.findIndex((p) => p.alias === input.alias);
+    if (idx < 0) {
+      fail("persona_not_found", `Persona "${input.alias}" tidak ditemukan di proyek ini.`);
+    }
+    const leased = this.project.tasks.filter(
+      (task) => task.persona === input.alias && this.activeLease(task),
+    );
+    if (leased.length > 0) {
+      fail(
+        "persona_in_use",
+        `Persona "${input.alias}" masih memegang lease aktif pada ${leased.length} task; lepas lease dulu.`,
+        { task_ids: leased.map((t) => t.id) },
+      );
+    }
+    const ownedRoots = (this.project.workspace_roots ?? []).filter(
+      (root) => root.ownerPersona === input.alias,
+    );
+    if (ownedRoots.length > 0) {
+      fail(
+        "persona_owns_roots",
+        `Persona "${input.alias}" masih menjadi owner ${ownedRoots.length} workspace root; pindahkan atau hapus root dulu.`,
+        { root_ids: ownedRoots.map((r) => r.id) },
+      );
+    }
+    for (const task of this.project.tasks) {
+      if (task.persona === input.alias) task.persona = null;
+    }
+    this.project.personas.splice(idx, 1);
+    this.dirty();
+    return { alias: input.alias, removed: true };
   }
 
   private repos(): string[] {
@@ -1434,7 +1488,7 @@ class LocalWorkflow {
       skills: skills.map(({ name, when_to_use }) => ({ name, when_to_use, repo_name: this.repo })),
       recent_handoffs: [...recent.values()].slice(0, active ? undefined : 5),
       project_repos: this.repos(),
-      documents: this.project.documents
+      documents: filterVisibleDocuments(this.project.documents, input.include_archived)
         .map(recordIndex)
         .sort((a, b) => a.kind.localeCompare(b.kind) || a.slug.localeCompare(b.slug)),
       workspace_roots: this.workspaceRootSummaries(),
@@ -1849,6 +1903,7 @@ class LocalWorkflow {
       updated_at: this.iso,
       updated_by: `local@${this.repo}`,
       size: input.content.length,
+      archived_at: existing?.archived_at ?? null,
     };
     if (existing) Object.assign(existing, doc);
     else this.project.documents.push(doc);
@@ -1856,11 +1911,45 @@ class LocalWorkflow {
     return { document: recordIndex(doc), created: !existing };
   }
 
+  private archiveDocument(input: Parsed<"archive_document">): McpToolOutput<"archive_document"> {
+    const existing =
+      this.project.documents.find((doc) => doc.slug === input.slug) ??
+      fail("not_found", `Dokumen "${input.slug}" tidak ditemukan di proyek ini.`);
+    if (isDocumentArchived(existing)) {
+      fail("already_archived", `Dokumen "${input.slug}" sudah diarsipkan.`);
+    }
+    Object.assign(existing, {
+      archived_at: this.iso,
+      updated_at: this.iso,
+      updated_by: `local@${this.repo}`,
+      version: existing.version + 1,
+    });
+    this.dirty();
+    return { document: recordIndex(existing) };
+  }
+
+  private restoreDocument(input: Parsed<"restore_document">): McpToolOutput<"restore_document"> {
+    const existing =
+      this.project.documents.find((doc) => doc.slug === input.slug) ??
+      fail("not_found", `Dokumen "${input.slug}" tidak ditemukan di proyek ini.`);
+    if (!isDocumentArchived(existing)) {
+      fail("not_archived", `Dokumen "${input.slug}" tidak diarsipkan.`);
+    }
+    Object.assign(existing, {
+      archived_at: null,
+      updated_at: this.iso,
+      updated_by: `local@${this.repo}`,
+      version: existing.version + 1,
+    });
+    this.dirty();
+    return { document: recordIndex(existing) };
+  }
+
   private async search(input: Parsed<"search_context">): Promise<McpToolOutput<"search_context">> {
     const items: LocalSearchItem[] = [];
     const sources = new Set(input.sources);
     if (sources.has("document"))
-      for (const doc of this.project.documents)
+      for (const doc of filterVisibleDocuments(this.project.documents, input.include_archived))
         items.push({ source: "document", ref: doc.slug, title: doc.title, text: doc.content });
     if (sources.has("task"))
       for (const task of this.tasks.values())

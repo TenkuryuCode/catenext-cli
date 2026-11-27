@@ -1,11 +1,16 @@
 import { readFile } from "node:fs/promises";
 import {
+  ArchiveDocumentInput,
   CreateEpicToolInput,
   CreateTasksInput,
   EPIC_TEMPLATES,
   findEpicTemplate,
   GetDocumentInput,
   GetProjectBoardInput,
+  GetProjectContextInput,
+  type PlatformId,
+  RemovePersonaInput,
+  RestoreDocumentInput,
   SaveDocumentInput,
   SEARCH_SOURCES,
   SearchContextInput,
@@ -15,9 +20,11 @@ import {
   UpsertPersonaInput,
 } from "@catenext/shared";
 import type { z } from "zod";
-import { ConfigError, findProjectRoot, readConfig } from "./config.js";
+import { ConfigError, configuredPlatforms, findProjectRoot, readConfig } from "./config.js";
 import { LocalService } from "./local-service.js";
+import { applyFileEdits, summarize } from "./maintenance.js";
 import { describeRedactions, scrubDeep } from "./scrubber.js";
+import { planSubagents } from "./subagents.js";
 
 export class PlanningInputError extends Error {
   constructor(message: string) {
@@ -366,6 +373,54 @@ export async function personaSet(
   );
 }
 
+export async function personaRemove(service: LocalService, alias: string, asJson: boolean) {
+  const body = prepare(RemovePersonaInput, { alias }, ["alias"]);
+  const res = await service.callTool("remove_persona", body);
+  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  console.log(`✓ Persona "${res.alias}" dihapus dari proyek ini.`);
+}
+
+const RESTART_IDE_TIP =
+  "Mulai ulang klien MCP/IDE agar stub persona terbaca (sama seperti setelah `catenext sync`).";
+
+/** Regenerate IDE agent stubs after persona set/remove (same path as `catenext sync`). */
+export async function regenPersonaSubagents(
+  root: string,
+  service: LocalService,
+  opts: { platforms?: readonly PlatformId[]; force?: boolean; quiet?: boolean } = {},
+): Promise<void> {
+  const config = await readConfig(root);
+  const platforms = opts.platforms?.length ? opts.platforms : configuredPlatforms(config);
+  const { personas } = await service.callTool("list_personas", {});
+  const sub = await planSubagents(
+    root,
+    personas,
+    platforms,
+    {
+      stack: config.stack ?? [],
+      repoName: config.repo_name,
+      layout: config.layout,
+    },
+    { force: Boolean(opts.force) },
+  );
+  await applyFileEdits(root, sub.edits);
+  if (opts.quiet) return;
+  for (const l of summarize(sub.edits)) console.log(l);
+  for (const path of sub.skipped) {
+    console.log(`! ${path} already exists and is not Catenext-managed; skipped.`);
+  }
+  if (sub.edits.length === 0 && sub.skipped.length === 0) {
+    console.log(
+      `✓ Stub agen sudah selaras (${personas.length} persona, ${platforms.join(", ") || "none"}).`,
+    );
+  } else {
+    console.log(
+      `✓ Stub agen diperbarui untuk ${personas.length} persona: ${platforms.join(", ") || "none"}.`,
+    );
+  }
+  console.log(RESTART_IDE_TIP);
+}
+
 /** Papan proyek lintas repo untuk orchestrator (setara get_project_board). */
 export async function boardShow(
   service: LocalService,
@@ -401,23 +456,77 @@ export async function boardShow(
   if (res.truncated) console.log("\n(daftar dipotong; pakai --epic untuk mempersempit)");
 }
 
-export async function docList(service: LocalService, asJson: boolean) {
-  const { documents } = await service.callTool("get_project_context", {});
-  if (asJson) return console.log(JSON.stringify({ documents }, null, 2));
+export async function docList(
+  service: LocalService,
+  opts: { json?: boolean; includeArchived?: boolean },
+) {
+  const body = prepare(
+    GetProjectContextInput,
+    opts.includeArchived ? { include_archived: true } : {},
+    ["include_archived"],
+  );
+  const { documents } = await service.callTool("get_project_context", body);
+  if (opts.json) return console.log(JSON.stringify({ documents }, null, 2));
   if (documents.length === 0)
     return console.log(
       "Belum ada dokumen proyek. Buat dengan: catenext doc save <slug> --file <path.md>",
     );
-  for (const d of documents)
-    console.log(`${d.slug}  v${d.version}  ${d.kind}  ${d.title}  (${d.size} karakter)`);
+  for (const d of documents) {
+    const archived = d.archived_at ? "  [arsip]" : "";
+    console.log(`${d.slug}  v${d.version}  ${d.kind}  ${d.title}  (${d.size} karakter)${archived}`);
+  }
 }
 
-export async function docGet(service: LocalService, slug: string, asJson: boolean) {
-  const body = prepare(GetDocumentInput, { slug }, ["slug"]);
+export async function docGet(
+  service: LocalService,
+  slug: string,
+  opts: { json?: boolean; outline?: boolean; section?: string },
+) {
+  if (opts.outline && opts.section !== undefined) {
+    throw new PlanningInputError("Jangan gabungkan --outline dengan --section.");
+  }
+  const body = prepare(
+    GetDocumentInput,
+    {
+      slug,
+      ...(opts.outline ? { outline_only: true } : {}),
+      ...(opts.section !== undefined ? { section: opts.section } : {}),
+    },
+    ["slug", "outline_only", "section"],
+  );
   const res = await service.callTool("get_document", body);
-  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  if (opts.outline) {
+    console.log(`<!-- ${res.slug} v${res.version} (${res.kind}) · outline -->`);
+    for (const h of res.outline ?? []) {
+      const indent = "  ".repeat(Math.max(0, h.level - 1));
+      console.log(`${indent}${"#".repeat(h.level)} ${h.title}  (baris ${h.line})`);
+    }
+    return;
+  }
+  if (opts.section !== undefined) {
+    console.log(
+      `<!-- ${res.slug} v${res.version} (${res.kind}) · bagian: ${res.section ?? opts.section} -->`,
+    );
+    console.log(res.content);
+    return;
+  }
   console.log(`<!-- ${res.slug} v${res.version} (${res.kind}) -->`);
   console.log(res.content);
+}
+
+export async function docArchive(service: LocalService, slug: string, asJson: boolean) {
+  const body = prepare(ArchiveDocumentInput, { slug }, ["slug"]);
+  const res = await service.callTool("archive_document", body);
+  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  console.log(`✓ Dokumen "${res.document.slug}" diarsipkan (v${res.document.version}).`);
+}
+
+export async function docRestore(service: LocalService, slug: string, asJson: boolean) {
+  const body = prepare(RestoreDocumentInput, { slug }, ["slug"]);
+  const res = await service.callTool("restore_document", body);
+  if (asJson) return console.log(JSON.stringify(res, null, 2));
+  console.log(`✓ Dokumen "${res.document.slug}" dipulihkan (v${res.document.version}).`);
 }
 
 export async function docSave(

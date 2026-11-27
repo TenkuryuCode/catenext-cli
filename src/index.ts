@@ -31,6 +31,7 @@ import {
 } from "./fallback.js";
 import { applyInit, planInit, renderDiff } from "./init/index.js";
 import { McpConfigError } from "./init/mcp-config.js";
+import { formatInitDryRunPreview, planInitDryRunPreview } from "./init/preview.js";
 import { LocalServiceError } from "./local-service.js";
 import { PERMISSION_ACTIONS } from "./local-state.js";
 import { applyFileEdits, planRemove, planSync, summarize } from "./maintenance.js";
@@ -40,8 +41,10 @@ import { nodeLauncherWarning, stableNodeCommand } from "./node-command.js";
 import {
   boardShow,
   cliService,
+  docArchive,
   docGet,
   docList,
+  docRestore,
   docSave,
   epicCreate,
   epicList,
@@ -49,8 +52,10 @@ import {
   epicUpdate,
   PlanningInputError,
   personaList,
+  personaRemove,
   personaSet,
   prepare,
+  regenPersonaSubagents,
   requireRoot,
   searchShow,
   taskCancel,
@@ -58,7 +63,15 @@ import {
   taskDeps,
   taskUpdate,
 } from "./planning.js";
-import { listSkills, loadSkill, SkillError } from "./skills.js";
+import {
+  listSkills,
+  loadSkill,
+  SkillError,
+  skillCreate,
+  skillList,
+  skillRemove,
+  skillSet,
+} from "./skills.js";
 import { planSubagents } from "./subagents.js";
 import {
   buildTemplateBundle,
@@ -208,6 +221,14 @@ program
           console.log("✓ Tidak ada perubahan: Catenext sudah terpasang di repo ini.");
         } else if (opts.dryRun) {
           console.log(renderDiff(changes));
+          const preview = await planInitDryRunPreview({
+            root,
+            changes,
+            platforms,
+            personaSeed: answers.personaSeed,
+            stack: answers.stack,
+          });
+          for (const line of formatInitDryRunPreview(preview)) console.log(line);
           console.log(`(dry-run) ${changes.length} file akan berubah. Tidak ada yang ditulis.`);
           return;
         } else {
@@ -233,9 +254,7 @@ program
           repoName: config.repo_name,
           layout: config.layout,
         });
-        const { planEntryPointers } = await import("./agents/entry-pointers.js");
-        const pointers = await planEntryPointers(root, platforms);
-        const agentEdits = [...sub.edits, ...pointers];
+        const agentEdits = sub.edits;
         if (agentEdits.length) {
           const { applyFileEdits } = await import("./maintenance.js");
           await applyFileEdits(root, agentEdits);
@@ -421,11 +440,50 @@ persona
     (v: string, prev: string[] | undefined) => [...(prev ?? []), v],
   )
   .option("--json", "Keluaran JSON")
+  .option("--no-sync", "Lewati regenerasi stub agen IDE setelah perubahan persona")
+  .option(...PLATFORM_OPT)
   .action(
-    (alias: string, opts: { role: string; rule: string[]; repo?: string[]; json?: boolean }) =>
-      friendly(async () =>
-        personaSet(await cliService(), alias, opts.role, opts.rule, Boolean(opts.json), opts.repo),
-      ),
+    (
+      alias: string,
+      opts: {
+        role: string;
+        rule: string[];
+        repo?: string[];
+        json?: boolean;
+        noSync?: boolean;
+      } & PlatformOptions,
+    ) =>
+      friendly(async () => {
+        const root = await requireRoot();
+        const service = await cliService(root);
+        await personaSet(service, alias, opts.role, opts.rule, Boolean(opts.json), opts.repo);
+        if (!opts.noSync) {
+          await regenPersonaSubagents(root, service, {
+            platforms: opts.platform,
+            quiet: Boolean(opts.json),
+          });
+        }
+      }),
+  );
+persona
+  .command("remove")
+  .description("Hapus persona dari proyek ini (gagal bila lease aktif atau punya workspace root)")
+  .argument("<alias>", "Alias persona yang dihapus")
+  .option("--json", "Keluaran JSON")
+  .option("--no-sync", "Lewati regenerasi stub agen IDE setelah perubahan persona")
+  .option(...PLATFORM_OPT)
+  .action((alias: string, opts: { json?: boolean; noSync?: boolean } & PlatformOptions) =>
+    friendly(async () => {
+      const root = await requireRoot();
+      const service = await cliService(root);
+      await personaRemove(service, alias, Boolean(opts.json));
+      if (!opts.noSync) {
+        await regenPersonaSubagents(root, service, {
+          platforms: opts.platform,
+          quiet: Boolean(opts.json),
+        });
+      }
+    }),
   );
 
 program
@@ -627,16 +685,44 @@ const doc = program
   .description("Dokumen proyek lokal (blueprint, ERD, arsitektur, keputusan)");
 doc
   .command("list")
+  .option("--include-archived", "Sertakan dokumen yang sudah diarsipkan")
   .option("--json", "Keluaran JSON")
-  .action((opts: { json?: boolean }) =>
-    friendly(async () => docList(await cliService(), Boolean(opts.json))),
+  .action((opts: { json?: boolean; includeArchived?: boolean }) =>
+    friendly(async () =>
+      docList(await cliService(), {
+        json: opts.json,
+        includeArchived: opts.includeArchived,
+      }),
+    ),
   );
 doc
   .command("get")
   .argument("<slug>")
+  .option("--outline", "Hanya daftar heading Markdown (tanpa isi lengkap)")
+  .option("--section <title>", "Hanya satu bagian yang cocok dengan judul heading")
+  .option("--json", "Keluaran JSON")
+  .action((slug: string, opts: { json?: boolean; outline?: boolean; section?: string }) =>
+    friendly(async () =>
+      docGet(await cliService(), slug, {
+        json: opts.json,
+        outline: opts.outline,
+        section: opts.section,
+      }),
+    ),
+  );
+doc
+  .command("archive")
+  .argument("<slug>")
   .option("--json", "Keluaran JSON")
   .action((slug: string, opts: { json?: boolean }) =>
-    friendly(async () => docGet(await cliService(), slug, Boolean(opts.json))),
+    friendly(async () => docArchive(await cliService(), slug, Boolean(opts.json))),
+  );
+doc
+  .command("restore")
+  .argument("<slug>")
+  .option("--json", "Keluaran JSON")
+  .action((slug: string, opts: { json?: boolean }) =>
+    friendly(async () => docRestore(await cliService(), slug, Boolean(opts.json))),
   );
 doc
   .command("save")
@@ -992,18 +1078,69 @@ review
       ),
   );
 
-program
+const skill = program
   .command("skill")
-  .description("Baca skill repo dari checkout atau revisi Git")
+  .description("Kelola skill repo Markdown di .catenext/skills");
+skill
+  .command("list")
+  .description("Daftar skill valid di repo (indeks name + when_to_use)")
+  .option("--json", "Keluaran JSON")
+  .action((opts: { json?: boolean }) =>
+    friendly(async () => skillList(await requireRoot(), { json: opts.json })),
+  );
+skill
+  .command("create")
+  .description("Buat skill baru (gagal bila nama sudah dipakai)")
+  .argument("<name>", "Nama skill, mis. api-style")
+  .requiredOption("--when-to-use <text>", "Kapan agen harus memuat skill ini")
+  .requiredOption("--file <path>", "File Markdown isi skill (tanpa frontmatter)")
+  .option("--json", "Keluaran JSON")
+  .action((name: string, opts: { whenToUse: string; file: string; json?: boolean }) =>
+    friendly(async () =>
+      skillCreate(await requireRoot(), name, {
+        whenToUse: opts.whenToUse,
+        file: opts.file,
+        json: opts.json,
+      }),
+    ),
+  );
+skill
+  .command("set")
+  .description("Buat atau perbarui skill (field yang tidak diisi dipertahankan)")
+  .argument("<name>")
+  .option("--when-to-use <text>", "Perbarui petunjuk kapan memuat skill")
+  .option("--file <path>", "File Markdown isi skill baru")
+  .option("--json", "Keluaran JSON")
+  .action((name: string, opts: { whenToUse?: string; file?: string; json?: boolean }) =>
+    friendly(async () =>
+      skillSet(await requireRoot(), name, {
+        whenToUse: opts.whenToUse,
+        file: opts.file,
+        json: opts.json,
+      }),
+    ),
+  );
+skill
+  .command("remove")
+  .description("Hapus file skill dari .catenext/skills")
+  .argument("<name>")
+  .option("--json", "Keluaran JSON")
+  .action((name: string, opts: { json?: boolean }) =>
+    friendly(async () => skillRemove(await requireRoot(), name, { json: opts.json })),
+  );
+skill
   .command("load")
+  .description("Baca skill repo dari checkout atau revisi Git")
   .argument("<name>")
   .option("--revision <sha>", "SHA commit Git untuk paritas lintas perangkat")
   .option("--json")
   .action((name: string, opts: { revision?: string; json?: boolean }) =>
     friendly(async () => {
-      const skill = await loadSkill(await requireRoot(), name, opts.revision);
+      const skillBody = await loadSkill(await requireRoot(), name, opts.revision);
       console.log(
-        opts.json ? JSON.stringify({ ...skill, revision: opts.revision }, null, 2) : skill.content,
+        opts.json
+          ? JSON.stringify({ ...skillBody, revision: opts.revision }, null, 2)
+          : skillBody.content,
       );
     }),
   );

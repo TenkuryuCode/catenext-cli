@@ -175,6 +175,16 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    description: "Add documents.archived_at for soft-archive metadata",
+    up(db) {
+      const columns = db.prepare("PRAGMA table_info(documents)").all() as { name: string }[];
+      if (!columns.some(({ name }) => name === "archived_at")) {
+        db.exec("ALTER TABLE documents ADD COLUMN archived_at TEXT");
+      }
+    },
+  },
 ];
 
 function hasCode(error: unknown, code: string): boolean {

@@ -648,14 +648,67 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(nvmLaunch.command).not.toMatch(/v22\.11\.0/);
   }, 30_000);
 
+  it("covers doc archive, restore, list --include-archived, and get --outline|--section", async () => {
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.name=Catenext Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "Doc CLI fixture",
+    );
+    cli(["init", "--platform", "claude-code"]);
+    const docPath = join(fixtureDir, "notes.md");
+    await writeFile(docPath, "# Intro\n\nBody.\n\n## Details\n\nMore.\n");
+    cli(["doc", "save", "notes", "--kind", "other", "--file", docPath]);
+    expect(cli(["doc", "list"])).toContain("notes");
+
+    cli(["doc", "archive", "notes", "--json"]);
+    expect(cli(["doc", "list"])).not.toContain("notes");
+    expect(cli(["doc", "list", "--include-archived"])).toContain("notes");
+    expect(cli(["doc", "list", "--include-archived"])).toContain("[arsip]");
+
+    const outline = JSON.parse(cli(["doc", "get", "notes", "--outline", "--json"])) as {
+      outline: Array<{ title: string; level: number }>;
+    };
+    expect(outline.outline.map((h) => h.title)).toEqual(["Intro", "Details"]);
+
+    const section = cli(["doc", "get", "notes", "--section", "Details"]);
+    expect(section).toContain("More.");
+    expect(section).toContain("· bagian: Details");
+
+    expect(runCli(["doc", "get", "notes", "--outline", "--section", "Intro"]).status).toBe(1);
+
+    cli(["doc", "restore", "notes"]);
+    expect(cli(["doc", "list"])).toContain("notes");
+    expect(cli(["doc", "list"])).not.toContain("[arsip]");
+  }, 20_000);
+
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {
       const result = runCli([command, "--platform", "unknown-platform"]);
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("Platform tidak didukung");
     }
-    cli(["init", "--platform", "claude-code,codex", "--platform", "cursor", "--dry-run"]);
+    const dryOut = cli([
+      "init",
+      "--platform",
+      "claude-code,codex",
+      "--platform",
+      "cursor",
+      "--dry-run",
+    ]);
+    expect(dryOut).toContain("(dry-run) SQLite seed");
+    expect(dryOut).toContain("personas:");
+    expect(dryOut).toContain("(dry-run) Stub agen");
+    expect(dryOut).toMatch(/orchestrator\.(md|toml)/);
     expect(await readdir(root)).toEqual([]);
+    await expect(readFile(join(root, ".catenext/catenext.sqlite"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
     cli(["init", "--platform", "claude-code,codex", "--platform", "cursor"]);
     await expect(readFile(join(root, ".codex/config.toml"), "utf8")).resolves.toContain("catenext");
     const cursor = await readFile(join(root, ".cursor/mcp.json"), "utf8");

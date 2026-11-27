@@ -19,6 +19,8 @@ export const SUBAGENT_DIRS: Partial<Record<PlatformId, string>> = {
   opencode: join(".opencode", "agents"),
   /** Codex custom agents are TOML under `.codex/agents/`. */
   codex: join(".codex", "agents"),
+  /** VS Code Copilot harness discovers workspace agents under `.github/agents/`. */
+  vscode: join(".github", "agents"),
 };
 
 /** Pre-v0.11 Antigravity path — still cleaned on remove/sync. */

@@ -209,6 +209,7 @@ export function starterDocuments(
         "| edit_setup | human, orchestrator |",
         "| manage_roots | human, orchestrator |",
         "| upsert_persona | human, orchestrator |",
+        "| remove_persona (MCP) | same gate as upsert_persona |",
         "",
         "Human CLI remains the hard gate for approve / approve_plan.",
       ].join("\n"),

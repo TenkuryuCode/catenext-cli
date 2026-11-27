@@ -19,6 +19,7 @@ export const PLATFORM_ENTRY_FILES: Partial<Record<PlatformId, string>> = {
   codex: joinSafe(".codex", "CATENEXT.md"),
   opencode: joinSafe(".opencode", "CATENEXT.md"),
   antigravity: joinSafe(".agents", "CATENEXT.md"),
+  vscode: joinSafe(".vscode", "CATENEXT.md"),
 };
 
 function joinSafe(...parts: string[]): string {
@@ -118,6 +119,14 @@ function platformMeta(platform: PlatformId, entryPath: string): PlatformEntryMet
           ? `Persona agents: [\`.opencode/agents/\`](${agentsHref}).`
           : "Persona agents: `.opencode/agents/`.",
         syncHint: "`catenext sync --platform opencode`",
+      };
+    case "vscode":
+      return {
+        title: "VS Code · Catenext entry",
+        agentsNote: agentsHref
+          ? `Custom agents (Copilot harness): [\`.github/agents/\`](${agentsHref}). MCP: \`.vscode/mcp.json\`.`
+          : "Custom agents: `.github/agents/`. MCP: `.vscode/mcp.json`.",
+        syncHint: "`catenext sync --platform vscode`",
       };
     default:
       return {

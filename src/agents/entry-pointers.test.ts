@@ -73,6 +73,15 @@ describe("entry-pointers rendering", () => {
     expect(md).toContain(".agents/agents/");
     expect(md).toContain("catenext sync --platform antigravity");
   });
+
+  it("vscode entry points at .github/agents and .vscode/mcp.json", () => {
+    const md = renderEntryPointer("vscode", ".vscode/CATENEXT.md");
+    expect(md).toContain("# VS Code · Catenext entry");
+    expect(md).toContain("[CATENEXT.md](../CATENEXT.md)");
+    expect(md).toContain(".github/agents/");
+    expect(md).toContain(".vscode/mcp.json");
+    expect(md).toContain("catenext sync --platform vscode");
+  });
 });
 
 describe("planEntryPointers", () => {
@@ -95,6 +104,7 @@ describe("planEntryPointers", () => {
       PLATFORM_ENTRY_FILES.codex,
       PLATFORM_ENTRY_FILES.opencode,
       PLATFORM_ENTRY_FILES.antigravity,
+      PLATFORM_ENTRY_FILES.vscode,
     ]);
     expect(first.every((e) => e.before === null)).toBe(true);
 

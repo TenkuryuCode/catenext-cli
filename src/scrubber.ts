@@ -66,6 +66,7 @@ export const SCRUB_TOOL_FIELDS: Partial<Record<McpToolName, readonly string[]>> 
   update_epic: ["epic_id"],
   create_tasks: ["epic_id", "ref", "depends_on", "target_repo", "role", "persona"],
   upsert_persona: ["alias", "role", "repos"],
+  remove_persona: ["alias"],
   save_repo_skill: ["name"],
   manage_roots: ["action", "persona", "root_id", "path"],
   graph_neighbors: ["path"],

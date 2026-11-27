@@ -17,6 +17,12 @@ import {
 } from "./init/mcp-config.js";
 import { readRepoFile } from "./init/repo-files.js";
 import { entryIsStale } from "./maintenance.js";
+import {
+  type CheckLine,
+  formatNextFixTips,
+  inspectLocalSkills,
+  inspectOnboardingArtifacts,
+} from "./verify.js";
 import { readGitWorktreeRegistrations } from "./worktrees.js";
 
 type Status = "ok" | "warning" | "error" | "skipped" | "fixed";
@@ -28,7 +34,78 @@ type Finding = {
   path?: string;
 };
 
-type DoctorReport = { ok: boolean; checks: Finding[] };
+type DoctorReport = { ok: boolean; checks: Finding[]; nextFix: string };
+
+const ARTIFACT_OK: Record<string, string> = {
+  "artifacts.master": "CATENEXT.md master prompt is present.",
+  "artifacts.agents": "AGENTS.md contains the Catenext orchestrator block.",
+};
+
+const ARTIFACT_WARN: Record<string, string> = {
+  "artifacts.master": "CATENEXT.md is missing or not Catenext-managed.",
+  "artifacts.agents": "AGENTS.md is missing the Catenext orchestrator block.",
+};
+
+function artifactPath(label: string): string | undefined {
+  const idx = label.indexOf(": ");
+  return idx === -1 ? undefined : label.slice(idx + 2);
+}
+
+function artifactFinding(line: CheckLine): Finding {
+  const id = line.id ?? "artifacts";
+  const path = artifactPath(line.label);
+  if (line.ok) {
+    const message =
+      ARTIFACT_OK[id] ??
+      (id.startsWith("artifacts.entry.")
+        ? "Platform entry pointer is present."
+        : id.includes("orchestrator")
+          ? "Orchestrator stub is present."
+          : "Persona stub is present.");
+    return finding(id, "ok", message, path);
+  }
+  const message =
+    ARTIFACT_WARN[id] ??
+    (id.startsWith("artifacts.entry.")
+      ? "Platform entry pointer is missing or not Catenext-managed."
+      : id.includes("orchestrator")
+        ? "Orchestrator stub is missing or not Catenext-managed."
+        : "Persona stub is missing or not Catenext-managed.");
+  return finding(id, "warning", message, path);
+}
+
+function skillFinding(line: CheckLine): Finding {
+  const id = line.id ?? "skills";
+  const path = artifactPath(line.label);
+  if (line.ok) {
+    const count = line.label.replace(/^Skill lokal valid: /, "");
+    return finding(id, "ok", `Local skills are valid (${count}).`, path);
+  }
+  return finding(id, "warning", line.hint ?? "Invalid local skill.", path);
+}
+
+function mcpFixKey(message: string): CheckLine["fixKey"] | undefined {
+  if (message.includes("sync --fix")) return "sync-fix";
+  if (message.includes("entry missing")) return "init";
+  if (message.includes("sync --dry-run")) return "sync";
+  return undefined;
+}
+
+function collectDoctorFixLines(fixLines: CheckLine[], checks: Finding[]): CheckLine[] {
+  const lines = fixLines.filter((line) => !line.ok);
+  for (const { id, status, message } of checks) {
+    if (
+      (status !== "warning" && status !== "error") ||
+      id.startsWith("artifacts.") ||
+      id.startsWith("skills.")
+    ) {
+      continue;
+    }
+    const fixKey = mcpFixKey(message);
+    if (fixKey) lines.push({ ok: false, label: id, fixKey });
+  }
+  return lines;
+}
 
 function finding(id: string, status: Status, message: string, path?: string): Finding {
   return { id, status, message, ...(path ? { path } : {}) };
@@ -511,22 +588,41 @@ export async function runDoctor(options: {
             : "Cannot read or validate .catenext/config.yaml. Check access, format, and CLI compatibility.",
         ),
       ],
+      nextFix: formatNextFixTips([
+        { ok: false, label: id, fixKey: project === null ? "init" : undefined },
+      ]),
     };
   const { root, config } = project;
+  const platforms = configuredPlatforms(config);
+  const skillLines = await inspectLocalSkills(root);
+  // Snapshot persona reads avoid opening live SQLite (doctor must not create -shm).
+  const artifactLines = await inspectOnboardingArtifacts(root, config, platforms, {
+    personaStubs: "snapshot",
+  });
   const checks = [
     finding(id, "ok", "Project config is readable and valid."),
     ...(await checkSqlite(stateFilePath(root, config), options.fix === true)),
     await checkWorktrees(root),
-    ...(await checkMcp(root, configuredPlatforms(config))),
+    ...(await checkMcp(root, platforms)),
     await checkVersion(root, options.version),
+    ...skillLines.map(skillFinding),
+    ...artifactLines.map(artifactFinding),
   ];
-  return { ok: !checks.some(({ status }) => status === "error" || status === "warning"), checks };
+  const nextFix = formatNextFixTips(
+    collectDoctorFixLines([...skillLines, ...artifactLines], checks),
+  );
+  return {
+    ok: !checks.some(({ status }) => status === "error" || status === "warning"),
+    checks,
+    nextFix,
+  };
 }
 
 export function formatDoctorReport(report: DoctorReport): string {
-  return report.checks
+  const body = report.checks
     .map(
       ({ id, status, message, path }) => `[${status}] ${id}${path ? ` (${path})` : ""}: ${message}`,
     )
     .join("\n");
+  return report.nextFix ? `${body}\n\n${report.nextFix}` : body;
 }

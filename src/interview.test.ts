@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_PLATFORMS, SUPPORTED_PLATFORMS } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildInterviewSetup, parsePlatformChoices, runInitInterview } from "./interview.js";
+import {
+  buildInterviewSetup,
+  parsePersonaSeed,
+  parsePlatformChoices,
+  runInitInterview,
+} from "./interview.js";
 
 let root: string;
 
@@ -88,6 +93,9 @@ describe("parsePlatformChoices", () => {
   it("supports recommended/default keywords, deduplicates, and filters windsurf", () => {
     expect(parsePlatformChoices("recommended")).toEqual([...DEFAULT_PLATFORMS]);
     expect(parsePlatformChoices("default")).toEqual([...DEFAULT_PLATFORMS]);
+    const detected = ["cursor", "vscode"] as const;
+    expect(parsePlatformChoices("recommended", detected)).toEqual([...detected]);
+    expect(parsePlatformChoices("default", detected)).toEqual([...detected]);
     expect(parsePlatformChoices("cursor, claude-code  cursor windsurf codex")).toEqual([
       "cursor",
       "claude-code",
@@ -97,6 +105,15 @@ describe("parsePlatformChoices", () => {
 
   it("throws on unsupported platform identifiers", () => {
     expect(() => parsePlatformChoices("cursor, notepad")).toThrow(/Unsupported platform: notepad/);
+  });
+});
+
+describe("parsePersonaSeed", () => {
+  it("maps legacy default keyword to matched like ensureSeed", () => {
+    expect(parsePersonaSeed("default")).toBe("matched");
+    expect(parsePersonaSeed("matched")).toBe("matched");
+    expect(parsePersonaSeed("all")).toBe("all");
+    expect(parsePersonaSeed("bogus")).toBe("matched");
   });
 });
 

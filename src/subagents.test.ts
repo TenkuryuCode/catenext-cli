@@ -80,10 +80,18 @@ describe("subagent persona", () => {
     expect(removed.map((e) => e.path)).not.toContain(join(".claude", "agents", "citra.md"));
   });
 
-  it("does not fall back to .claude/agents for vscode; writes Codex TOML under .codex/agents", async () => {
+  it("does not fall back to .claude/agents for vscode; writes Copilot stubs under .github/agents", async () => {
     const root = await mkdtemp(join(tmpdir(), "catenext-sub-nofallback-"));
     const vscode = await planSubagents(root, [adel], ["vscode"]);
-    expect(vscode).toEqual({ edits: [], skipped: [] });
+    expect(vscode.edits.map((e) => e.path).sort()).toEqual([
+      join(".github", "agents", "adel.md"),
+      join(".github", "agents", "orchestrator.md"),
+    ]);
+    expect(vscode.skipped).toEqual([]);
+    await applyFileEdits(root, vscode.edits);
+    expect(await readFile(join(root, ".github", "agents", "adel.md"), "utf8")).toContain(
+      "name: adel",
+    );
 
     const codex = await planSubagents(root, [adel], ["codex"]);
     expect(codex.edits.map((e) => e.path).sort()).toEqual([

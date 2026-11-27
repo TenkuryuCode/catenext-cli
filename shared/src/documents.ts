@@ -35,6 +35,8 @@ export const DocumentIndexEntrySchema = z.object({
   updated_at: IsoDateTimeSchema,
   /** Panjang isi dalam karakter, agar agen bisa menimbang biaya membaca. */
   size: z.number().int().min(0),
+  /** Waktu soft-archive (Epic B); null = dokumen aktif. */
+  archived_at: IsoDateTimeSchema.nullable().optional(),
 });
 export type DocumentIndexEntry = z.infer<typeof DocumentIndexEntrySchema>;
 
@@ -82,3 +84,23 @@ export const SaveDocumentOutput = z.object({
   document: DocumentIndexEntrySchema,
   created: z.boolean(),
 });
+
+export const ArchiveDocumentInput = z.object({
+  slug: DocumentSlugSchema,
+});
+export type ArchiveDocumentInputType = z.infer<typeof ArchiveDocumentInput>;
+
+export const ArchiveDocumentOutput = z.object({
+  document: DocumentIndexEntrySchema,
+});
+export type ArchiveDocumentOutputType = z.infer<typeof ArchiveDocumentOutput>;
+
+export const RestoreDocumentInput = z.object({
+  slug: DocumentSlugSchema,
+});
+export type RestoreDocumentInputType = z.infer<typeof RestoreDocumentInput>;
+
+export const RestoreDocumentOutput = z.object({
+  document: DocumentIndexEntrySchema,
+});
+export type RestoreDocumentOutputType = z.infer<typeof RestoreDocumentOutput>;

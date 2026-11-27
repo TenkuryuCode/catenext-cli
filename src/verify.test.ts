@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatenextConfigSchema, type PlatformId } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ENTRY_MARKER, MASTER_MARKER, MASTER_PROMPT_FILE } from "./agents/entry-pointers.js";
 import { stateFilePath } from "./config.js";
 import { openDatabaseAt } from "./db/open.js";
 import { insertTaskEvents } from "./db/task-events.js";
+import { BLOCK_START } from "./init/agents-md.js";
 import { applyInit, planInit } from "./init/index.js";
 import { entryMatchesRoot, selectedAdapters, WINDSURF_UNSUPPORTED } from "./init/mcp-config.js";
 import { renderSkill } from "./skills.js";
+import { ORCHESTRATOR_MARKER } from "./subagents.js";
 import { formatChecks, verifySetup } from "./verify.js";
 
 const CLAUDE_ROOT_TOKEN = "$" + "{CLAUDE_PROJECT_DIR}";
@@ -35,6 +38,8 @@ async function writeRepo(rel: string, content: string) {
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "catenext-verify-"));
+  await writeRepo(MASTER_PROMPT_FILE, `${MASTER_MARKER}\nfixture\n`);
+  await writeRepo("AGENTS.md", `# Fixture\n\n${BLOCK_START}\nfixture\n<!-- catenext:end -->\n`);
 });
 
 afterEach(async () => {
@@ -66,7 +71,8 @@ describe("verifySetup", () => {
       ok: true,
       label: `State belum dibuat: ${stateFilePath(root, config)}`,
     });
-    expect(lines.every((l) => l.ok)).toBe(true);
+    const withoutStubs = lines.filter((l) => !l.id?.startsWith("artifacts.stub."));
+    expect(withoutStubs.every((l) => l.ok)).toBe(true);
     expect(lines.map((l) => l.label)).toEqual(
       expect.arrayContaining([
         "Claude Code: .mcp.json",
@@ -158,7 +164,11 @@ describe("verifySetup", () => {
       ".catenext/skills/dump.md",
       renderSkill({ ...good, name: "dump", content: `~~~ts\n${"example();\n".repeat(16)}~~~` }),
     );
-    const output = formatChecks(await verifySetup(root, config));
+    const lines = await verifySetup(root, config);
+    expect(lines.some((l) => l.id?.startsWith("skills.invalid.") && l.fixKey === "skills")).toBe(
+      true,
+    );
+    const output = formatChecks(lines);
     expect(output).toContain("name duplikat");
     expect(output).toContain("name harus sama dengan nama file");
     expect(output).toMatch(/missing\.md: frontmatter tidak valid \(name:/);
@@ -166,6 +176,9 @@ describe("verifySetup", () => {
     expect(output).toContain("dump.md: Blok kode maksimal 15 baris");
     expect(output).toContain("secret.md: potensi secret");
     expect(output).not.toContain(fixture);
+    expect(output).toContain("Next steps:");
+    expect(output).toContain("catenext skill list");
+    expect(output).toContain("catenext verify");
   });
 
   it("flags symlink and hardlink state files as non-regular", async () => {
@@ -236,6 +249,7 @@ describe("verifySetup", () => {
       ok: false,
       label: "Claude Code: .mcp.json",
       hint: "Entri catenext belum ada. Jalankan `catenext init` atau `catenext sync`.",
+      fixKey: "init",
     });
 
     // 2. File exists without catenext entry
@@ -314,6 +328,68 @@ describe("verifySetup", () => {
     expect(
       entryMatchesRoot({ command: "catenext", args: ["mcp", "--root", root] }, root, adapter),
     ).toBe(true);
+  });
+});
+
+describe("onboarding artifacts in verify", () => {
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "catenext-verify-artifacts-"));
+  });
+
+  it("flags missing CATENEXT.md, AGENTS block, entry pointer, and stub with numbered next-fix tips", async () => {
+    const config = makeConfig(["cursor"]);
+    const lines = await verifySetup(root, config, ["cursor"]);
+    expect(lines.some((l) => l.id === "artifacts.master" && !l.ok)).toBe(true);
+    expect(lines.some((l) => l.id === "artifacts.agents" && !l.ok)).toBe(true);
+    expect(lines.some((l) => l.id === "artifacts.entry.cursor" && !l.ok)).toBe(true);
+    const output = formatChecks(lines);
+    expect(output).toContain("Next steps:");
+    expect(output).toMatch(/1\. Run `catenext/);
+    expect(output).toContain("catenext sync --force");
+    expect(output).toContain("catenext verify");
+  });
+
+  it("flags missing persona stubs with numbered next-fix tips", async () => {
+    const config = makeConfig(["cursor"]);
+    const state = stateFilePath(root, config);
+    await mkdir(join(state, ".."), { recursive: true });
+    const db = openDatabaseAt(state);
+    try {
+      db.prepare("INSERT INTO projects (id, created_at) VALUES (?, ?)").run(
+        config.project_id,
+        "2026-01-02T00:00:00.000Z",
+      );
+      db.prepare(
+        "INSERT INTO personas (project_id, alias, role, rules_json) VALUES (?, ?, ?, ?)",
+      ).run(config.project_id, "be", "backend", "[]");
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } finally {
+      db.close();
+    }
+    await chmod(state, 0o600);
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      await rm(state + suffix, { force: true });
+    }
+    await writeRepo(MASTER_PROMPT_FILE, `${MASTER_MARKER}\nfixture\n`);
+    await writeRepo("AGENTS.md", `# Fixture\n\n${BLOCK_START}\nfixture\n<!-- catenext:end -->\n`);
+    await writeRepo(".cursor/CATENEXT.md", `${ENTRY_MARKER}\n`);
+    await writeRepo(
+      ".cursor/agents/orchestrator.md",
+      `${ORCHESTRATOR_MARKER}\nYou are the orchestrator.\n`,
+    );
+
+    const lines = await verifySetup(root, config, ["cursor"]);
+    const persona = lines.find((l) => l.id === "artifacts.stub.persona.be.cursor");
+    expect(persona).toMatchObject({
+      ok: false,
+      fixKey: "sync-force",
+      hint: expect.stringContaining("sync --force"),
+    });
+    const output = formatChecks(lines);
+    expect(output).toContain("Stub persona be (cursor)");
+    expect(output).toContain("Next steps:");
+    expect(output).toContain("catenext sync --force");
+    expect(output).toContain("catenext verify");
   });
 });
 

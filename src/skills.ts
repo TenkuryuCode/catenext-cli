@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -210,4 +210,129 @@ export async function saveSkill(
     await rm(tmp, { force: true });
   }
   return { path, created, skill };
+}
+
+/** Alias historis untuk `saveSkill` (CLI create/set dan MCP `save_repo_skill`). */
+export const writeSkill = saveSkill;
+
+export async function removeSkill(root: string, name: string): Promise<{ path: string }> {
+  const parsedName = SkillNameSchema.safeParse(name);
+  if (!parsedName.success) throw new SkillError(`Nama skill "${name}" tidak valid.`);
+  const path = join(SKILLS_DIR, `${parsedName.data}.md`);
+  const source = await readRepoFile(root, path);
+  if (source === null) {
+    const { skills } = await listSkills(root);
+    const names = skills.map((s) => s.name).join(", ") || "(belum ada)";
+    throw new SkillError(`Skill "${name}" tidak ada. Skill tersedia: ${names}.`);
+  }
+  await unlink(join(root, path));
+  return { path };
+}
+
+async function readSkillBody(file: string): Promise<string> {
+  return (await readFile(file, "utf8")).trim();
+}
+
+/** `catenext skill list` */
+export async function skillList(root: string, opts: { json?: boolean }): Promise<void> {
+  const { skills, invalid } = await listSkills(root);
+  const index = skillIndex(skills);
+  if (opts.json) {
+    console.log(JSON.stringify({ skills: index, invalid }, null, 2));
+    return;
+  }
+  if (index.length === 0 && invalid.length === 0) {
+    console.log(
+      'Belum ada skill. Buat dengan: catenext skill create <name> --when-to-use "..." --file <path.md>',
+    );
+    return;
+  }
+  for (const s of index) console.log(`${s.name}  ${s.when_to_use}`);
+  for (const i of invalid) console.log(`! Skill dilewati: ${i.error}`);
+}
+
+/** `catenext skill create` — gagal bila file sudah ada. */
+export async function skillCreate(
+  root: string,
+  name: string,
+  opts: { whenToUse: string; file: string; json?: boolean },
+): Promise<void> {
+  const parsedName = SkillNameSchema.parse(name);
+  const path = join(SKILLS_DIR, `${parsedName}.md`);
+  if ((await readRepoFile(root, path)) !== null) {
+    throw new SkillError(`Skill "${name}" sudah ada. Gunakan: catenext skill set ${name} ...`);
+  }
+  const content = await readSkillBody(opts.file);
+  const saved = await writeSkill(root, {
+    name: parsedName,
+    when_to_use: opts.whenToUse,
+    content,
+  });
+  if (opts.json) {
+    console.log(
+      JSON.stringify({ path: saved.path, created: saved.created, skill: saved.skill }, null, 2),
+    );
+    return;
+  }
+  console.log(`✓ Skill "${saved.skill.name}" dibuat di ${saved.path}.`);
+}
+
+/** `catenext skill set` — buat atau perbarui; field yang tidak diisi dipertahankan. */
+export async function skillSet(
+  root: string,
+  name: string,
+  opts: { whenToUse?: string; file?: string; json?: boolean },
+): Promise<void> {
+  const parsedName = SkillNameSchema.parse(name);
+  const path = join(SKILLS_DIR, `${parsedName}.md`);
+  const whenOpt = opts.whenToUse?.trim();
+  const contentOpt = opts.file ? await readSkillBody(opts.file) : undefined;
+  const source = await readRepoFile(root, path);
+  let when = whenOpt;
+  let content = contentOpt;
+  if (source === null) {
+    if (!when || content === undefined) {
+      throw new SkillError(
+        `Skill "${name}" belum ada. Wajib --when-to-use dan --file, atau: catenext skill create ${name} ...`,
+      );
+    }
+  } else {
+    if (!when && content === undefined) {
+      throw new SkillError("Berikan --when-to-use dan/atau --file untuk memperbarui skill.");
+    }
+    const existing = parseSkill(source, `${parsedName}.md`);
+    when = when ?? existing.when_to_use;
+    content = content ?? existing.content;
+  }
+  if (!when || content === undefined) {
+    throw new SkillError("Isi skill tidak lengkap.");
+  }
+  const saved = await writeSkill(root, {
+    name: parsedName,
+    when_to_use: when,
+    content,
+  });
+  if (opts.json) {
+    console.log(
+      JSON.stringify({ path: saved.path, created: saved.created, skill: saved.skill }, null, 2),
+    );
+    return;
+  }
+  console.log(
+    `✓ Skill "${saved.skill.name}" ${saved.created ? "dibuat" : "diperbarui"} di ${saved.path}.`,
+  );
+}
+
+/** `catenext skill remove` */
+export async function skillRemove(
+  root: string,
+  name: string,
+  opts: { json?: boolean },
+): Promise<void> {
+  const removed = await removeSkill(root, name);
+  if (opts.json) {
+    console.log(JSON.stringify(removed, null, 2));
+    return;
+  }
+  console.log(`✓ Skill "${name}" dihapus (${removed.path}).`);
 }

@@ -10,6 +10,27 @@ tag yang versinya belum ada di file ini. Perbarui juga [docs/STATUS.md](docs/STA
 
 ## [Belum dirilis]
 
+## [0.12.0] - 2026-11-27
+
+Rilis tunggal Epic A (DX onboarding) + Epic B (siklus dokumen) + Epic C (CRUD persona/skill).
+
+### Ditambahkan
+- `catenext init --dry-run`: pratinjau seed persona SQLite dan rencana stub agen lewat helper yang sama dengan apply, tanpa menulis config, state, atau file stub.
+- `catenext doctor` dan `catenext verify`: inventori read-only artefak onboarding (`CATENEXT.md`, blok `AGENTS.md`, entry pointer platform, stub agen) plus tips perbaikan bernomor (`sync --force`, `verify`, …); juga melaporkan skill tidak valid dan stub persona hilang.
+- Dukungan VS Code kelas pertama: `.vscode/CATENEXT.md`, stub `.github/agents` (Copilot-native), baris **Mulai cepat** di README; `init`/`sync` tidak lagi memperlakukan `vscode` sebagai MCP-only.
+- SQLite schema v5: kolom `documents.archived_at` untuk soft-archive dokumen proyek (migrasi idempoten; baris lama tetap aktif).
+- MCP `archive_document` / `restore_document`; filter opsional `include_archived` pada `get_project_context` dan `search_context` (default menyembunyikan terarsip).
+- CLI `catenext doc archive|restore`, `doc list --include-archived`, serta `doc get --outline` / `--section` terhubung ke pembacaan MCP yang sama.
+- Skill repo `docs-hygiene`: arsip/restore nyata, audit lewat `get_project_context` + `include_archived`, dan panduan memecah dokumen panjang.
+- `catenext persona remove` (CLI + MCP) dengan guard lease aktif / pemilik workspace root; regenerasi stub IDE setelah `persona set|remove` (`--no-sync` / `--platform`).
+- CLI `catenext skill list|create|set|remove` (+ `load`) untuk skill Markdown di `.catenext/skills/`.
+
+### Diubah
+- Interview `init`: rekomendasi platform mengikuti platform terdeteksi; default seed persona **`matched`**; entry pointer platform hanya direncanakan lewat `planInit` (satu jalur perencanaan).
+- Dokumentasi: paste master prompt pendek selaras `renderMasterPrompt` / `CATENEXT.md`; tips locale (`session_prefs.locale`) di README mirror serta baris platform VS Code di panduan platform.
+- Indeks dokumen default (`doc list`, konteks MCP, pencarian) mengecualikan slug terarsip; `save_document` mempertahankan `archived_at`.
+- README mirror: baris **Mulai cepat** dan bagian **Dokumen dan skill** menjelaskan outline, section, arsip/restore, CRUD persona/skill, filter import template, serta pemetaan perintah CLI ↔ tool MCP.
+
 ## [0.11.1] - 2026-11-27
 
 ### Diubah

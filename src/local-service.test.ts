@@ -395,6 +395,9 @@ describe("LocalService approval gate", () => {
     await expect(
       agent.callTool("upsert_persona", { alias: "sec", role: "security" }),
     ).rejects.toMatchObject({ code: "permission_denied" });
+    await expect(agent.callTool("remove_persona", { alias: "sec" })).rejects.toMatchObject({
+      code: "permission_denied",
+    });
     await expect(
       agent.callTool("manage_roots", { action: "add", path: root }),
     ).rejects.toMatchObject({ code: "permission_denied" });
@@ -409,6 +412,9 @@ describe("LocalService approval gate", () => {
     await expect(
       agent.callTool("upsert_persona", { alias: "sec2", role: "security" }),
     ).rejects.toMatchObject({ code: "permission_denied" });
+    await expect(agent.callTool("remove_persona", { alias: "sec" })).rejects.toMatchObject({
+      code: "permission_denied",
+    });
 
     await service.setPermissions("manage_roots", ["human"]);
     const extDir = await mkdtemp(join(tmpdir(), "catenext-perm-root-"));
@@ -420,6 +426,59 @@ describe("LocalService approval gate", () => {
       await expect(
         service.callTool("manage_roots", { action: "add", path: extDir }),
       ).resolves.toMatchObject({ roots: [{ path: extDir }] });
+    } finally {
+      await rm(extDir, { recursive: true, force: true });
+    }
+  });
+
+  it("remove_persona menolak lease aktif, workspace root, dan menghapus bila aman", async () => {
+    await service.callTool("upsert_persona", {
+      alias: "be",
+      role: "backend",
+      repos: ["be"],
+      rules: ["Tests"],
+    });
+    const { id } = await draft([plan("rm", { persona: "be" })]);
+    await manage("approve_plan", id("rm"));
+
+    const claim = await service.callTool("claim_task", {
+      task_id: id("rm"),
+      agent_alias: "be",
+    });
+    await expect(service.callTool("remove_persona", { alias: "be" })).rejects.toMatchObject({
+      code: "persona_in_use",
+    });
+    await service.callTool("release_task", { task_id: id("rm"), lease_id: claim.lease_id });
+
+    await expect(service.callTool("remove_persona", { alias: "be" })).resolves.toMatchObject({
+      alias: "be",
+      removed: true,
+    });
+    expect(
+      (await service.callTool("list_personas", {})).personas.map((p) => p.alias),
+    ).not.toContain("be");
+
+    await service.callTool("upsert_persona", { alias: "fe", role: "frontend", repos: ["fe"] });
+    const extDir = await mkdtemp(join(tmpdir(), "catenext-rm-root-"));
+    try {
+      await service.callTool("manage_roots", {
+        action: "add",
+        path: extDir,
+        persona: "fe",
+      });
+      await expect(service.callTool("remove_persona", { alias: "fe" })).rejects.toMatchObject({
+        code: "persona_owns_roots",
+      });
+      const listed = await service.callTool("manage_roots", { action: "list" });
+      const owned = listed.roots.find((r) => r.path === extDir);
+      if (!owned) throw new Error("Expected workspace root for fe fixture");
+      await service.callTool("manage_roots", {
+        action: "remove",
+        root_id: owned.id,
+      });
+      await expect(service.callTool("remove_persona", { alias: "fe" })).resolves.toMatchObject({
+        removed: true,
+      });
     } finally {
       await rm(extDir, { recursive: true, force: true });
     }
@@ -941,6 +1000,69 @@ describe("LocalService reviews and context", () => {
     await expect(foreign.callTool("get_document", { slug: doc.slug })).rejects.toMatchObject({
       code: "not_found",
     });
+  });
+
+  it("archives and restores documents with default visibility excluding archived in context and search", async () => {
+    const content = "# Quota\n\nArchive me.";
+    await service.callTool("save_document", {
+      slug: "quota-archive",
+      title: "Quota Archive",
+      kind: "decision",
+      content,
+      expected_version: 0,
+    });
+    const archived = await service.callTool("archive_document", { slug: "quota-archive" });
+    expect(archived.document.archived_at).toEqual(expect.any(String));
+    expect(archived.document.version).toBe(2);
+
+    expect(await service.callTool("get_project_context", {})).toMatchObject({ documents: [] });
+    const withArchived = await service.callTool("get_project_context", {
+      include_archived: true,
+    });
+    expect(withArchived.documents.map((d) => d.slug)).toEqual(["quota-archive"]);
+
+    expect(
+      await service.callTool("search_context", {
+        query: "archive",
+        sources: ["document"],
+      }),
+    ).toMatchObject({ hits: [] });
+    const searchAll = await service.callTool("search_context", {
+      query: "archive",
+      sources: ["document"],
+      include_archived: true,
+    });
+    expect(searchAll.hits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source: "document", ref: "quota-archive" }),
+      ]),
+    );
+
+    const outline = await service.callTool("get_document", {
+      slug: "quota-archive",
+      outline_only: true,
+    });
+    expect(outline.outline).toEqual([{ level: 1, title: "Quota", line: 1 }]);
+    const section = await service.callTool("get_document", {
+      slug: "quota-archive",
+      section: "Quota",
+    });
+    expect(section.section).toBe("Quota");
+    expect(section.content).toContain("Archive me.");
+
+    await expect(
+      service.callTool("archive_document", { slug: "quota-archive" }),
+    ).rejects.toMatchObject({ code: "already_archived" });
+
+    const restored = await service.callTool("restore_document", { slug: "quota-archive" });
+    expect(restored.document.archived_at).toBeNull();
+    expect(await new LocalService(root, config).callTool("get_project_context", {})).toMatchObject({
+      documents: [expect.objectContaining({ slug: "quota-archive", archived_at: null })],
+    });
+
+    await expect(
+      service.callTool("restore_document", { slug: "quota-archive" }),
+    ).rejects.toMatchObject({ code: "not_archived" });
   });
 
   it("exposes code source in search_context and workspace_roots summary in session_brief and get_project_context", async () => {

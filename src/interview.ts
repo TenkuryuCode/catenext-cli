@@ -148,13 +148,16 @@ export function buildInterviewSetup(
   };
 }
 
-export function parsePlatformChoices(raw: string): PlatformId[] {
+export function parsePlatformChoices(
+  raw: string,
+  recommended: readonly PlatformId[] = [...DEFAULT_PLATFORMS],
+): PlatformId[] {
   const parts = raw
     .split(/[,\s]+/)
     .map((part) => part.trim())
     .filter(Boolean);
   if (parts.length === 1 && (parts[0] === "recommended" || parts[0] === "default")) {
-    return [...DEFAULT_PLATFORMS];
+    return [...recommended];
   }
   const out: PlatformId[] = [];
   for (const part of parts) {
@@ -185,8 +188,9 @@ export type InterviewAnswers = {
   stack: string[];
 };
 
-function parsePersonaSeed(raw: string): PersonaSeedMode {
-  if (raw === "all" || raw === "default") return "all";
+export function parsePersonaSeed(raw: string): PersonaSeedMode {
+  if (raw === "default") return "matched";
+  if (raw === "all") return "all";
   if (raw === "minimal" || raw === "none" || raw === "matched") return raw;
   return "matched";
 }
@@ -214,7 +218,7 @@ export async function runInitInterview(
       "Platforms (comma-separated, or 'recommended')",
       defaultPlatforms.join(","),
     );
-    platforms = parsePlatformChoices(platformAnswer);
+    platforms = parsePlatformChoices(platformAnswer, defaultPlatforms);
 
     const personaCards = buildInterviewSetup(root, "personas", stack);
     console.log(personaCards.ask);

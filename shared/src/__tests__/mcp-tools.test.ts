@@ -18,6 +18,7 @@ describe("registry tool MCP", () => {
   it("mengekspos tool yang didaftarkan server", () => {
     expect([...MCP_TOOL_NAMES].sort()).toEqual(
       [
+        "archive_document",
         "cancel_task",
         "claim_task",
         "complete_handoff",
@@ -31,11 +32,13 @@ describe("registry tool MCP", () => {
         "interview_setup",
         "list_epics",
         "list_personas",
+        "remove_persona",
         "load_skill",
         "manage_roots",
         "manage_task",
         "report_blocker",
         "release_task",
+        "restore_document",
         "review_pull_request",
         "save_document",
         "save_repo_skill",
