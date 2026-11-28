@@ -1,4 +1,10 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import type { McpToolName } from "@catenext/shared";
+import { readConfig } from "../../config.js";
+import { loadTask } from "../../db/project-codec.js";
+import { LocalStore } from "../../db/store.js";
+import { DEFAULT_SCRUB_SKIP_KEYS, scrubDeep, scrubText } from "../../scrubber.js";
 import {
   isPlainObject,
   JSONRPC_INTERNAL_ERROR,
@@ -208,6 +214,29 @@ export async function listResources(
   return { ok: true, result: { resources } };
 }
 
+async function loadHandoffFromStore(
+  root: string,
+  taskId: string,
+): Promise<Record<string, unknown> | undefined> {
+  const config = await readConfig(root).catch(() => null);
+  if (!config) return undefined;
+  const stateFile = resolve(root, config.state_file ?? ".catenext/catenext.sqlite");
+  if (!existsSync(stateFile)) return undefined;
+  const task = await new LocalStore(stateFile).query((db) =>
+    loadTask(db, config.project_id, taskId),
+  );
+  if (!task?.handoff) return undefined;
+  const integrated =
+    task.integrated_commit ??
+    (task.handoff as { integrated_commit?: { branch: string; sha: string } }).integrated_commit;
+  return {
+    task_id: task.id,
+    title: task.title,
+    handoff_summary: task.handoff,
+    ...(integrated ? { integrated_commit: integrated } : {}),
+  };
+}
+
 export async function readResource(
   context: () => Promise<ServerContext>,
   params: unknown,
@@ -249,7 +278,7 @@ export async function readResource(
       return {
         ok: true,
         result: {
-          contents: [{ uri: params.uri, mimeType: "text/markdown", text: doc.content }],
+          contents: [{ uri: params.uri, mimeType: "text/markdown", text: scrubText(doc.content) }],
         },
       };
     } catch {
@@ -261,13 +290,16 @@ export async function readResource(
     }
   }
 
-  const contextResult = await ctx.service.callTool("get_project_context", {});
-  const handoff =
-    isPlainObject(contextResult) && Array.isArray(contextResult.recent_handoffs)
-      ? contextResult.recent_handoffs.find(
-          (item) => isPlainObject(item) && item.task_id === target.taskId,
-        )
-      : undefined;
+  let handoff: unknown = await loadHandoffFromStore(ctx.root, target.taskId);
+  if (!handoff) {
+    const contextResult = await ctx.service.callTool("get_project_context", {});
+    handoff =
+      isPlainObject(contextResult) && Array.isArray(contextResult.recent_handoffs)
+        ? contextResult.recent_handoffs.find(
+            (item) => isPlainObject(item) && item.task_id === target.taskId,
+          )
+        : undefined;
+  }
   if (!handoff) {
     return {
       ok: false,
@@ -275,10 +307,11 @@ export async function readResource(
       message: `Resource not found: ${params.uri}`,
     };
   }
+  const scrubbed = scrubDeep(handoff, DEFAULT_SCRUB_SKIP_KEYS).value;
   return {
     ok: true,
     result: {
-      contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(handoff) }],
+      contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(scrubbed) }],
     },
   };
 }

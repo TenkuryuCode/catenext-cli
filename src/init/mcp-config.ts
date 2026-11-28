@@ -1,8 +1,10 @@
 import { isAbsolute, resolve } from "node:path";
 import type { PlatformId } from "@catenext/shared";
+import { hasVersionedSegment, stableNodeCommand, stableScriptPath } from "../node-command.js";
 import {
   type EntryInspection,
   McpConfigError,
+  type McpRole,
   type McpServerEntry,
   stdioEntry,
 } from "./mcp-entry.js";
@@ -13,7 +15,9 @@ import { readRepoFile } from "./repo-files.js";
 export {
   type EntryInspection,
   entryBase,
+  entryRole,
   McpConfigError,
+  type McpRole,
   type McpServerEntry,
 } from "./mcp-entry.js";
 export const CURSOR_WORKSPACE_FOLDER = "$" + "{workspaceFolder}";
@@ -127,14 +131,22 @@ export function scopedEntry(
   root: string,
   adapter: ClientAdapter,
   base: McpServerEntry,
+  role: McpRole = "orchestrator",
 ): McpServerEntry {
   const result = stdioEntry(base.command, base.args);
   if (!result || [result.command, ...result.args].some((value) => value.includes("\0"))) {
     throw new McpConfigError("Perintah MCP harus berupa program dan daftar argumen tanpa NUL.");
   }
+  const command = hasVersionedSegment(result.command)
+    ? stableNodeCommand(result.command, process.env.PATH)
+    : result.command;
+  const args = result.args.slice();
+  if (args[0] && hasVersionedSegment(args[0])) {
+    args[0] = stableScriptPath(args[0]);
+  }
   return {
-    command: result.command,
-    args: [...result.args, "mcp", "--root", adapter.workspaceToken ?? resolve(root)],
+    command,
+    args: [...args, "mcp", "--role", role, "--root", adapter.workspaceToken ?? resolve(root)],
   };
 }
 

@@ -34,16 +34,29 @@ export function stdioEntry(command: unknown, args: unknown): McpServerEntry | nu
     : null;
 }
 
+export type McpRole = "orchestrator" | "worker" | "reviewer";
+
+function isMcpRole(value: string | undefined): value is McpRole {
+  return value === "orchestrator" || value === "worker" || value === "reviewer";
+}
+
+/** Extract explicit `--role <role>` override from a managed entry, if present. */
+export function entryRole(entry: McpServerEntry): McpRole | null {
+  const args = entry.args.slice();
+  if (args.at(-2) === "--root") args.splice(-2);
+  if (args.length >= 2 && args.at(-2) === "--role") {
+    const role = args.at(-1);
+    if (isMcpRole(role)) return role;
+  }
+  return null;
+}
+
 /** Recognize generated local launches; never take over another server named catenext. */
 export function entryBase(entry: McpServerEntry): McpServerEntry | null {
   const args = entry.args.slice();
   if (args.at(-2) === "--root") args.splice(-2);
-  // Optional flags after `mcp`: --role <orchestrator|worker>, --allow-crud
-  if (
-    args.length >= 2 &&
-    args.at(-2) === "--role" &&
-    (args.at(-1) === "orchestrator" || args.at(-1) === "worker")
-  ) {
+  // Optional flags after `mcp`: --role <orchestrator|worker|reviewer>, --allow-crud
+  if (args.length >= 2 && args.at(-2) === "--role" && isMcpRole(args.at(-1))) {
     args.splice(-2);
   }
   if (args.at(-1) === "--allow-crud") args.pop();

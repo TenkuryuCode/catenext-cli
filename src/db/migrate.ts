@@ -24,6 +24,7 @@ import { emptyExtendedProject, saveProject } from "./project-codec.js";
 import {
   CODE_SEARCH_FILES_SQL,
   CODE_SEARCH_FTS_SQL,
+  EMBEDDING_CHUNKS_SQL,
   EPIC_RUNS_SQL,
   SCHEMA_SQL,
   SCHEMA_VERSION,
@@ -230,6 +231,13 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     up(db) {
       db.exec(EPIC_RUNS_SQL);
       ensureRetentionColumns(db);
+    },
+  },
+  {
+    version: 10,
+    description: "Add embedding_chunks table for opt-in semantic embeddings",
+    up(db) {
+      db.exec(EMBEDDING_CHUNKS_SQL);
     },
   },
 ];

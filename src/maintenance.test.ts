@@ -75,8 +75,11 @@ describe("local sync", () => {
     expect(text).toContain('// neighbor comment\n  "x"  : {"command":"x","args":[]},');
     expect(json(text)).toMatchObject({
       mcpServers: {
-        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
-        catenext: { command: "node", args: ["new.js", "mcp", "--root", "${CLAUDE_PROJECT_DIR}"] },
+        catenext: {
+          command: "node",
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
+          args: ["new.js", "mcp", "--role", "orchestrator", "--root", "${CLAUDE_PROJECT_DIR}"],
+        },
       },
     });
   });
@@ -128,11 +131,60 @@ describe("local sync", () => {
     await applyFileEdits(root, plan.edits);
     expect(json(await read(".mcp.json"))).toMatchObject({
       mcpServers: {
-        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
-        catenext: { command: "node", args: ["new.js", "mcp", "--root", "${CLAUDE_PROJECT_DIR}"] },
+        catenext: {
+          command: "node",
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal IDE placeholder, not interpolation
+          args: ["new.js", "mcp", "--role", "orchestrator", "--root", "${CLAUDE_PROJECT_DIR}"],
+        },
       },
     });
     expect(await read(AGENTS_MD)).toContain(BLOCK_START);
+  });
+
+  it("preserves explicit --role override on --fix while defaulting to --role orchestrator on --force", async () => {
+    await write(
+      ".agents/mcp_config.json",
+      JSON.stringify({
+        mcpServers: {
+          catenext: {
+            command: "catenext",
+            args: ["mcp", "--role", "worker", "--root", "/wrong/repo"],
+          },
+        },
+      }),
+    );
+    const fix = await planSync({
+      root,
+      platforms: ["antigravity"],
+      fix: true,
+      defaultCommand: NEW,
+    });
+    await applyFileEdits(root, fix.edits);
+    expect(json(await read(".agents/mcp_config.json"))).toEqual({
+      mcpServers: {
+        catenext: {
+          command: "catenext",
+          args: ["mcp", "--role", "worker", "--root", root],
+        },
+      },
+    });
+
+    const force = await planSync({
+      root,
+      platforms: ["antigravity"],
+      fix: false,
+      force: true,
+      defaultCommand: NEW,
+    });
+    await applyFileEdits(root, force.edits);
+    expect(json(await read(".agents/mcp_config.json"))).toEqual({
+      mcpServers: {
+        catenext: {
+          command: "node",
+          args: ["new.js", "mcp", "--role", "orchestrator", "--root", root],
+        },
+      },
+    });
   });
 
   it("checks platform set membership without rewriting config when same set is reordered", async () => {

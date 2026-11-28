@@ -15,6 +15,7 @@ import {
   nodeLauncherWarning,
   npxLaunch,
   stableNodeCommand,
+  stableScriptPath,
 } from "./node-command.js";
 
 const SERVBAY = resolve("/Applications/ServBay/package/node/24/24.21.0/bin/node");
@@ -132,5 +133,46 @@ describe("npxLaunch", () => {
   it("tetap memakai path skrip untuk instalasi global atau build lokal", () => {
     expect(npxLaunch("/usr/local/lib/node_modules/catenext/dist/index.js")).toBeNull();
     expect(npxLaunch("/repo/apps/cli/dist/index.js")).toBeNull();
+  });
+});
+
+describe("stableScriptPath", () => {
+  it("resolves versioned ServBay and nvm script paths to current symlink when available", () => {
+    const servbayScript = resolve(
+      "/Applications/ServBay/package/node/24/24.21.0/lib/node_modules/catenext/dist/index.js",
+    );
+    const servbayCurrent = resolve(
+      "/Applications/ServBay/package/node/current/lib/node_modules/catenext/dist/index.js",
+    );
+    expect(
+      stableScriptPath(
+        servbayScript,
+        (p) => (p === servbayCurrent ? servbayScript : p),
+        (p) => p === servbayCurrent,
+      ),
+    ).toBe(servbayCurrent);
+
+    const nvmScript = resolve(
+      "/home/test/.nvm/versions/node/v22.11.0/lib/node_modules/catenext/dist/index.js",
+    );
+    const nvmCurrent = resolve("/home/test/.nvm/current/lib/node_modules/catenext/dist/index.js");
+    expect(
+      stableScriptPath(
+        nvmScript,
+        (p) => (p === nvmCurrent ? nvmScript : p),
+        (p) => p === nvmCurrent,
+      ),
+    ).toBe(nvmCurrent);
+  });
+
+  it("keeps relative or unpinned script paths unchanged", () => {
+    expect(stableScriptPath("cli.js")).toBe("cli.js");
+    expect(
+      stableScriptPath(
+        resolve("/repo/apps/cli/dist/index.js"),
+        (p) => p,
+        () => true,
+      ),
+    ).toBe(resolve("/repo/apps/cli/dist/index.js"));
   });
 });

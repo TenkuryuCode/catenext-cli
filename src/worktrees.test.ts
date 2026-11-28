@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatenextConfigSchema } from "@catenext/shared";
@@ -9,7 +9,7 @@ import { findProjectRoot } from "./config.js";
 import { LocalStore } from "./db/store.js";
 import { taskClaim } from "./fallback.js";
 import { LocalService } from "./local-service.js";
-import { pruneWorktrees } from "./worktrees.js";
+import { pruneWorktrees, readManagedWorktree } from "./worktrees.js";
 
 const tempDirs: string[] = [];
 
@@ -200,4 +200,75 @@ it("rechecks lease state after preview while waiting for the writer lock", async
   expect(git(root, "worktree", "list", "--porcelain").replaceAll("\\", "/")).toContain(
     draft.path.replaceAll("\\", "/"),
   );
+}, 20_000);
+
+it("rejects hardlinked and symlinked lock files during locked store and prune operations", async () => {
+  const { dir, service, newTask, opts, options } = await fixture();
+  const id = await newTask("lock-edge");
+  const draft = opts("lock-edge");
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await taskClaim(service, id, draft);
+  const output = log.mock.calls.at(-1)?.[0];
+  if (typeof output !== "string") throw new Error("Missing claim JSON");
+  const lease = JSON.parse(output) as { lease_id: string };
+  await service.callTool("release_task", { task_id: id, lease_id: lease.lease_id });
+
+  const lockPath = `${service.stateFile}.lock`;
+  const decoy = join(dir, "decoy-lock");
+  await writeFile(
+    decoy,
+    JSON.stringify({ pid: process.pid, startedAt: new Date(0).toISOString() }),
+  );
+
+  // Hardlinked lock file must be rejected even when its content looks stale.
+  await link(decoy, lockPath);
+  const store = new LocalStore(service.stateFile);
+  await expect(store.inspect(() => null, { lock: true })).rejects.toThrow(
+    /not a symlink or hardlink/i,
+  );
+  await expect(pruneWorktrees(options, true)).rejects.toThrow(/not a symlink or hardlink/i);
+
+  // Symlinked lock file must also be rejected.
+  await rm(lockPath, { force: true });
+  await symlink(decoy, lockPath);
+  await expect(store.inspect(() => null, { lock: true })).rejects.toThrow(/not a symlink/i);
+}, 20_000);
+
+it("enforces symlink boundary checks on worktree creation and managed marker discovery", async () => {
+  const { dir, root, service, newTask, opts } = await fixture();
+
+  // 1. Symlinked parent pointing inside primary root must be rejected.
+  const aliasToRoot = join(dir, "alias-to-primary");
+  await symlink(root, aliasToRoot);
+  const id1 = await newTask("sym-parent");
+  await expect(
+    taskClaim(service, id1, {
+      ...opts("sym-parent"),
+      path: join(aliasToRoot, "nested-wt"),
+    }),
+  ).rejects.toThrow(/di luar worktree yang sudah terdaftar/i);
+
+  // 2. Dangling symlink at target --path must be rejected by lstat-based requireMissing.
+  const dangling = join(dir, "dangling-wt");
+  await symlink(join(dir, "does-not-exist"), dangling);
+  const id2 = await newTask("dangling");
+  await expect(
+    taskClaim(service, id2, {
+      ...opts("dangling"),
+      path: dangling,
+    }),
+  ).rejects.toThrow(/harus belum ada/i);
+
+  // 3. Hardlinked catenext-worktree.json marker inside git admin dir must be ignored.
+  const id3 = await newTask("hardlink-marker");
+  const validOpts = opts("valid-wt");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  await taskClaim(service, id3, validOpts);
+  expect(await readManagedWorktree(validOpts.path)).not.toBeNull();
+
+  const adminDir = git(validOpts.path, "rev-parse", "--path-format=absolute", "--git-dir");
+  const markerPath = join(adminDir, "catenext-worktree.json");
+  const markerCopy = join(dir, "marker-hardlink.json");
+  await link(markerPath, markerCopy);
+  expect(await readManagedWorktree(validOpts.path)).toBeNull();
 }, 20_000);

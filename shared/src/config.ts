@@ -25,6 +25,50 @@ export type PlatformId = z.infer<typeof PlatformIdSchema>;
 
 export const DEFAULT_PLATFORMS: PlatformId[] = ["claude-code", "cursor", "codex", "antigravity"];
 
+export const EMBEDDING_PROVIDERS = ["ollama", "gemini", "openai"] as const;
+export const EmbeddingProviderSchema = z.enum(EMBEDDING_PROVIDERS);
+export type EmbeddingProvider = z.infer<typeof EmbeddingProviderSchema>;
+
+const UrlCtor = (
+  globalThis as unknown as {
+    URL?: new (input: string) => { protocol: string; username: string; password: string };
+  }
+).URL;
+
+/** Validate that an embedding endpoint URL uses http/https without embedded credentials. */
+export function isValidEmbeddingEndpoint(raw: string): boolean {
+  if (!/^https?:\/\//i.test(raw)) return false;
+  if (UrlCtor) {
+    try {
+      const url = new UrlCtor(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+      if (url.username || url.password) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return !/^https?:\/\/[^/?#]*@/i.test(raw);
+}
+
+export const EmbeddingsConfigSchema = z
+  .object({
+    provider: EmbeddingProviderSchema,
+    model: z.string().min(1).max(120).optional(),
+    dimensions: z.number().int().positive().max(16384).optional(),
+    endpoint: z
+      .string()
+      .min(1)
+      .max(500)
+      .refine(isValidEmbeddingEndpoint, {
+        message: "endpoint must be an http/https URL without embedded credentials",
+      })
+      .optional(),
+  })
+  .strict();
+
+export type EmbeddingsConfig = z.infer<typeof EmbeddingsConfigSchema>;
+
 /**
  * Isi .catenext/config.yaml. File ini milik manusia: tidak ada tool MCP yang boleh
  * menulisnya. State orkestrator disimpan secara lokal di .catenext/catenext.sqlite.
@@ -39,6 +83,7 @@ export const CatenextConfigSchema = z.object({
   platforms: z.array(PlatformIdSchema).optional(),
   /** Path SQLite state bersama (opsional, untuk proyek multi-repo lintas folder). */
   state_file: z.string().min(1).max(300).optional(),
+  embeddings: EmbeddingsConfigSchema.optional(),
   overrides: z
     .object({
       default_agent_alias: AgentAliasSchema.optional(),

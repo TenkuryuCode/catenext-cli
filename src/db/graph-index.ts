@@ -1,7 +1,16 @@
 import { createHash } from "node:crypto";
-import { accessSync, constants, type Dirent, lstatSync, readdirSync, realpathSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  type Dirent,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { extname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
   type ClaimGraphFile,
@@ -243,6 +252,7 @@ export async function indexProjectGraph(
   root: string,
   options: GraphIndexOptions = {},
 ): Promise<GraphIndexResult> {
+  clearGraphFreshnessCache(projectId);
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
   return withDatabaseAsync(dbOrPath, async (db) => {
     const registeredRoots = db
@@ -880,10 +890,81 @@ function hasAnyCodeFileBounded(absDir: string): boolean {
   return false;
 }
 
+const DEFAULT_GRAPH_FRESHNESS_TTL_MS = 5_000;
+const MAX_FRESHNESS_CACHE_ENTRIES = 100;
+
+interface FreshnessCacheEntry {
+  totalFiles: number;
+  gitSignature: string;
+  expiresAt: number;
+  result: GraphFreshnessResult;
+}
+
+const freshnessCache = new Map<string, FreshnessCacheEntry>();
+
+export function clearGraphFreshnessCache(projectId?: string): void {
+  if (!projectId) {
+    freshnessCache.clear();
+    return;
+  }
+  const prefix = `${projectId}\0`;
+  for (const key of freshnessCache.keys()) {
+    if (key.startsWith(prefix)) freshnessCache.delete(key);
+  }
+}
+
+function resolveGitDir(startDir: string): string | undefined {
+  let current = resolve(startDir);
+  for (;;) {
+    const dotGit = join(current, ".git");
+    try {
+      const st = statSync(dotGit);
+      if (st.isDirectory()) return dotGit;
+      if (st.isFile()) {
+        const raw = readFileSync(dotGit, "utf8");
+        const match = raw.match(/^gitdir:\s*(.+)\s*$/m);
+        if (match?.[1]) return resolve(current, match[1].trim());
+      }
+    } catch {
+      // Not at this level
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function statMtimeMs(path: string): number {
+  try {
+    return Math.floor(statSync(path).mtimeMs);
+  } catch {
+    return -1;
+  }
+}
+
+function readGitStateMtimes(rootDirs: Array<{ rootId: string | null; dir: string }>): {
+  hasGit: boolean;
+  signature: string;
+} {
+  const gitDirs = new Set<string>();
+  for (const rootDir of rootDirs) {
+    const gitDir = resolveGitDir(rootDir.dir);
+    if (gitDir) gitDirs.add(gitDir);
+  }
+  if (gitDirs.size === 0) return { hasGit: false, signature: "" };
+  const parts = [...gitDirs].sort().map((gitDir) => {
+    const indexMtime = statMtimeMs(join(gitDir, "index"));
+    const headMtime = statMtimeMs(join(gitDir, "HEAD"));
+    return `${gitDir}:${indexMtime}:${headMtime}`;
+  });
+  return { hasGit: true, signature: parts.join("|") };
+}
+
 export function checkGraphFreshness(
   dbOrPath: DatabaseSync | string,
   projectId: string,
   rootDirs: Array<{ rootId: string | null; dir: string }>,
+  options?: { ttlMs?: number },
 ): GraphFreshnessResult {
   return withDatabase(dbOrPath, (db) => {
     const totalFiles = (
@@ -899,6 +980,25 @@ export function checkGraphFreshness(
         }
       }
       return { stale: false, checked_files: 0 };
+    }
+
+    const gitState = readGitStateMtimes(rootDirs);
+    const ttlMs = options?.ttlMs ?? (gitState.hasGit ? DEFAULT_GRAPH_FRESHNESS_TTL_MS : 0);
+    const cacheKey = `${projectId}\0${rootDirs
+      .map((r) => `${r.rootId ?? ""}:${resolve(r.dir)}`)
+      .sort()
+      .join("|")}`;
+
+    if (ttlMs > 0) {
+      const cached = freshnessCache.get(cacheKey);
+      if (
+        cached &&
+        cached.totalFiles === totalFiles &&
+        cached.gitSignature === gitState.signature &&
+        Date.now() < cached.expiresAt
+      ) {
+        return cached.result;
+      }
     }
 
     if (!isGraphParserCurrent(db, projectId)) {
@@ -995,7 +1095,20 @@ export function checkGraphFreshness(
       };
     }
 
-    return { stale: false, checked_files: checked };
+    const result: GraphFreshnessResult = { stale: false, checked_files: checked };
+    if (ttlMs > 0) {
+      if (freshnessCache.size >= MAX_FRESHNESS_CACHE_ENTRIES) {
+        const oldestKey = freshnessCache.keys().next().value;
+        if (oldestKey !== undefined) freshnessCache.delete(oldestKey);
+      }
+      freshnessCache.set(cacheKey, {
+        totalFiles,
+        gitSignature: gitState.signature,
+        expiresAt: Date.now() + ttlMs,
+        result,
+      });
+    }
+    return result;
   });
 }
 
@@ -1116,11 +1229,12 @@ export async function microReindexModifiedFiles(
       return { applied: false, reindexed: 0, counts };
     }
 
+    clearGraphFreshnessCache(projectId);
     let targets: string[];
     if (modifiedPaths !== undefined) {
       targets = [...new Set(modifiedPaths.filter((p) => p.length > 0))];
     } else {
-      const freshness = checkGraphFreshness(db, projectId, rootDirs);
+      const freshness = checkGraphFreshness(db, projectId, rootDirs, { ttlMs: 0 });
       if (!freshness.stale) {
         return { applied: true, reindexed: 0, counts };
       }

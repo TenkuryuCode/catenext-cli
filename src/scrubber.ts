@@ -50,15 +50,19 @@ const RULES: Rule[] = [
     replace: (m, pre, tok) => (tok.includes("[REDACTED:") ? m : `${pre}${redact("bearer_token")}`),
   },
   {
-    // KEY=value / password: value / "api_key": "secret-val". Nilai dianggap secret bila >= 12 karakter,
-    // atau >= 6 karakter dan mengandung angka/simbol (agar prosa biasa tidak ikut tersensor).
+    // KEY=value / password: value / "api_key": "secret-val" / PASSWORD="my secret pass".
+    // Nilai dianggap secret bila >= 12 karakter, atau >= 6 karakter dan mengandung angka/simbol
+    // (agar prosa biasa tidak ikut tersensor).
     kind: "assignment",
     pattern:
-      /\b([A-Za-z0-9_.-]*(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|auth)[A-Za-z0-9_.-]*)(["']?\s*[:=]\s*["']?)([^\s"'`,;]*[^\s"'`,;.)])/gi,
-    replace: (m, name, sep, value) => {
+      /\b([A-Za-z0-9_.-]*(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|auth)[A-Za-z0-9_.-]*)(["']?\s*[:=]\s*)(?:(["'])((?:\\.|(?!\3)[^\\\n\r])+)\3|([^\s"'`,;]*[^\s"'`,;.)]))/gi,
+    replace: (m, name, sep, quote, quotedVal, unquotedVal) => {
+      const value = quotedVal ?? unquotedVal ?? "";
       if (value.includes("[REDACTED:")) return m;
       const looksSecret = value.length >= 12 || (value.length >= 6 && /[0-9\W_]/.test(value));
-      return looksSecret ? `${name}${sep}${redact("assignment")}` : m;
+      if (!looksSecret) return m;
+      const q = quote ?? "";
+      return `${name}${sep}${q}${redact("assignment")}${q}`;
     },
   },
 ];

@@ -19,10 +19,24 @@ function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   }
 }
 
+const tableColumnCache = new WeakMap<DatabaseSync, Map<string, Set<string>>>();
+
 function tableColumnNames(db: DatabaseSync, table: string): Set<string> {
-  return new Set(
-    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((col) => col.name),
-  );
+  let byTable = tableColumnCache.get(db);
+  if (!byTable) {
+    byTable = new Map<string, Set<string>>();
+    tableColumnCache.set(db, byTable);
+  }
+  let cols = byTable.get(table);
+  if (!cols) {
+    cols = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+        (col) => col.name,
+      ),
+    );
+    byTable.set(table, cols);
+  }
+  return cols;
 }
 
 function epicsSelectSql(db: DatabaseSync): string {
@@ -42,9 +56,8 @@ function parseEpicSummary(raw: unknown): VersionedEpicSummary | null {
 }
 
 function documentsSelectSql(db: DatabaseSync): string {
-  const columns = db.prepare("PRAGMA table_info(documents)").all() as { name: string }[];
   const base = "slug, title, kind, version, updated_by, updated_at, size, content";
-  return columns.some((col) => col.name === "archived_at") ? `${base}, archived_at` : base;
+  return tableColumnNames(db, "documents").has("archived_at") ? `${base}, archived_at` : base;
 }
 
 function tasksSelectSql(db: DatabaseSync): string {

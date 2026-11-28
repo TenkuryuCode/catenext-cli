@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { CatenextConfigSchema, type McpToolName } from "@catenext/shared";
+import { CatenextConfigSchema, MCP_CRUD_TOOLS, type McpToolName } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
@@ -12,8 +12,11 @@ import {
   ResourceUpdatedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { stateFilePath } from "../config.js";
 import { indexProjectGraph } from "../db/graph-index.js";
+import { LocalStore } from "../db/store.js";
 import { LocalService } from "../local-service.js";
+import { scrubText } from "../scrubber.js";
 import { ROLE_TOOLS } from "./catalog.js";
 import {
   createCatenextMcpServer,
@@ -41,7 +44,8 @@ afterEach(async () => {
 async function setup(
   respond = (_call: Captured): unknown => ({ ok: 1 }),
   ctxOverride?: ServerContext,
-  role?: "orchestrator" | "worker",
+  role?: "orchestrator" | "worker" | "reviewer",
+  allowCrud?: boolean,
 ) {
   const calls: Captured[] = [];
   const service = {
@@ -59,6 +63,7 @@ async function setup(
     context: async () => ctxOverride ?? { ok: true, service, root: repoRoot },
     log: (m) => logs.push(m),
     role,
+    allowCrud,
   });
   const [a, b] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "claude-code", version: "1.0.0" });
@@ -996,16 +1001,61 @@ describe("server MCP catenext", () => {
       text: expect.stringContaining("blueprint, orchestrator, permissions, sync-board"),
     });
 
+    const kickoffOmitted = await client.getPrompt({ name: "kickoff-brainstorm" });
+    expect(kickoffOmitted.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("No `goal` argument was provided"),
+    });
+    expect(kickoffOmitted.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining("Ask the user what feature or epic goal"),
+    });
+
+    const kickoffEmpty = await client.getPrompt({
+      name: "kickoff-brainstorm",
+      arguments: { personas: "be,fe" },
+    });
+    expect(kickoffEmpty.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Personas: be,fe"),
+    });
+
+    const reviewOmitted = await client.getPrompt({ name: "rc-review" });
+    expect(reviewOmitted.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("No `task_id` argument was provided"),
+    });
+    expect(reviewOmitted.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining("catenext://handoffs/{task_id}"),
+    });
+
+    const reviewBlank = await client.getPrompt({
+      name: "rc-review",
+      arguments: { task_id: "   ", focus: "contracts" },
+    });
+    expect(reviewBlank.messages[0]?.content).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Focus: contracts"),
+    });
+    expect(reviewBlank.messages[0]?.content).toMatchObject({
+      text: expect.stringContaining("Ask the user which task UUID"),
+    });
+
     await expect(client.getPrompt({ name: "unknown-prompt" })).rejects.toMatchObject({
       code: -32602,
     });
     await expect(
-      client.getPrompt({ name: "kickoff-brainstorm", arguments: {} }),
+      client.getPrompt({
+        name: "kickoff-brainstorm",
+        arguments: { goal: 123 as unknown as string },
+      }),
     ).rejects.toMatchObject({
       code: -32602,
     });
     await expect(
-      client.getPrompt({ name: "rc-review", arguments: { task_id: "   " } }),
+      client.getPrompt({
+        name: "rc-review",
+        arguments: { task_id: null as unknown as string },
+      }),
     ).rejects.toMatchObject({
       code: -32602,
     });
@@ -1499,6 +1549,407 @@ describe("server MCP catenext", () => {
           status: "CLOSED",
           eligible: [],
         });
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scrubs unlisted MCP tool inputs, MCP tool outputs, readResource, and quoted multi-word secrets", async () => {
+    const fakeKey = ["sk-proj", "testfixture0123456789abcdef"].join("-");
+    const fakeGh = ["ghp", "abcdefghijklmnopqrstuvwxyz0123456789"].join("_");
+
+    // 1. Quoted multi-word secrets in scrubText
+    expect(scrubText('PASSWORD="my secret pass 123"')).toBe('PASSWORD="[REDACTED:assignment]"');
+    expect(scrubText("API_SECRET='correct horse battery staple'")).toBe(
+      "API_SECRET='[REDACTED:assignment]'",
+    );
+    expect(scrubText('{"password": "my super secret 123", "note": "ok"}')).toBe(
+      '{"password": "[REDACTED:assignment]", "note": "ok"}',
+    );
+    expect(scrubText('PASSWORD="short"')).toBe('PASSWORD="short"');
+
+    // 2. Unlisted MCP tool input scrubbing (epic_run) + output scrubbing (get_document, search_context, claim_task)
+    const {
+      client,
+      calls,
+      logs,
+      root: repoRoot,
+    } = await setup((call) => {
+      if (call.name === "get_document") {
+        return {
+          slug: "secret-doc",
+          title: "Secret Doc",
+          kind: "other",
+          version: 1,
+          content: `Use token ${fakeGh} and PASSWORD="my secret pass 123"`,
+        };
+      }
+      if (call.name === "search_context") {
+        return {
+          results: [{ snippet: `api_key=${fakeKey}` }],
+        };
+      }
+      if (call.name === "claim_task") {
+        return {
+          task: {
+            id: TASK,
+            title: "Task with secret",
+            prompt_instruction: `Run with ${fakeKey}`,
+          },
+          lease_id: "22222222-3333-4444-8555-666666666666",
+          dependency_handoffs: [
+            {
+              task_id: TASK,
+              title: "Dep",
+              handoff_summary: { ...HANDOFF, notes_for_next_agent: `Token: ${fakeGh}` },
+            },
+          ],
+        };
+      }
+      return { ok: 1 };
+    });
+
+    const epicRes = await client.callTool({
+      name: "epic_run",
+      arguments: {
+        epic_id: TASK,
+        action: "pause",
+        reason: `Paused due to ${fakeKey}`,
+      },
+    });
+    expect(epicRes.isError).toBeFalsy();
+    expect(calls[0]).toEqual({
+      name: "epic_run",
+      body: {
+        epic_id: TASK,
+        action: "pause",
+        reason: "Paused due to [REDACTED:llm_api_key]",
+      },
+    });
+    expect(logs.some((l) => l.includes("llm_api_key"))).toBe(true);
+
+    const docRes = await client.callTool({
+      name: "get_document",
+      arguments: { slug: "secret-doc" },
+    });
+    const docText = (docRes.content as Array<{ text: string }>)[0]?.text ?? "";
+    expect(docText).not.toContain(fakeGh);
+    expect(docText).not.toContain("my secret pass 123");
+    expect(docText).toContain("[REDACTED:github_token]");
+    expect(docText).toContain('PASSWORD=\\"[REDACTED:assignment]\\"');
+
+    const searchRes = await client.callTool({
+      name: "search_context",
+      arguments: { query: "api_key" },
+    });
+    const searchText = (searchRes.content as Array<{ text: string }>)[0]?.text ?? "";
+    expect(searchText).not.toContain(fakeKey);
+    expect(searchText).toContain("[REDACTED:llm_api_key]");
+
+    const claimRes = await client.callTool({
+      name: "claim_task",
+      arguments: { task_id: TASK },
+    });
+    const claimJson = JSON.parse(
+      (claimRes.content as Array<{ text: string }>)[0]?.text ?? "{}",
+    ) as {
+      task: { prompt_instruction: string };
+      lease_id: string;
+      dependency_handoffs: Array<{ handoff_summary: { notes_for_next_agent: string } }>;
+    };
+    expect(claimJson.lease_id).toBe("22222222-3333-4444-8555-666666666666");
+    expect(claimJson.task.prompt_instruction).toBe("Run with [REDACTED:llm_api_key]");
+    expect(claimJson.dependency_handoffs[0]?.handoff_summary.notes_for_next_agent).toBe(
+      "Token: [REDACTED:github_token]",
+    );
+
+    // 3. load_skill output scrubbing (native skill on disk containing a secret)
+    const claudeSkillDir = join(repoRoot, ".claude", "skills", "secret-skill");
+    await mkdir(claudeSkillDir, { recursive: true });
+    await writeFile(
+      join(claudeSkillDir, "SKILL.md"),
+      `---\ndescription: Test skill\n---\nUse ${fakeKey}\n`,
+      "utf8",
+    );
+    const skillRes = await client.callTool({
+      name: "load_skill",
+      arguments: { name: "secret-skill" },
+    });
+    const skillText = (skillRes.content as Array<{ text: string }>)[0]?.text ?? "";
+    expect(skillText).not.toContain(fakeKey);
+    expect(skillText).toContain("[REDACTED:llm_api_key]");
+
+    // 4. readResource scrubbing for documents
+    const readDoc = await client.readResource({ uri: "catenext://documents/secret-doc" });
+    const readDocText = (readDoc.contents[0] as { text: string }).text;
+    expect(readDocText).not.toContain(fakeGh);
+    expect(readDocText).toContain("[REDACTED:github_token]");
+    expect(readDocText).toContain('PASSWORD="[REDACTED:assignment]"');
+  });
+
+  it("reads catenext://handoffs/{task_id} via direct store lookup even when outside recent_handoffs", async () => {
+    const fakeKey = ["sk-ant-api03", "testfixture0123456789abcdef"].join("-");
+    const repoDir = await mkdtemp(join(tmpdir(), "catenext-mcp-handoff-store-"));
+    try {
+      await mkdir(join(repoDir, ".catenext"), { recursive: true });
+      const config = CatenextConfigSchema.parse({
+        schema_version: 1,
+        project_id: randomUUID(),
+        repo_name: "app",
+        state_file: ".catenext/catenext.sqlite",
+      });
+      await writeFile(
+        join(repoDir, ".catenext/config.yaml"),
+        `schema_version: 1\nproject_id: ${config.project_id}\nrepo_name: app\nstate_file: .catenext/catenext.sqlite\n`,
+        "utf8",
+      );
+      const human = new LocalService(repoDir, config, "human");
+      await human.ensureSeed();
+      const agent = new LocalService(repoDir, config, "agent");
+
+      const { epic } = (await human.callTool("create_epic", {
+        title: "Handoff Store Epic",
+      })) as { epic: { id: string } };
+      const { created } = (await human.callTool("create_tasks", {
+        epic_id: epic.id,
+        tasks: [
+          {
+            ref: "old-task",
+            title: "Older completed task",
+            prompt_instruction: "Do work",
+            role: "backend",
+          },
+        ],
+      })) as { created: Array<{ task_id: string }> };
+      const oldTaskId = created[0]?.task_id ?? "";
+      expect(oldTaskId).not.toBe("");
+      await human.callTool("manage_task", { action: "approve_plan", task_id: oldTaskId });
+      const claim = await agent.callTool("claim_task", { task_id: oldTaskId, agent_alias: "be" });
+      await agent.callTool("complete_handoff", {
+        task_id: oldTaskId,
+        lease_id: claim.lease_id,
+        handoff_summary: {
+          ...HANDOFF,
+          notes_for_next_agent: `Older handoff with secret ${fakeKey}`,
+        },
+      });
+      await human.callTool("manage_task", { action: "approve", task_id: oldTaskId });
+
+      // Verify get_project_context does not include this DONE task in recent_handoffs
+      const ctxRes = await agent.callTool("get_project_context", {});
+      expect(ctxRes.recent_handoffs.some((h) => h.task_id === oldTaskId)).toBe(false);
+
+      const server = createCatenextMcpServer({
+        version: "test",
+        context: async () => ({ ok: true, service: agent, root: repoDir }),
+      });
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "claude-code", version: "1.0.0" });
+      const transport: McpTransport = {
+        async start() {
+          a.onmessage = transport.onmessage;
+          a.onclose = transport.onclose;
+          await a.start();
+        },
+        close: () => a.close(),
+        send: (msg) => a.send("error" in msg ? { ...msg, id: msg.id ?? undefined } : msg),
+      };
+      await Promise.all([server.connect(transport), client.connect(b)]);
+      try {
+        const readRes = await client.readResource({ uri: `catenext://handoffs/${oldTaskId}` });
+        const parsed = JSON.parse((readRes.contents[0] as { text: string }).text) as {
+          task_id: string;
+          title: string;
+          handoff_summary: { notes_for_next_agent: string };
+        };
+        expect(parsed.task_id).toBe(oldTaskId);
+        expect(parsed.title).toBe("Older completed task");
+        expect(parsed.handoff_summary.notes_for_next_agent).not.toContain(fakeKey);
+        expect(parsed.handoff_summary.notes_for_next_agent).toContain("[REDACTED:llm_api_key]");
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enables CRUD only on opted-in non-worker/non-reviewer launches and keeps approvals human-only", async () => {
+    const blockedProfiles: Array<{
+      role?: "orchestrator" | "worker" | "reviewer";
+      allowCrud?: boolean;
+    }> = [
+      { role: undefined, allowCrud: false },
+      { role: "orchestrator", allowCrud: false },
+      { role: "worker", allowCrud: true },
+      { role: "reviewer", allowCrud: true },
+    ];
+    for (const profile of blockedProfiles) {
+      const { client } = await setup(undefined, undefined, profile.role, profile.allowCrud);
+      const { tools } = await client.listTools();
+      for (const name of MCP_CRUD_TOOLS) {
+        expect(tools.some((tool) => tool.name === name)).toBe(false);
+        await expect(
+          client.callTool({
+            name,
+            arguments: {
+              task_id: TASK,
+              epic_id: TASK,
+              title: "Denied edit",
+              depends_on: [],
+              allowCrud: true,
+              caller: "human",
+              role: "orchestrator",
+            },
+          }),
+        ).rejects.toThrow(`Tool ${name} not found`);
+      }
+      await close?.();
+      close = undefined;
+      if (root) {
+        await rm(root, { recursive: true, force: true });
+        root = undefined;
+      }
+    }
+
+    const defaultCrud = await setup(undefined, undefined, undefined, true);
+    expect((await defaultCrud.client.listTools()).tools.map(({ name }) => name)).toEqual(
+      expect.arrayContaining([...MCP_CRUD_TOOLS]),
+    );
+    await close?.();
+    close = undefined;
+    if (root) {
+      await rm(root, { recursive: true, force: true });
+      root = undefined;
+    }
+
+    const repoDir = await mkdtemp(join(tmpdir(), "catenext-mcp-crud-"));
+    try {
+      await mkdir(join(repoDir, ".catenext"), { recursive: true });
+      const config = CatenextConfigSchema.parse({
+        schema_version: 1,
+        project_id: randomUUID(),
+        repo_name: "app",
+        state_file: ".catenext/catenext.sqlite",
+      });
+      await writeFile(
+        join(repoDir, ".catenext/config.yaml"),
+        `schema_version: 1\nproject_id: ${config.project_id}\nrepo_name: app\nstate_file: .catenext/catenext.sqlite\n`,
+        "utf8",
+      );
+      const human = new LocalService(repoDir, config, "human");
+      await human.ensureSeed();
+      const service = new LocalService(repoDir, config, "agent", { allowCrud: true });
+
+      const server = createCatenextMcpServer({
+        version: "test",
+        context: async () => ({ ok: true, service, root: repoDir }),
+        role: "orchestrator",
+        allowCrud: true,
+      });
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "claude-code", version: "1.0.0" });
+      const transport: McpTransport = {
+        async start() {
+          a.onmessage = transport.onmessage;
+          a.onclose = transport.onclose;
+          await a.start();
+        },
+        close: () => a.close(),
+        send: (msg) => a.send("error" in msg ? { ...msg, id: msg.id ?? undefined } : msg),
+      };
+      await Promise.all([server.connect(transport), client.connect(b)]);
+      const callJson = async <T>(name: McpToolName, args: Record<string, unknown>): Promise<T> => {
+        const res = await client.callTool({ name, arguments: args });
+        if (res.isError) throw new Error(textOf(res));
+        return JSON.parse(textOf(res)) as T;
+      };
+      try {
+        expect((await client.listTools()).tools.map(({ name }) => name)).toEqual(
+          expect.arrayContaining([...MCP_CRUD_TOOLS]),
+        );
+
+        const { epic } = await callJson<{ epic: { id: string } }>("create_epic", {
+          title: "Fixture epic",
+        });
+        const { created } = await callJson<{ created: Array<{ task_id: string }> }>(
+          "create_tasks",
+          {
+            epic_id: epic.id,
+            tasks: [
+              { ref: "a", title: "Fixture A", prompt_instruction: "Build fixture A" },
+              { ref: "b", title: "Fixture B", prompt_instruction: "Build fixture B" },
+            ],
+          },
+        );
+        const [taskA, taskB] = created;
+        if (!taskA || !taskB) throw new Error("Fixture tasks missing");
+
+        const updatedEpic = await callJson<{ epic: { title: string } }>("update_epic", {
+          epic_id: epic.id,
+          title: "Updated epic",
+        });
+        expect(updatedEpic.epic.title).toBe("Updated epic");
+
+        expect(
+          await callJson("update_task", {
+            task_id: taskA.task_id,
+            title: "Updated task",
+            requires_approval: false,
+            status: "DONE",
+          }),
+        ).toMatchObject({ task_id: taskA.task_id, title: "Updated task", status: "DRAFT" });
+
+        expect(
+          await callJson("set_dependencies", {
+            task_id: taskB.task_id,
+            depends_on: [taskA.task_id],
+          }),
+        ).toEqual({
+          task_id: taskB.task_id,
+          depends_on: [taskA.task_id],
+        });
+
+        const cycleRes = await client.callTool({
+          name: "set_dependencies",
+          arguments: { task_id: taskA.task_id, depends_on: [taskB.task_id] },
+        });
+        expect(cycleRes.isError).toBe(true);
+        expect(textOf(cycleRes)).toMatch(/melingkar/);
+
+        const blockedCancel = await client.callTool({
+          name: "cancel_task",
+          arguments: { task_id: taskA.task_id },
+        });
+        expect(blockedCancel.isError).toBe(true);
+        expect(textOf(blockedCancel)).toMatch(/dependensi/);
+
+        for (const action of ["approve_plan", "approve"]) {
+          const denied = await client.callTool({
+            name: "manage_task",
+            arguments: { task_id: taskA.task_id, action, caller: "human" },
+          });
+          expect(denied.isError).toBe(true);
+          expect(textOf(denied)).toMatch(/catenext (task|review) approve/);
+        }
+
+        expect(await callJson("cancel_task", { task_id: taskB.task_id })).toMatchObject({
+          task_id: taskB.task_id,
+          cancelled: true,
+        });
+
+        const store = new LocalStore(stateFilePath(repoDir, config));
+        const events = await store.readTaskEvents(config.project_id, { actor: "agent" });
+        expect(events.map((e) => ({ event: e.event, actor: e.actor }))).toEqual(
+          expect.arrayContaining(
+            ["update", "set_dependencies", "cancel"].map((event) => ({ event, actor: "agent" })),
+          ),
+        );
       } finally {
         await client.close();
         await server.close();

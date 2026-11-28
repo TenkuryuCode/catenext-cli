@@ -1060,9 +1060,10 @@ function assembleReviewContextPack(
 
   const gitBranch = rawGitBranch ? scrubText(rawGitBranch) : undefined;
   const safeBaseBranch = scrubText(baseBranch);
+  const diffBaseRef = diffMeta.base_ref ? scrubText(diffMeta.base_ref) : safeBaseBranch;
 
   const detailPointers: ReviewDetailPointers = {
-    git_diff_command: `git diff ${safeBaseBranch}...${headSha} --`,
+    git_diff_command: `git diff ${diffBaseRef}...${headSha} --`,
     git_show_stat_command: `git show --stat ${headSha}`,
     ...(docRefs?.length ? { doc_refs: docRefs.map((ref) => scrubText(ref)) } : {}),
     mcp_tools: compact

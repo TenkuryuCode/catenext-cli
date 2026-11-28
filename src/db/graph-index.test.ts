@@ -11,6 +11,7 @@ import { DEFAULT_MAX_FILE_BYTES } from "../workspace-walk.js";
 import {
   checkGraphFreshness,
   GRAPH_PARSER_VERSION,
+  getGraphCounts,
   getGraphIndexFastPathState,
   graphNeighbors,
   indexProjectGraph,
@@ -25,6 +26,7 @@ import {
   resolveImport,
   symbolSearch,
 } from "./graph-index.js";
+import { renderArchitectureMarkdown } from "./graph-summary.js";
 import { openDatabaseAt } from "./open.js";
 import { LocalStore } from "./store.js";
 
@@ -2144,4 +2146,255 @@ describe("microReindexModifiedFiles", () => {
       await rm(outsideDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("index --summary, --impact, and --force flag matrix", () => {
+  async function initServiceProject() {
+    await mkdir(join(root, ".catenext"), { recursive: true });
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: projectId,
+      repo_name: "app",
+      state_file: "state.sqlite",
+    });
+    const service = new LocalService(root, config, "human");
+    await service.ensureSeed();
+    return { config, service };
+  }
+
+  it("produces architecture summary with mermaid/hubs and creates/updates architecture doc", async () => {
+    const { service } = await initServiceProject();
+    await mkdir(join(root, "src/core"), { recursive: true });
+    await mkdir(join(root, "src/api"), { recursive: true });
+    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
+    await writeFile(
+      join(root, "src/api/route.ts"),
+      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
+    );
+
+    const counts = await indexProjectGraph(dbPath, projectId, root);
+    expect(counts).toEqual({ files: 2, symbols: 2, edges: 1 });
+
+    const summary = await service.callTool("graph_summary", {
+      depth: 2,
+      max_hubs: 5,
+      include_mermaid: true,
+      include_tests: false,
+    });
+    expect(summary.indexed).toBe(true);
+    expect(summary.mermaid).toContain("flowchart LR");
+    expect(summary.groups).toHaveLength(2);
+
+    const markdown = renderArchitectureMarkdown(summary, { depth: 2, includeTests: false });
+    expect(markdown).toContain("# Project architecture");
+    expect(markdown).toContain("```mermaid");
+    expect(markdown).toContain("## Architectural Hubs");
+
+    const v1 = await service.callTool("save_document", {
+      slug: "architecture",
+      kind: "architecture",
+      title: "Project architecture",
+      content: markdown,
+    });
+    expect(v1.created).toBe(true);
+    expect(v1.document).toMatchObject({ slug: "architecture", kind: "architecture", version: 1 });
+
+    const fetched = await service.callTool("get_document", { slug: "architecture" });
+    expect(fetched.content).toContain("# Project architecture");
+    expect(fetched.content).toContain("## Module Dependency Graph");
+
+    const v2 = await service.callTool("save_document", {
+      slug: "architecture",
+      kind: "architecture",
+      title: "Project architecture",
+      content: markdown,
+      expected_version: fetched.version,
+    });
+    expect(v2.created).toBe(false);
+    expect(v2.document).toMatchObject({ slug: "architecture", kind: "architecture", version: 2 });
+  });
+
+  it("filters test files by default and includes them when include_tests is true for impact and summary", async () => {
+    const { service } = await initServiceProject();
+    await mkdir(join(root, "src/core"), { recursive: true });
+    await mkdir(join(root, "src/api"), { recursive: true });
+    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
+    await writeFile(
+      join(root, "src/api/route.ts"),
+      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/api/handler.ts"),
+      `import { handle } from "./route.js";\nexport function serve() { return handle(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/core/db.test.ts"),
+      `import { queryDb } from "./db.js";\nexport function testDb() { return queryDb(); }\n`,
+    );
+
+    const counts = await indexProjectGraph(dbPath, projectId, root);
+    expect(counts).toEqual({ files: 4, symbols: 4, edges: 3 });
+
+    const impactDefault = await service.callTool("graph_impact", {
+      path: "src/core/db.ts",
+      depth: 2,
+      limit: 20,
+      include_tests: false,
+    });
+    expect(impactDefault.total_affected).toBe(2);
+    expect(impactDefault.impacted.map((h) => h.path)).toEqual([
+      "src/api/route.ts",
+      "src/api/handler.ts",
+    ]);
+
+    const impactWithTests = await service.callTool("graph_impact", {
+      path: "src/core/db.ts",
+      depth: 2,
+      limit: 20,
+      include_tests: true,
+    });
+    expect(impactWithTests).toMatchObject({
+      target: "src/core/db.ts",
+      indexed: true,
+      total_affected: 3,
+      truncated: false,
+    });
+    expect(impactWithTests.impacted.map((h) => h.path)).toEqual([
+      "src/api/route.ts",
+      "src/core/db.test.ts",
+      "src/api/handler.ts",
+    ]);
+
+    const summaryWithoutTests = await service.callTool("graph_summary", {
+      depth: 2,
+      max_hubs: 12,
+      include_mermaid: true,
+      include_tests: false,
+    });
+    expect(summaryWithoutTests.totals).toEqual({ files: 3, symbols: 3, edges: 2 });
+    expect(summaryWithoutTests.hubs.map((h) => h.path)).not.toContain("src/core/db.test.ts");
+
+    const summaryWithTests = await service.callTool("graph_summary", {
+      depth: 2,
+      max_hubs: 12,
+      include_mermaid: true,
+      include_tests: true,
+    });
+    expect(summaryWithTests.totals).toEqual({ files: 4, symbols: 4, edges: 3 });
+    expect(summaryWithTests.hubs.map((h) => h.path)).toContain("src/core/db.test.ts");
+
+    const mdWithTests = renderArchitectureMarkdown(summaryWithTests, {
+      depth: 2,
+      includeTests: true,
+    });
+    expect(mdWithTests).toContain("**4** files, **4** symbols, **3** import edges");
+    expect(mdWithTests).not.toContain("include_tests=false");
+  });
+
+  it("supports fast-path skip for untracked files vs rebuildEdges (--force)", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/core.ts"), "export function core() { return 1; }\n");
+    await writeFile(
+      join(root, "src/app.ts"),
+      `import { core } from "./core.js";\nexport function app() { return core(); }\n`,
+    );
+
+    const first = await indexProjectGraph(dbPath, projectId, root);
+    expect(first.files).toBe(2);
+
+    // Untracked file added without modifying indexed files: fast-path stays non-stale
+    await writeFile(join(root, "src/extra.ts"), "export const extra = 42;\n");
+    const rootDirs = [{ rootId: null, dir: root }];
+    const fastState = getGraphIndexFastPathState(dbPath, projectId, rootDirs);
+    expect(fastState.indexed_files).toBe(2);
+    expect(fastState.stale).toBe(false);
+    expect(getGraphCounts(dbPath, projectId).files).toBe(2);
+
+    // rebuildEdges (--force) bypasses fast-path and indexes the newly added file
+    const forced = await indexProjectGraph(dbPath, projectId, root, { rebuildEdges: true });
+    expect(forced.files).toBe(3);
+  });
+
+  it.each(["paths", "references"] as const)(
+    "rebuilds edges with rebuildEdges after only tsconfig %s changes",
+    async (configField) => {
+      const { service } = await initServiceProject();
+      const outsideDir = await mkdtemp(join(tmpdir(), "catenext-tsconfig-outside-"));
+      try {
+        await mkdir(join(root, "src"), { recursive: true });
+        await writeFile(join(root, "src/app.ts"), 'import "@dep";\n');
+        await writeFile(join(root, "src/old.ts"), "export const oldValue = 1;\n");
+        await writeFile(join(root, "src/new.ts"), "export const newValue = 2;\n");
+        await writeFile(join(outsideDir, "outside.ts"), "export const outside = 3;\n");
+
+        const pathsConfig = (target: string) => ({
+          compilerOptions: { paths: { "@dep": [target] } },
+        });
+        await writeFile(
+          join(root, "tsconfig.old.json"),
+          JSON.stringify(pathsConfig("./src/old.ts")),
+        );
+        await writeFile(
+          join(root, "tsconfig.new.json"),
+          JSON.stringify(pathsConfig("./src/new.ts")),
+        );
+        await writeFile(
+          join(outsideDir, "tsconfig.outside.json"),
+          JSON.stringify(pathsConfig("./outside.ts")),
+        );
+
+        const setConfig = (target: "old" | "new" | "outside") =>
+          writeFile(
+            join(root, "tsconfig.json"),
+            JSON.stringify(
+              configField === "paths"
+                ? pathsConfig(
+                    target === "outside" ? join(outsideDir, "outside.ts") : `./src/${target}.ts`,
+                  )
+                : {
+                    references: [
+                      {
+                        path:
+                          target === "outside"
+                            ? join(outsideDir, "tsconfig.outside.json")
+                            : `./tsconfig.${target}.json`,
+                      },
+                    ],
+                  },
+            ),
+          );
+
+        const readImpact = async (target: "old" | "new") =>
+          await service.callTool("graph_impact", {
+            path: `src/${target}.ts`,
+            depth: 2,
+            limit: 20,
+            include_tests: false,
+          });
+
+        await setConfig("old");
+        await indexProjectGraph(dbPath, projectId, root);
+        expect((await readImpact("old")).impacted.map((h) => h.path)).toEqual(["src/app.ts"]);
+
+        await setConfig("new");
+        // Incremental index without rebuildEdges keeps old edges for config-only edits
+        await indexProjectGraph(dbPath, projectId, root);
+        expect((await readImpact("old")).impacted.map((h) => h.path)).toEqual(["src/app.ts"]);
+
+        const forced = await indexProjectGraph(dbPath, projectId, root, { rebuildEdges: true });
+        expect(forced.edges).toBe(1);
+        expect((await readImpact("new")).impacted.map((h) => h.path)).toEqual(["src/app.ts"]);
+        expect((await readImpact("old")).impacted).toEqual([]);
+
+        await setConfig("outside");
+        const outsideForced = await indexProjectGraph(dbPath, projectId, root, {
+          rebuildEdges: true,
+        });
+        expect(outsideForced.edges).toBe(0);
+        expect((await readImpact("new")).impacted).toEqual([]);
+      } finally {
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    },
+  );
 });

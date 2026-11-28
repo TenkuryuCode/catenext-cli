@@ -55,16 +55,16 @@ function routingTable(personas: PersonaItem[]): string[] {
   return lines;
 }
 
+function isReviewerPersona(p: PersonaItem): boolean {
+  const role = p.role.toLowerCase();
+  const alias = p.alias.toLowerCase();
+  return role === "reviewer" || alias === "reviewer";
+}
+
 function isReadVerifyPersona(p: PersonaItem): boolean {
   const role = p.role.toLowerCase();
   const alias = p.alias.toLowerCase();
-  return (
-    role === "reviewer" ||
-    role === "docs" ||
-    role === "scribe" ||
-    alias === "reviewer" ||
-    alias === "scribe"
-  );
+  return isReviewerPersona(p) || role === "docs" || role === "scribe" || alias === "scribe";
 }
 
 function personaDescription(p: PersonaItem): string {
@@ -82,6 +82,55 @@ export function renderSubagentBody(
       : ["- (no rules yet — set via catenext persona set)"];
   const alias = JSON.stringify(p.alias);
   const stack = stackLine(ctx.stack);
+  const isReviewer = isReviewerPersona(p);
+  const contextBullets = isReviewer
+    ? [
+        "- Cold start: human/orchestrator read `CATENEXT.md` then `AGENTS.md`.",
+        '- `review_pull_request` (`action: "claim"`, `include_context: true`) already returns `review_context_pack` (`diff_meta`, `handoff_decisions`, `verification_command`, `epic_summary_excerpt`, `sync_board_excerpt`, `detail_pointers`) — skip redundant `get_project_context`.',
+        "- If extra doc or diff detail is needed beyond `review_context_pack`, use `detail_pointers.git_diff_command` or call `get_document` with `outline_only: true` or `section`.",
+        "- Prefer `graph_neighbors` with `paths[]` (batch up to 5) instead of 1-file-per-call; use `symbol_search` / `search_context` only for files under review.",
+        "- Cite paths and `head_sha` in review feedback; **never publish** credentials or critical secrets (or large code dumps).",
+      ]
+    : [
+        "- Cold start: human/orchestrator read `CATENEXT.md` then `AGENTS.md`.",
+        "- `claim_task` with `include_context: true` already returns `context_pack` (`epic_summary`, `sync_board_excerpt`, `skills_hint`, `graph_slice`), `scope_files`, `verify_command`, and `doc_refs` — skip redundant `get_project_context`.",
+        "- If extra doc is needed beyond `context_pack`, call `get_document` with `outline_only: true` or `section`.",
+        "- Prefer `graph_neighbors` with `paths[]` (batch up to 5) instead of 1-file-per-call; use `symbol_search` only for files you will touch.",
+        "- Cite paths in handoffs; **never publish** credentials or critical secrets (or large code dumps).",
+      ];
+  const workflowSection = isReviewer
+    ? [
+        "## Workflow (one review per call, read-only)",
+        "",
+        `1. **Fast-path (\`TASK_ID\` in brief):** skip \`get_project_context\` and \`get_ready_tasks\`; call \`review_pull_request\` directly with \`action: "claim"\`, \`task_id\`, \`agent_alias: ${alias}\`, \`compact: true\`, \`include_context: true\` (include \`head_sha\` if provided).`,
+        `2. **No \`TASK_ID\` in brief:** call \`review_pull_request\` with \`action: "list"\` (pick a \`NEEDS_REVIEW\` task or stop if empty), then \`review_pull_request\` with \`action: "claim"\`, \`compact: true\`, \`include_context: true\`.`,
+        '3. Inspect `review_context_pack` first; use `detail_pointers.git_diff_command`, `get_document` (`outline_only` / `section`), `graph_neighbors` (`paths[]`, up to 5), or `search_context` only when needed. If the handoff commit moves, call `review_pull_request` with `action: "refresh"`.',
+        "4. Run read-only verification if needed; do **not** edit files, create worktrees, or merge default/`main`.",
+        '5. Submit local recommendation via `review_pull_request` (`action: "submit"`, `task_id`, `lease_id`, `head_sha`, `decision: "approve" | "request_changes"`, `feedback`) or `report_blocker`. (`approve` is a recommendation only; human runs `catenext review approve`.)',
+        "6. Report to orchestrator: task, `head_sha`, `decision`, key findings, and verify output.",
+        "",
+        `CLI: \`catenext review list\`, \`catenext review claim <id> --as ${p.alias} --include-context --compact\`, \`catenext review refresh <id> --include-context\`, \`catenext review submit <id> --lease <id> --sha <sha> --decision <approve|request_changes> --feedback "..."\`.`,
+      ]
+    : [
+        "## Workflow (one task per call, dedicated worktree)",
+        "",
+        `1. **Fast-path (\`TASK_ID\` in brief):** skip \`get_project_context\` and \`get_ready_tasks\`; call \`claim_task\` directly with \`task_id\`, \`agent_alias: ${alias}\`, \`worktree\` (unique branch/session), \`compact: true\`, \`include_context: true\`.`,
+        `2. **No \`TASK_ID\` in brief:** call \`get_ready_tasks\` with \`agent_alias: ${alias}\` (pick top task or stop if empty), then \`claim_task\` with \`compact: true\`, \`include_context: true\`, and \`worktree\`.`,
+        "3. Use `context_pack` from claim; only fetch extra docs via `get_document` (`outline_only` / `section`) or `graph_neighbors` (`paths[]`, up to 5) when needed.",
+        "4. Implement, test, commit **only** on that worktree branch. Never merge default/`main`.",
+        "5. `complete_handoff` (keep `notes_for_next_agent` concise: decisions, changed contracts, file paths; include branch/PR ref if asked) or `report_blocker`.",
+        "6. Report to orchestrator: task, worktree/branch, status, PR URL if any, verify command.",
+        "",
+        `CLI: \`catenext next --as ${p.alias}\`, \`catenext claim <id> --as ${p.alias} --worktree\`, \`catenext done <id> --lease <id> --notes "..."\`.`,
+      ];
+  const ownershipBoundaries = isReviewer
+    ? [
+        "- Only review `NEEDS_REVIEW` handoffs; never approve final `DONE` status (human-only) or merge to main.",
+      ]
+    : [
+        `- Only do tasks owned by ${p.alias}.`,
+        "- Prefer REVISION_REQUESTED tasks and follow claim feedback.",
+      ];
   return [
     `You are Catenext persona **${p.alias}** (role: ${p.role}).`,
     "",
@@ -96,11 +145,7 @@ export function renderSubagentBody(
     "",
     "## Powerful context (keep compact)",
     "",
-    "- Cold start: human/orchestrator read `CATENEXT.md` then `AGENTS.md`.",
-    "- `claim_task` with `include_context: true` already returns `context_pack` (`epic_summary`, `sync_board_excerpt`, `skills_hint`, `graph_slice`), `scope_files`, `verify_command`, and `doc_refs` — skip redundant `get_project_context`.",
-    "- If extra doc is needed beyond `context_pack`, call `get_document` with `outline_only: true` or `section`.",
-    "- Prefer `graph_neighbors` with `paths[]` (batch up to 5) instead of 1-file-per-call; use `symbol_search` only for files you will touch.",
-    "- Cite paths in handoffs; **never publish** credentials or critical secrets (or large code dumps).",
+    ...contextBullets,
     "",
     "## Cross-agent asks",
     "",
@@ -108,21 +153,11 @@ export function renderSubagentBody(
     "`ASK: <persona> · NEED: <one line> · BLOCKS: <task id>` — do not open a private side channel.",
     "Skill: `cross-agent-sync`.",
     "",
-    "## Workflow (one task per call, dedicated worktree)",
-    "",
-    `1. **Fast-path (\`TASK_ID\` in brief):** skip \`get_project_context\` and \`get_ready_tasks\`; call \`claim_task\` directly with \`task_id\`, \`agent_alias: ${alias}\`, \`worktree\` (unique branch/session), \`compact: true\`, \`include_context: true\`.`,
-    `2. **No \`TASK_ID\` in brief:** call \`get_ready_tasks\` with \`agent_alias: ${alias}\` (pick top task or stop if empty), then \`claim_task\` with \`compact: true\`, \`include_context: true\`, and \`worktree\`.`,
-    "3. Use `context_pack` from claim; only fetch extra docs via `get_document` (`outline_only` / `section`) or `graph_neighbors` (`paths[]`, up to 5) when needed.",
-    "4. Implement, test, commit **only** on that worktree branch. Never merge default/`main`.",
-    "5. `complete_handoff` (keep `notes_for_next_agent` concise: decisions, changed contracts, file paths; include branch/PR ref if asked) or `report_blocker`.",
-    "6. Report to orchestrator: task, worktree/branch, status, PR URL if any, verify command.",
-    "",
-    `CLI: \`catenext next --as ${p.alias}\`, \`catenext claim <id> --as ${p.alias} --worktree\`, \`catenext done <id> --lease <id> --notes "..."\`.`,
+    ...workflowSection,
     "",
     "## Boundaries",
     "",
-    `- Only do tasks owned by ${p.alias}.`,
-    "- Prefer REVISION_REQUESTED tasks and follow claim feedback.",
+    ...ownershipBoundaries,
     "- Do not call `create_tasks`, `manage_task`, or `upsert_persona`.",
     ...(isReadVerifyPersona(p)
       ? [
@@ -145,12 +180,20 @@ export function renderSubagentBody(
   ].join("\n");
 }
 
-function markdownFrontmatter(platform: PlatformId, name: string, description: string): string[] {
+function markdownFrontmatter(
+  platform: PlatformId,
+  name: string,
+  description: string,
+  persona?: PersonaItem,
+): string[] {
   const lines = ["---", `name: ${name}`, `description: ${description}`];
   if (platform === "cursor") {
     lines.push("model: inherit");
   } else if (platform === "antigravity") {
     lines.push("model: inherit", "subagent: true", "mainAgent: false");
+    if (persona && isReadVerifyPersona(persona)) {
+      lines.push("disallowedTools: [write_file, edit_file]");
+    }
   }
   lines.push("---");
   return lines;
@@ -171,7 +214,7 @@ export function renderSubagent(
 ): string {
   if (platform === "codex") return renderCodexSubagent(p, ctx);
   return [
-    ...markdownFrontmatter(platform, p.alias, personaDescription(p)),
+    ...markdownFrontmatter(platform, p.alias, personaDescription(p), p),
     SUBAGENT_MARKER,
     "<!-- Generated by `catenext sync` from local personas; edit via `catenext persona set`, not this file. Format is stable across IDE/CLI. -->",
     "",

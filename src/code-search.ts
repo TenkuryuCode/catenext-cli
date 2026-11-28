@@ -6,6 +6,11 @@ import type { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { hasCodeSearchFts, tryEnableCodeSearchFts } from "./db/migrate.js";
 import { checkpointWalAndClose, openDatabaseAt } from "./db/open.js";
+import {
+  decodeEmbeddingVector,
+  type EmbeddingClient,
+  encodeEmbeddingVector,
+} from "./embeddings.js";
 import { scrubText } from "./scrubber.js";
 import { collectRootTargets, type RegisteredRoot } from "./workspace-roots.js";
 import {
@@ -33,6 +38,29 @@ export type SearchLocalCodeOptions = {
   maxFileBytes?: number;
   /** Internal/test hook: force non-FTS5 SQLite fallback path. */
   disableFts5?: boolean;
+  /** Optional embedding client for hybrid Vector + FTS5 RRF search. */
+  embeddingClient?: EmbeddingClient;
+  /** Optional timeout (ms) for query embedding generation before falling back to FTS5. */
+  embeddingTimeoutMs?: number;
+};
+
+export type IndexCodeEmbeddingsOptions = {
+  roots?: RegisteredRoot[];
+  db?: DatabaseSync;
+  projectId?: string;
+  maxFileBytes?: number;
+  disableFts5?: boolean;
+  client: EmbeddingClient;
+  batchSize?: number;
+};
+
+export type IndexCodeEmbeddingsResult = {
+  indexed: number;
+  skipped: number;
+  deleted: number;
+  totalChunks: number;
+  model: string;
+  provider: string;
 };
 
 const STANDALONE_DB_REL = join(".catenext", "cache", "code-search.sqlite");
@@ -603,13 +631,285 @@ function queryFtsIndex(
   });
 }
 
-/** Incremental local code index backed by SQLite FTS5 with safe fallback when FTS5 is unavailable. */
+const RRF_K = 60;
+const EMBED_BATCH_SIZE = 32;
+
+/** Compute cosine similarity between two numeric vectors in [-1, 1] (0 for zero/mismatched vectors). */
+export function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  if (a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const va = a[i] ?? 0;
+    const vb = b[i] ?? 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function stripChunkSuffix(sourceKey: string): string {
+  return sourceKey.replace(/#\d+$/, "");
+}
+
+/**
+ * Incrementally index code chunks into `embedding_chunks`, skipping unchanged chunks by sha256
+ * and pruning deleted/stale chunk keys for the active model.
+ */
+export async function indexCodeEmbeddings(
+  root: string,
+  options: IndexCodeEmbeddingsOptions,
+): Promise<IndexCodeEmbeddingsResult> {
+  await cleanupLegacyCodeCache(root);
+
+  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const roots = options.roots ?? [];
+  const projectId = options.projectId ?? STANDALONE_PROJECT_ID;
+  const batchSize = Math.max(1, Math.floor(options.batchSize ?? EMBED_BATCH_SIZE));
+
+  let ownedDb: DatabaseSync | undefined;
+  let db = options.db;
+  if (!db) {
+    const dbPath = join(root, STANDALONE_DB_REL);
+    await mkdir(join(root, ".catenext", "cache"), { recursive: true, mode: 0o700 });
+    ownedDb = openDatabaseAt(dbPath);
+    db = ownedDb;
+  }
+
+  try {
+    await syncCodeSearchIndex(db, projectId, root, roots, maxFileBytes, !options.disableFts5);
+
+    const fileRows = db
+      .prepare("SELECT path, content FROM code_search_files WHERE project_id = ? ORDER BY path")
+      .all(projectId) as Array<{ path: string; content: string }>;
+
+    const activeChunks: Array<{ sourceKey: string; sha: string; text: string }> = [];
+    const activeKeys = new Set<string>();
+    for (const fileRow of fileRows) {
+      const chunks = chunkText(fileRow.content);
+      for (let i = 0; i < chunks.length; i++) {
+        const sourceKey = `${fileRow.path}#${i}`;
+        const text = `${fileRow.path}\n${chunks[i] ?? ""}`;
+        const hash = sha256(text);
+        activeChunks.push({ sourceKey, sha: hash, text });
+        activeKeys.add(sourceKey);
+      }
+    }
+
+    const existingRows = db
+      .prepare(
+        "SELECT source_key, sha256 FROM embedding_chunks WHERE project_id = ? AND source_kind = 'code' AND model = ?",
+      )
+      .all(projectId, options.client.model) as Array<{ source_key: string; sha256: string }>;
+    const existingShaByKey = new Map(existingRows.map((row) => [row.source_key, row.sha256]));
+
+    const toEmbed: Array<{ sourceKey: string; sha: string; text: string }> = [];
+    let skipped = 0;
+    for (const chunk of activeChunks) {
+      if (existingShaByKey.get(chunk.sourceKey) === chunk.sha) {
+        skipped += 1;
+      } else {
+        toEmbed.push(chunk);
+      }
+    }
+
+    const deletedKeys: string[] = [];
+    for (const row of existingRows) {
+      if (!activeKeys.has(row.source_key)) {
+        deletedKeys.push(row.source_key);
+      }
+    }
+
+    const embeddedRows: Array<{
+      sourceKey: string;
+      sha: string;
+      dims: number;
+      vector: Buffer;
+    }> = [];
+    for (let offset = 0; offset < toEmbed.length; offset += batchSize) {
+      const batch = toEmbed.slice(offset, offset + batchSize);
+      const vectors = await options.client.embed(batch.map((item) => item.text));
+      if (vectors.length !== batch.length) {
+        throw new Error(
+          `Embedding provider returned ${vectors.length} vectors for ${batch.length} chunks.`,
+        );
+      }
+      for (let i = 0; i < batch.length; i++) {
+        const item = batch[i];
+        const vec = vectors[i];
+        if (!item || !vec || vec.length === 0) {
+          throw new Error("Embedding provider returned an empty vector.");
+        }
+        embeddedRows.push({
+          sourceKey: item.sourceKey,
+          sha: item.sha,
+          dims: vec.length,
+          vector: encodeEmbeddingVector(vec),
+        });
+      }
+    }
+
+    if (deletedKeys.length > 0 || embeddedRows.length > 0) {
+      const nowIso = new Date().toISOString();
+      runInTx(db, "embedding_chunks_sync", () => {
+        const deleteStmt = db.prepare(
+          "DELETE FROM embedding_chunks WHERE project_id = ? AND source_kind = 'code' AND model = ? AND source_key = ?",
+        );
+        const upsertStmt = db.prepare(
+          `INSERT INTO embedding_chunks (
+             project_id, source_kind, source_key, sha256, model, dims, vector, updated_at
+           ) VALUES (?, 'code', ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (project_id, source_kind, source_key, model)
+           DO UPDATE SET
+             sha256 = excluded.sha256,
+             dims = excluded.dims,
+             vector = excluded.vector,
+             updated_at = excluded.updated_at`,
+        );
+
+        for (const key of deletedKeys) {
+          deleteStmt.run(projectId, options.client.model, key);
+        }
+        for (const row of embeddedRows) {
+          upsertStmt.run(
+            projectId,
+            row.sourceKey,
+            row.sha,
+            options.client.model,
+            row.dims,
+            row.vector,
+            nowIso,
+          );
+        }
+      });
+    }
+
+    return {
+      indexed: embeddedRows.length,
+      skipped,
+      deleted: deletedKeys.length,
+      totalChunks: activeChunks.length,
+      model: options.client.model,
+      provider: options.client.provider,
+    };
+  } finally {
+    if (ownedDb) {
+      checkpointWalAndClose(ownedDb);
+    }
+  }
+}
+
+function fuseRrfHits(
+  ftsHits: readonly CodeHit[],
+  vectorHits: readonly CodeHit[],
+  limit: number,
+): CodeHit[] {
+  const rrfScores = new Map<string, number>();
+  const hitByRef = new Map<string, CodeHit>();
+
+  for (let i = 0; i < ftsHits.length; i++) {
+    const hit = ftsHits[i];
+    if (!hit) continue;
+    hitByRef.set(hit.ref, hit);
+    rrfScores.set(hit.ref, (rrfScores.get(hit.ref) ?? 0) + 1 / (RRF_K + i + 1));
+  }
+
+  for (let i = 0; i < vectorHits.length; i++) {
+    const hit = vectorHits[i];
+    if (!hit) continue;
+    if (!hitByRef.has(hit.ref)) {
+      hitByRef.set(hit.ref, hit);
+    }
+    rrfScores.set(hit.ref, (rrfScores.get(hit.ref) ?? 0) + 1 / (RRF_K + i + 1));
+  }
+
+  const maxRrf = 2 / (RRF_K + 1);
+  const fused: CodeHit[] = [];
+  for (const [ref, rrf] of rrfScores) {
+    const base = hitByRef.get(ref);
+    if (!base) continue;
+    fused.push({
+      ...base,
+      score: Math.min(1, rrf / maxRrf),
+    });
+  }
+
+  fused.sort((a, b) => b.score - a.score || a.ref.localeCompare(b.ref));
+  return fused.slice(0, limit);
+}
+
+async function queryVectorHits(
+  db: DatabaseSync,
+  projectId: string,
+  query: string,
+  limit: number,
+  client: EmbeddingClient,
+  ftsHits: readonly CodeHit[],
+  timeoutMs?: number,
+): Promise<CodeHit[] | null> {
+  const chunkRows = db
+    .prepare(
+      `SELECT source_key, vector
+       FROM embedding_chunks
+       WHERE project_id = ? AND source_kind = 'code' AND model = ?`,
+    )
+    .all(projectId, client.model) as Array<{ source_key: string; vector: Uint8Array }>;
+  if (chunkRows.length === 0) return null;
+
+  const [queryVec] = await client.embed([query], timeoutMs !== undefined ? { timeoutMs } : {});
+  if (!queryVec || queryVec.length === 0) return null;
+
+  const bestByPath = new Map<string, number>();
+  for (const row of chunkRows) {
+    const sim = cosineSimilarity(queryVec, decodeEmbeddingVector(row.vector));
+    if (sim <= 0) continue;
+    const filePath = stripChunkSuffix(row.source_key);
+    const prev = bestByPath.get(filePath);
+    if (prev === undefined || sim > prev) {
+      bestByPath.set(filePath, sim);
+    }
+  }
+
+  const rankedPaths = [...bestByPath.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit);
+
+  const ftsByRef = new Map(ftsHits.map((hit) => [hit.ref, hit]));
+  const selectContent = db.prepare(
+    "SELECT content FROM code_search_files WHERE project_id = ? AND path = ?",
+  );
+
+  const vectorHits: CodeHit[] = [];
+  for (const [filePath, sim] of rankedPaths) {
+    const ref = clipText(filePath, 200);
+    const existing = ftsByRef.get(ref);
+    if (existing) {
+      vectorHits.push({ ...existing, score: sim });
+      continue;
+    }
+    const fileRow = selectContent.get(projectId, filePath) as { content: string } | undefined;
+    if (!fileRow) continue;
+    vectorHits.push({
+      source: "code",
+      ref,
+      title: clipText(filePath, 300),
+      snippet: extractContextualSnippet(fileRow.content, query, SNIPPET_MAX_LEN),
+      score: sim,
+    });
+  }
+  return vectorHits;
+}
+
+/** Incremental local code index backed by SQLite FTS5 with optional hybrid Vector+BM25 RRF and safe fallback. */
 export async function searchLocalCode(
   root: string,
   query: string,
   limit = 8,
   options: SearchLocalCodeOptions = {},
-): Promise<{ hits: CodeHit[]; degraded: boolean; note?: string }> {
+): Promise<{ hits: CodeHit[]; degraded: boolean; reranked: boolean; note?: string }> {
   await cleanupLegacyCodeCache(root);
 
   const safeLimit = Math.max(0, Math.floor(limit));
@@ -641,38 +941,64 @@ export async function searchLocalCode(
       return {
         hits: [],
         degraded: !ftsEnabled,
+        reranked: false,
         note: ftsEnabled
           ? "Pencarian kode memakai SQLite FTS5."
           : "Pencarian kode memakai fallback SQLite tanpa FTS5.",
       };
     }
 
+    const candidateLimit = options.embeddingClient ? Math.max(safeLimit * 3, 20) : safeLimit;
+    let ftsHits: CodeHit[] = [];
+    let degraded = false;
+    let note = "Pencarian kode memakai SQLite FTS5.";
+
     if (ftsEnabled) {
       try {
-        let hits = queryFtsIndex(db, projectId, trimmed, safeLimit);
-        if (hits.length === 0 && trimmed.length >= 2) {
-          hits = queryLikeFallback(db, projectId, trimmed, safeLimit);
+        ftsHits = queryFtsIndex(db, projectId, trimmed, candidateLimit);
+        if (ftsHits.length === 0 && trimmed.length >= 2) {
+          ftsHits = queryLikeFallback(db, projectId, trimmed, candidateLimit);
         }
-        return {
-          hits,
-          degraded: false,
-          note: "Pencarian kode memakai SQLite FTS5.",
-        };
       } catch {
-        const hits = queryLikeFallback(db, projectId, trimmed, safeLimit);
-        return {
-          hits,
-          degraded: true,
-          note: "FTS5 gagal dijalankan; memakai fallback SQLite LIKE.",
-        };
+        ftsHits = queryLikeFallback(db, projectId, trimmed, candidateLimit);
+        degraded = true;
+        note = "FTS5 gagal dijalankan; memakai fallback SQLite LIKE.";
+      }
+    } else {
+      ftsHits = queryLikeFallback(db, projectId, trimmed, candidateLimit);
+      degraded = true;
+      note = "FTS5 tidak tersedia; memakai fallback SQLite LIKE.";
+    }
+
+    if (options.embeddingClient) {
+      try {
+        const vectorHits = await queryVectorHits(
+          db,
+          projectId,
+          trimmed,
+          candidateLimit,
+          options.embeddingClient,
+          ftsHits,
+          options.embeddingTimeoutMs,
+        );
+        if (vectorHits && vectorHits.length > 0) {
+          return {
+            hits: fuseRrfHits(ftsHits, vectorHits, safeLimit),
+            degraded,
+            reranked: true,
+            note: "Pencarian kode memakai Hybrid RRF (Vector Cosine + FTS5 BM25).",
+          };
+        }
+      } catch {
+        // Graceful fallback to FTS5/LIKE when embedding provider is offline, unconfigured, or times out.
       }
     }
 
-    const hits = queryLikeFallback(db, projectId, trimmed, safeLimit);
     return {
-      hits,
-      degraded: true,
-      note: "FTS5 tidak tersedia; memakai fallback SQLite LIKE.",
+      hits: ftsHits.slice(0, safeLimit),
+      degraded,
+      reranked: false,
+      note,
     };
   } finally {
     if (ownedDb) {

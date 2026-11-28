@@ -17,7 +17,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { findCycle } from "@catenext/shared";
 import { LocalServiceError } from "../errors.js";
-import type { LocalProject } from "../local-state.js";
+import type { LocalProject, LocalTask } from "../local-state.js";
 import {
   dbHasProjects,
   getSchemaVersion,
@@ -29,7 +29,9 @@ import {
   emptyExtendedProject,
   loadProject,
   loadProjectState,
+  loadTask,
   saveProjectDiff,
+  saveTask,
 } from "./project-codec.js";
 import { SCHEMA_VERSION } from "./schema.js";
 import {
@@ -62,6 +64,29 @@ function unique<T>(items: T[]): boolean {
   return new Set(items).size === items.length;
 }
 
+/** Validate single-task invariants without loading the full project. */
+export function isTaskConsistent(task: LocalTask): boolean {
+  const { branch, lease } = task;
+  if (
+    !unique(task.dependencies) ||
+    (task.status === "IN_PROGRESS") !== Boolean(lease) ||
+    (task.status === "BLOCKED") !== Boolean(task.blocker) ||
+    ((task.status === "DONE" || task.status === "NEEDS_REVIEW") && !task.handoff) ||
+    (task.status === "REVISION_REQUESTED" && (!task.handoff || !task.feedback)) ||
+    (task.review && task.review.approvedLocally !== (task.status === "DONE")) ||
+    Boolean(task.handoff?.pull_request) !== Boolean(task.review)
+  ) {
+    return false;
+  }
+  if (branch && lease && (!lease.worktree || lease.repo !== branch.repo)) {
+    return false;
+  }
+  if (lease?.worktree && !branch) {
+    return false;
+  }
+  return true;
+}
+
 /** Validate cross-record invariants; malformed DB rows must never be treated as empty. */
 export function isConsistent(project: LocalProject): boolean {
   const epicIds = new Set(project.epics.map((epic) => epic.id));
@@ -84,14 +109,8 @@ export function isConsistent(project: LocalProject): boolean {
     if (
       !epicIds.has(task.epicId) ||
       (task.persona && !aliases.has(task.persona)) ||
-      !unique(task.dependencies) ||
       task.dependencies.some((id) => !taskIds.has(id)) ||
-      (task.status === "IN_PROGRESS") !== Boolean(lease) ||
-      (task.status === "BLOCKED") !== Boolean(task.blocker) ||
-      ((task.status === "DONE" || task.status === "NEEDS_REVIEW") && !task.handoff) ||
-      (task.status === "REVISION_REQUESTED" && (!task.handoff || !task.feedback)) ||
-      (task.review && task.review.approvedLocally !== (task.status === "DONE")) ||
-      Boolean(task.handoff?.pull_request) !== Boolean(task.review)
+      !isTaskConsistent(task)
     )
       return false;
     if (branch) {
@@ -159,25 +178,12 @@ function isLockContentStale(raw: string, fileMtimeMs: number, staleLockMs: numbe
 }
 
 async function tryCreateLockFile(lockPath: string, payload: string): Promise<boolean> {
-  const tmpPath = `${lockPath}.tmp.${process.pid}.${randomUUID()}`;
-  await writeFile(tmpPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
   try {
-    await link(tmpPath, lockPath);
+    await writeFile(lockPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
     return true;
   } catch (error) {
     if (hasCode(error, "EEXIST")) return false;
-    if (hasCode(error, "EXDEV") || hasCode(error, "EPERM") || hasCode(error, "ENOTSUP")) {
-      try {
-        await writeFile(lockPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
-        return true;
-      } catch (writeErr) {
-        if (hasCode(writeErr, "EEXIST")) return false;
-        throw writeErr;
-      }
-    }
     throw error;
-  } finally {
-    await rm(tmpPath, { force: true });
   }
 }
 
@@ -204,6 +210,13 @@ async function tryRecoverStaleLock(lockPath: string, staleLockMs: number): Promi
       if (hasCode(error, "ENOTEMPTY") || hasCode(error, "EEXIST")) return false;
       throw error;
     }
+  }
+
+  if (!st.isFile() || st.nlink !== 1) {
+    throw new LocalServiceError(
+      "invalid_state_file",
+      "Use a regular lock file, not a symlink or hardlink.",
+    );
   }
 
   let raw: string;
@@ -474,7 +487,9 @@ export class LocalStore {
         wrapOpenError(error);
       }
       await migrateJsonStateIfNeeded(db, file);
-      return await run(db);
+      const result = await run(db);
+      ensureDatabasePermissions(file);
+      return result;
     } finally {
       try {
         db?.close();
@@ -541,6 +556,78 @@ export class LocalStore {
             db.prepare(
               "INSERT INTO projects (id, created_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
             ).run(projectId, new Date().toISOString());
+          }
+          for (const hook of hooks) {
+            hook(db);
+          }
+          db.exec("COMMIT");
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+        ensureDatabasePermissions(file);
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Targeted single-task transaction using `loadTask` + `saveTask` instead of hydrating all tables.
+   * Safe for mutations that only affect one existing task and append-only audit/run records.
+   */
+  async taskTransaction<T>(
+    projectId: string,
+    repo: string,
+    taskId: string,
+    run: (
+      task: LocalTask,
+      dirty: () => void,
+      db: DatabaseSync,
+      afterSave: (hook: (db: DatabaseSync) => void) => void,
+    ) => Promise<T> | T,
+  ): Promise<T> {
+    const dir = dirname(this.file);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const file = join(await realpath(dir), basename(this.file));
+    await assertRegularFileOrMissing(file);
+    return await this.withWriteLock(file, async (db) => {
+      const task = loadTask(db, projectId, taskId);
+      if (!task) {
+        throw new LocalServiceError("not_found", "Task tidak ditemukan di proyek ini.");
+      }
+      if (!isTaskConsistent(task)) {
+        throw new LocalServiceError(
+          "corrupt_state",
+          "Catenext SQLite state failed consistency checks. Restore from backup.",
+        );
+      }
+
+      let changed = false;
+      const hooks: Array<(db: DatabaseSync) => void> = [];
+      const result = await run(
+        task,
+        () => {
+          changed = true;
+        },
+        db,
+        (hook) => {
+          hooks.push(hook);
+        },
+      );
+      if (changed || hooks.length > 0) {
+        if (changed && !isTaskConsistent(task)) {
+          throw new LocalServiceError(
+            "corrupt_state",
+            "Refusing to write inconsistent project state.",
+          );
+        }
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          if (changed) {
+            db.prepare(
+              "INSERT INTO project_repos (project_id, repo) VALUES (?, ?) ON CONFLICT(project_id, repo) DO NOTHING",
+            ).run(projectId, repo);
+            saveTask(db, projectId, task);
           }
           for (const hook of hooks) {
             hook(db);

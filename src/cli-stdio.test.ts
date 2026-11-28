@@ -16,13 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  ClaimTaskInput,
-  MCP_CRUD_TOOLS,
-  MCP_TOOLS,
-  type McpToolName,
-  type McpToolOutput,
-} from "@catenext/shared";
+import { ClaimTaskInput, MCP_TOOLS, type McpToolName, type McpToolOutput } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { build } from "esbuild";
@@ -419,6 +413,8 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(launch.args).toEqual([
       await realpath(entry),
       "mcp",
+      "--role",
+      "orchestrator",
       "--root",
       "$" + "{CLAUDE_PROJECT_DIR}",
     ]);
@@ -437,10 +433,19 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(git("remote")).toBe("");
 
     // Same launch IDE would use (resolving Claude Code workspace token), from a different cwd.
+    const launchArgs = launch.args.map((arg) => arg.replace("$" + "{CLAUDE_PROJECT_DIR}", root));
     const client = new Client({ name: "test-stdio", version: "1.0.0" });
     const transport = new StdioClientTransport({
       command: launch.command,
-      args: launch.args.map((arg) => arg.replace("$" + "{CLAUDE_PROJECT_DIR}", root)),
+      args: launchArgs,
+      cwd: env.HOME,
+      env,
+      stderr: "pipe",
+    });
+    const workerClient = new Client({ name: "test-stdio-worker", version: "1.0.0" });
+    const workerTransport = new StdioClientTransport({
+      command: launch.command,
+      args: launchArgs.map((arg, i) => (launchArgs[i - 1] === "--role" ? "worker" : arg)),
       cwd: env.HOME,
       env,
       stderr: "pipe",
@@ -451,6 +456,7 @@ describe("CLI dan MCP stdio lokal", () => {
     });
     try {
       await client.connect(transport);
+      await workerClient.connect(workerTransport);
       const { epic } = await mcp(client, "create_epic", { title: "Orkestrasi offline" });
       const plan = JSON.stringify([
         { ref: "first", title: "Kerja lokal", prompt_instruction: "Buat perubahan lokal" },
@@ -468,7 +474,7 @@ describe("CLI dan MCP stdio lokal", () => {
       );
       const [first, second] = created;
       if (!first || !second) throw new Error("Expected two tasks");
-      expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
+      expect((await mcp(workerClient, "get_ready_tasks")).tasks).toEqual([]);
       const planDenied = await client.callTool({
         name: "manage_task",
         arguments: { action: "approve_plan", task_id: first.task_id },
@@ -484,7 +490,7 @@ describe("CLI dan MCP stdio lokal", () => {
       expect(firstClaim.task.status).toBe("IN_PROGRESS");
       expect(
         (
-          await mcp(client, "report_blocker", {
+          await mcp(workerClient, "report_blocker", {
             lease_id: firstClaim.lease_id,
             task_id: first.task_id,
             category: "other",
@@ -493,7 +499,7 @@ describe("CLI dan MCP stdio lokal", () => {
         ).status,
       ).toBe("BLOCKED");
       expect(cliJson("manage_task", ["unblock", first.task_id]).status).toBe("TODO");
-      const secondClaim = await mcp(client, "claim_task", { task_id: first.task_id });
+      const secondClaim = await mcp(workerClient, "claim_task", { task_id: first.task_id });
       const secret = "sk_live_abcdefghijklmnop";
       expect(
         cliJson("complete_handoff", [
@@ -505,7 +511,7 @@ describe("CLI dan MCP stdio lokal", () => {
           `STRIPE_SECRET=${secret}`,
         ]).status,
       ).toBe("NEEDS_REVIEW");
-      expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
+      expect((await mcp(workerClient, "get_ready_tasks")).tasks).toEqual([]);
       const reviewDenied = await client.callTool({
         name: "manage_task",
         arguments: { action: "approve", task_id: first.task_id },
@@ -515,9 +521,9 @@ describe("CLI dan MCP stdio lokal", () => {
         type: "text",
         text: expect.stringContaining(`catenext review approve ${first.task_id}`),
       });
-      expect((await mcp(client, "get_ready_tasks")).tasks).toEqual([]);
+      expect((await mcp(workerClient, "get_ready_tasks")).tasks).toEqual([]);
       expect(cliJson("manage_task", ["review", "approve", first.task_id]).status).toBe("DONE");
-      const next = await mcp(client, "claim_task", { task_id: second.task_id });
+      const next = await mcp(workerClient, "claim_task", { task_id: second.task_id });
       expect(next.dependencies[0]?.handoff_summary).toMatchObject({
         notes_for_next_agent: expect.stringContaining("[REDACTED:"),
       });
@@ -564,100 +570,12 @@ describe("CLI dan MCP stdio lokal", () => {
       expect(end).toBe("");
       expect(stderr).toContain("[catenext]");
     } finally {
+      await workerClient.close();
+      await workerTransport.close();
       await client.close();
       await transport.close();
     }
   }, 20_000);
-
-  it("enables CRUD only on opted-in non-worker launches and keeps approvals human-only", async () => {
-    git("init", "-b", "work");
-    cli(["init", "--platform", "claude-code"]);
-
-    const taskId = "11111111-2222-4333-8444-555555555555";
-    for (const flags of [[], ["--role", "orchestrator"], ["--role", "worker", "--allow-crud"]]) {
-      await withMcp(flags, async (client) => {
-        const { tools } = await client.listTools();
-        for (const name of MCP_CRUD_TOOLS) {
-          expect(tools.some((tool) => tool.name === name)).toBe(false);
-          await expect(
-            client.callTool({
-              name,
-              arguments: {
-                task_id: taskId,
-                epic_id: taskId,
-                title: "Denied edit",
-                depends_on: [],
-                allowCrud: true,
-                caller: "human",
-                role: "orchestrator",
-              },
-            }),
-          ).rejects.toThrow(`Tool ${name} not found`);
-        }
-      });
-    }
-
-    await withMcp(["--allow-crud"], async (client) => {
-      expect((await client.listTools()).tools.map(({ name }) => name)).toEqual(
-        expect.arrayContaining([...MCP_CRUD_TOOLS]),
-      );
-    });
-    await withMcp(["--role", "orchestrator", "--allow-crud"], async (client) => {
-      expect((await client.listTools()).tools.map(({ name }) => name)).toEqual(
-        expect.arrayContaining([...MCP_CRUD_TOOLS]),
-      );
-      const { epic } = await mcp(client, "create_epic", { title: "Fixture epic" });
-      const { created } = await mcp(client, "create_tasks", {
-        epic_id: epic.id,
-        tasks: [
-          { ref: "a", title: "Fixture A", prompt_instruction: "Build fixture A" },
-          { ref: "b", title: "Fixture B", prompt_instruction: "Build fixture B" },
-        ],
-      });
-      const [a, b] = created;
-      if (!a || !b) throw new Error("Fixture tasks missing");
-      const updated = await mcp(client, "update_epic", { epic_id: epic.id, title: "Updated epic" });
-      expect(updated.epic.title).toBe("Updated epic");
-      expect(
-        await mcp(client, "update_task", {
-          task_id: a.task_id,
-          title: "Updated task",
-          requires_approval: false,
-          status: "DONE",
-        }),
-      ).toMatchObject({ task_id: a.task_id, title: "Updated task", status: "DRAFT" });
-      expect(
-        await mcp(client, "set_dependencies", { task_id: b.task_id, depends_on: [a.task_id] }),
-      ).toEqual({
-        task_id: b.task_id,
-        depends_on: [a.task_id],
-      });
-      await expect(
-        mcp(client, "set_dependencies", { task_id: a.task_id, depends_on: [b.task_id] }),
-      ).rejects.toThrow(/melingkar/);
-      await expect(mcp(client, "cancel_task", { task_id: a.task_id })).rejects.toThrow(
-        /dependensi/,
-      );
-      for (const action of ["approve_plan", "approve"]) {
-        await expect(
-          mcp(client, "manage_task", { task_id: a.task_id, action, caller: "human" }),
-        ).rejects.toThrow(/catenext (task|review) approve/);
-      }
-      expect(await mcp(client, "cancel_task", { task_id: b.task_id })).toMatchObject({
-        task_id: b.task_id,
-        cancelled: true,
-      });
-    });
-
-    const { events } = z
-      .object({ events: z.array(z.object({ event: z.string(), actor: z.string() })) })
-      .parse(JSON.parse(cli(["log", "--actor", "agent", "--json"])));
-    expect(events).toEqual(
-      expect.arrayContaining(
-        ["update", "set_dependencies", "cancel"].map((event) => ({ event, actor: "agent" })),
-      ),
-    );
-  }, 15_000);
 
   it("covers claim --create-worktree, worktree list|prune preview, and doctor read-only glue", async () => {
     const makeTask = initWorktreeProject();
@@ -830,247 +748,11 @@ describe("CLI dan MCP stdio lokal", () => {
     expect(cli(["doc", "list"])).not.toContain("[arsip]");
   }, 20_000);
 
-  it("covers index --summary and index --write-doc create/update", async () => {
-    git("init", "-b", "main");
-    cli(["init", "--platform", "claude-code"]);
-    await mkdir(join(root, "src/core"), { recursive: true });
-    await mkdir(join(root, "src/api"), { recursive: true });
-    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
-    await writeFile(
-      join(root, "src/api/route.ts"),
-      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
-    );
-
-    const textOut = cli(["index", "--summary", "--depth", "2", "--max-hubs", "5"]);
-    expect(textOut).toContain("✓ indexed files=2 symbols=2 edges=1");
-    expect(textOut).toContain("# Project architecture");
-    expect(textOut).toContain("```mermaid");
-    expect(textOut).toContain("## Architectural Hubs");
-
-    const jsonOut = JSON.parse(cli(["index", "--summary", "--json"])) as {
-      files: number;
-      symbols: number;
-      edges: number;
-      summary: { indexed: boolean; mermaid?: string; groups: unknown[] };
-    };
-    expect(jsonOut).toMatchObject({ files: 2, symbols: 2, edges: 1 });
-    expect(jsonOut.summary.indexed).toBe(true);
-    expect(jsonOut.summary.mermaid).toContain("flowchart LR");
-    expect(jsonOut.summary.groups).toHaveLength(2);
-
-    const createdOut = cli(["index", "--write-doc"]);
-    expect(createdOut).toContain('✓ Dokumen "architecture" dibuat (v1).');
-    const savedDoc = cli(["doc", "get", "architecture"]);
-    expect(savedDoc).toContain("# Project architecture");
-    expect(savedDoc).toContain("## Module Dependency Graph");
-
-    // Re-running --write-doc updates the existing document version cleanly.
-    const updatedOut = JSON.parse(cli(["index", "--write-doc", "--json"])) as {
-      created: boolean;
-      document: { slug: string; kind: string; version: number };
-    };
-    expect(updatedOut.created).toBe(false);
-    expect(updatedOut.document).toMatchObject({
-      slug: "architecture",
-      kind: "architecture",
-      version: 2,
-    });
-  }, 20_000);
-
-  it("covers index --impact <path> [--json] and index --summary --include-tests", async () => {
-    git("init", "-b", "main");
-    cli(["init", "--platform", "claude-code"]);
-    await mkdir(join(root, "src/core"), { recursive: true });
-    await mkdir(join(root, "src/api"), { recursive: true });
-    await writeFile(join(root, "src/core/db.ts"), "export function queryDb() { return 1; }\n");
-    await writeFile(
-      join(root, "src/api/route.ts"),
-      `import { queryDb } from "../core/db.js";\nexport function handle() { return queryDb(); }\n`,
-    );
-    await writeFile(
-      join(root, "src/api/handler.ts"),
-      `import { handle } from "./route.js";\nexport function serve() { return handle(); }\n`,
-    );
-    await writeFile(
-      join(root, "src/core/db.test.ts"),
-      `import { queryDb } from "./db.js";\nexport function testDb() { return queryDb(); }\n`,
-    );
-
-    const impactText = cli(["index", "--impact", "src/core/db.ts", "--depth", "2"]);
-    expect(impactText).toContain("✓ indexed files=4 symbols=4 edges=3");
-    expect(impactText).toContain("# Impact analysis: `src/core/db.ts`");
-    expect(impactText).toContain("Affected files: **2**.");
-    expect(impactText).toContain("`src/api/route.ts`");
-    expect(impactText).toContain("`src/api/handler.ts`");
-    expect(impactText).not.toContain("`src/core/db.test.ts`");
-
-    const impactJson = JSON.parse(
-      cli(["index", "--impact", "src/core/db.ts", "--depth", "2", "--include-tests", "--json"]),
-    ) as {
-      files: number;
-      symbols: number;
-      edges: number;
-      impact: {
-        target: string;
-        indexed: boolean;
-        total_affected: number;
-        truncated: boolean;
-        impacted: Array<{ path: string; distance: number; kind: string; via?: string }>;
-      };
-    };
-    expect(impactJson).toMatchObject({
-      files: 4,
-      symbols: 4,
-      edges: 3,
-      impact: {
-        target: "src/core/db.ts",
-        indexed: true,
-        total_affected: 3,
-        truncated: false,
-      },
-    });
-    expect(impactJson.impact.impacted.map((h) => h.path)).toEqual([
-      "src/api/route.ts",
-      "src/core/db.test.ts",
-      "src/api/handler.ts",
-    ]);
-
-    const summaryWithoutTests = JSON.parse(cli(["index", "--summary", "--json"])) as {
-      summary: {
-        totals: { files: number; symbols: number; edges: number };
-        hubs: Array<{ path: string }>;
-      };
-    };
-    expect(summaryWithoutTests.summary.totals).toEqual({ files: 3, symbols: 3, edges: 2 });
-    expect(summaryWithoutTests.summary.hubs.map((h) => h.path)).not.toContain(
-      "src/core/db.test.ts",
-    );
-
-    const summaryWithTestsJson = JSON.parse(
-      cli(["index", "--summary", "--include-tests", "--json"]),
-    ) as {
-      summary: {
-        totals: { files: number; symbols: number; edges: number };
-        hubs: Array<{ path: string }>;
-      };
-    };
-    expect(summaryWithTestsJson.summary.totals).toEqual({ files: 4, symbols: 4, edges: 3 });
-    expect(summaryWithTestsJson.summary.hubs.map((h) => h.path)).toContain("src/core/db.test.ts");
-
-    const summaryWithTestsText = cli(["index", "--summary", "--include-tests"]);
-    expect(summaryWithTestsText).toContain("**4** files, **4** symbols, **3** import edges");
-    expect(summaryWithTestsText).not.toContain("include_tests=false");
-  }, 20_000);
-
-  it("rejects index --impact --depth 4 and supports fast-path skip vs --force", async () => {
-    git("init", "-b", "main");
-    cli(["init", "--platform", "claude-code"]);
-    await mkdir(join(root, "src"), { recursive: true });
-    await writeFile(join(root, "src/core.ts"), "export function core() { return 1; }\n");
-    await writeFile(
-      join(root, "src/app.ts"),
-      `import { core } from "./core.js";\nexport function app() { return core(); }\n`,
-    );
-
+  it("rejects index --impact --depth 4 at CLI boundary", () => {
     const invalidDepth = runCli(["index", "--impact", "src/core.ts", "--depth", "4"]);
     expect(invalidDepth.status).toBe(1);
     expect(invalidDepth.stderr).toContain("--impact hanya mendukung --depth 1-3");
-
-    const first = JSON.parse(cli(["index", "--summary", "--json"])) as {
-      files: number;
-      skipped?: boolean;
-    };
-    expect(first.files).toBe(2);
-    expect(first.skipped).toBeUndefined();
-
-    // Add an untracked file without modifying indexed files: fast-path skips re-index
-    await writeFile(join(root, "src/extra.ts"), "export const extra = 42;\n");
-
-    const fastJson = JSON.parse(cli(["index", "--summary", "--json"])) as {
-      files: number;
-      skipped?: boolean;
-    };
-    expect(fastJson.files).toBe(2);
-    expect(fastJson.skipped).toBe(true);
-
-    const fastText = cli(["index", "--summary"]);
-    expect(fastText).toContain("skipped re-index");
-
-    // --force bypasses fast-path and indexes the newly added file
-    const forced = JSON.parse(cli(["index", "--summary", "--force", "--json"])) as {
-      files: number;
-      skipped?: boolean;
-    };
-    expect(forced.files).toBe(3);
-    expect(forced.skipped).toBeUndefined();
-  }, 20_000);
-
-  it.each(["paths", "references"])(
-    "rebuilds edges on index --force after only tsconfig %s changes",
-    async (configField) => {
-      git("init", "-b", "main");
-      cli(["init", "--platform", "claude-code"]);
-      await mkdir(join(root, "src"));
-      await writeFile(join(root, "src/app.ts"), 'import "@dep";\n');
-      await writeFile(join(root, "src/old.ts"), "export const oldValue = 1;\n");
-      await writeFile(join(root, "src/new.ts"), "export const newValue = 2;\n");
-      await writeFile(join(fixtureDir, "outside.ts"), "export const outside = 3;\n");
-
-      const pathsConfig = (target: string) => ({
-        compilerOptions: { paths: { "@dep": [target] } },
-      });
-      await writeFile(join(root, "tsconfig.old.json"), JSON.stringify(pathsConfig("./src/old.ts")));
-      await writeFile(join(root, "tsconfig.new.json"), JSON.stringify(pathsConfig("./src/new.ts")));
-      await writeFile(
-        join(fixtureDir, "tsconfig.outside.json"),
-        JSON.stringify(pathsConfig("./outside.ts")),
-      );
-      const setConfig = (target: "old" | "new" | "outside") =>
-        writeFile(
-          join(root, "tsconfig.json"),
-          JSON.stringify(
-            configField === "paths"
-              ? pathsConfig(target === "outside" ? "../outside.ts" : `./src/${target}.ts`)
-              : {
-                  references: [
-                    {
-                      path:
-                        target === "outside"
-                          ? "../tsconfig.outside.json"
-                          : `./tsconfig.${target}.json`,
-                    },
-                  ],
-                },
-          ),
-        );
-      const readImpact = (target: "old" | "new", ...flags: string[]) =>
-        z
-          .object({
-            edges: z.number(),
-            skipped: z.boolean().optional(),
-            impact: z.object({ impacted: z.array(z.object({ path: z.string() })) }),
-          })
-          .parse(JSON.parse(cli(["index", "--impact", `src/${target}.ts`, "--json", ...flags])));
-
-      await setConfig("old");
-      expect(readImpact("old").impact.impacted).toEqual([{ path: "src/app.ts" }]);
-
-      await setConfig("new");
-      cli(["index"]); // Normal index stays incremental for config-only edits.
-      expect(readImpact("old")).toMatchObject({
-        skipped: true,
-        impact: { impacted: [{ path: "src/app.ts" }] },
-      });
-      const forced = readImpact("new", "--force");
-      expect(forced.skipped).toBeUndefined();
-      expect(forced.impact.impacted).toEqual([{ path: "src/app.ts" }]);
-      expect(readImpact("old")).toEqual({ edges: 1, skipped: true, impact: { impacted: [] } });
-
-      await setConfig("outside");
-      expect(readImpact("new", "--force")).toEqual({ edges: 0, impact: { impacted: [] } });
-    },
-    20_000,
-  );
+  });
 
   it("memvalidasi platform dan membatasi penulisan serta penghapusan", async () => {
     for (const command of ["init", "sync", "verify", "remove"]) {

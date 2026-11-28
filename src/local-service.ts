@@ -36,6 +36,7 @@ import {
   requireHumanEpicRunApproval,
 } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
+import { configuredEmbeddings } from "./config.js";
 import { checkGraphFreshness, queryGraphNeighbors, symbolSearch } from "./db/graph-index.js";
 import {
   analyzeGraphImpact,
@@ -50,6 +51,7 @@ import {
   type ReadTaskEventsOptions,
   type TaskEventRecord,
 } from "./db/task-events.js";
+import { createEmbeddingClient, type EmbeddingClient } from "./embeddings.js";
 import {
   acceptedReview,
   assertIntegration,
@@ -73,7 +75,11 @@ import {
   enrichClaimContext,
   snapshotClaimContext,
 } from "./local-claim-context.js";
-import { claimResponse, dependencyHandoffs } from "./local-claim-response.js";
+import {
+  claimResponse,
+  dependencyHandoffs,
+  rerankClaimContextPack,
+} from "./local-claim-response.js";
 import {
   extractMarkdownOutline,
   extractMarkdownSection,
@@ -133,11 +139,68 @@ import {
 export type { ReadTaskEventsOptions, TaskEventRecord } from "./db/task-events.js";
 export { LocalServiceError } from "./errors.js";
 
+type SingleTaskMutationToolName = "release_task" | "report_blocker" | "complete_handoff";
+
+type ReadOnlyMcpToolName =
+  | "get_project_board"
+  | "get_project_context"
+  | "get_ready_tasks"
+  | "get_document"
+  | "list_epics"
+  | "list_personas"
+  | "search_context"
+  | "graph_neighbors"
+  | "symbol_search"
+  | "graph_summary"
+  | "graph_impact"
+  | "worktree_status"
+  | "session_brief"
+  | "interview_setup";
+
+const READ_ONLY_MCP_TOOLS = new Set<McpToolName>([
+  "get_project_board",
+  "get_project_context",
+  "get_ready_tasks",
+  "get_document",
+  "list_epics",
+  "list_personas",
+  "search_context",
+  "graph_neighbors",
+  "symbol_search",
+  "graph_summary",
+  "graph_impact",
+  "worktree_status",
+  "session_brief",
+  "interview_setup",
+]);
+
+function isReadOnlyMcpTool(name: McpToolName): name is ReadOnlyMcpToolName {
+  return READ_ONLY_MCP_TOOLS.has(name);
+}
+
+function isSingleTaskMutationTool(name: McpToolName): name is SingleTaskMutationToolName {
+  return name === "release_task" || name === "report_blocker" || name === "complete_handoff";
+}
+
+function assertHeldTask(task: LocalTask, repo: string, leaseId: string): LocalTask {
+  if (task.lease?.repo !== repo || !leaseMatches(task.lease.id, leaseId)) {
+    fail(
+      "not_lock_holder",
+      "Task ini tidak sedang Anda pegang. Ambil ulang dengan claim_task bila lease sudah habis.",
+    );
+  }
+  return task;
+}
+
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
   [N in Exclude<
     McpToolName,
-    McpCrudToolName | "claim_task" | "session_brief" | "review_pull_request"
+    | McpCrudToolName
+    | SingleTaskMutationToolName
+    | "claim_task"
+    | "session_brief"
+    | "review_pull_request"
   >]: (input: Parsed<N>) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
 
@@ -156,6 +219,12 @@ const directives = [
 
 function fail(code: string, message: string, details?: unknown): never {
   throw new LocalServiceError(code, message, details);
+}
+
+/** Narrows required epic_run fields whose presence is enforced by EpicRunInput.superRefine. */
+function requireEpicRunField(value: string | undefined, message: string): string {
+  if (!value) fail("invalid_input", message);
+  return value;
 }
 
 /** UUIDv5 with the project UUID as namespace. Alias remains the persisted identity. */
@@ -189,10 +258,19 @@ export class LocalService {
     private readonly repoRoot: string,
     private readonly config: CatenextConfig,
     private readonly caller: "human" | "agent" = "human",
-    private readonly capabilities: { readonly allowCrud?: boolean } = {},
+    private readonly capabilities: {
+      readonly allowCrud?: boolean;
+      readonly embeddingClient?: EmbeddingClient;
+    } = {},
   ) {
     this.stateFile = resolve(repoRoot, config.state_file ?? ".catenext/catenext.sqlite");
     this.store = new LocalStore(this.stateFile);
+  }
+
+  private resolveEmbeddingClient(): EmbeddingClient | undefined {
+    if (this.capabilities.embeddingClient) return this.capabilities.embeddingClient;
+    const embConfig = configuredEmbeddings(this.config);
+    return embConfig ? createEmbeddingClient(embConfig) : undefined;
   }
 
   /** Local trusted-host boundary. Deliberately not registered as an MCP tool. */
@@ -991,6 +1069,183 @@ export class LocalService {
     }
   }
 
+  private async callSingleTaskMutation(
+    name: SingleTaskMutationToolName,
+    input: unknown,
+  ): Promise<unknown> {
+    const repo = this.config.repo_name;
+    const projectId = this.config.project_id;
+    const existed = existsSync(this.stateFile);
+    let out: unknown;
+    switch (name) {
+      case "release_task": {
+        const parsed = MCP_TOOLS.release_task.input.parse(input);
+        out = await this.store.taskTransaction(
+          projectId,
+          repo,
+          parsed.task_id,
+          (task, dirty, _db, afterSave) => {
+            assertHeldTask(task, repo, parsed.lease_id);
+            const fromStatus = task.status;
+            const actor = task.lease?.alias ?? task.persona ?? this.caller;
+            const status = returnClaim(task);
+            const iso = new Date(Date.now()).toISOString();
+            dirty();
+            afterSave((txDb) => {
+              insertTaskEvents(txDb, projectId, [
+                {
+                  task_id: task.id,
+                  event: "release",
+                  actor,
+                  detail: { from: fromStatus, to: status, repo },
+                  created_at: iso,
+                },
+              ]);
+            });
+            return { status, task_id: task.id } satisfies McpToolOutput<"release_task">;
+          },
+        );
+        break;
+      }
+      case "report_blocker": {
+        const parsed = MCP_TOOLS.report_blocker.input.parse(input);
+        out = await this.store.taskTransaction(
+          projectId,
+          repo,
+          parsed.task_id,
+          (task, dirty, _db, afterSave) => {
+            assertHeldTask(task, repo, parsed.lease_id);
+            const fromStatus = task.status;
+            const actor = task.lease?.alias ?? task.persona ?? this.caller;
+            advance(task, "report_blocker");
+            task.blocker = { category: parsed.category, reason: parsed.reason };
+            endLease(task);
+            const iso = new Date(Date.now()).toISOString();
+            dirty();
+            afterSave((txDb) => {
+              insertTaskEvents(txDb, projectId, [
+                {
+                  task_id: task.id,
+                  event: "blocker",
+                  actor,
+                  note: `[${parsed.category}] ${parsed.reason}`,
+                  detail: {
+                    from: fromStatus,
+                    to: task.status,
+                    category: parsed.category,
+                    reason: parsed.reason,
+                  },
+                  created_at: iso,
+                },
+              ]);
+            });
+            return {
+              status: "BLOCKED",
+              task_id: task.id,
+            } satisfies McpToolOutput<"report_blocker">;
+          },
+        );
+        break;
+      }
+      case "complete_handoff": {
+        const parsed = MCP_TOOLS.complete_handoff.input.parse(input);
+        out = await this.store.taskTransaction(
+          projectId,
+          repo,
+          parsed.task_id,
+          (task, dirty, db, afterSave) => {
+            assertHeldTask(task, repo, parsed.lease_id);
+            const handoff = parsed.handoff_summary;
+            if (task.branch && task.branch.name !== handoff.git_branch) {
+              fail("branch_mismatch", `Kirim handoff dari branch "${task.branch.name}".`);
+            }
+            const iso = new Date(Date.now()).toISOString();
+            const rawRun = readRun(db, projectId, task.epicId);
+            const run = rawRun?.status === "CLOSED" ? undefined : rawRun;
+            if (run) {
+              const project = loadProject(db, projectId);
+              assertRunHealthy(run, project, db, projectId);
+              if (
+                handoff.pull_request ||
+                !fullSha.test(handoff.last_commit_hash) ||
+                localCommit(this.repoRoot, runBranch(task.epicId, task.id)) !==
+                  handoff.last_commit_hash
+              ) {
+                fail(
+                  "run_handoff",
+                  "Run handoff needs the current local branch tip (full SHA), without PR metadata.",
+                );
+              }
+              try {
+                runTaskChanges(this.repoRoot, run, project, task, handoff.last_commit_hash);
+              } catch (error) {
+                if (
+                  !(error instanceof LocalServiceError) ||
+                  !["run_scope", "run_risk"].includes(error.code)
+                ) {
+                  throw error;
+                }
+                run.status = "PAUSED";
+                run.reason = error.message;
+                delete run.ready_head;
+                afterSave((txDb) => {
+                  saveRun(txDb, projectId, run);
+                });
+              }
+            }
+            const fromStatus = task.status;
+            const actor = task.lease?.alias ?? task.persona ?? this.caller;
+            advance(task, "complete");
+            task.handoff = handoff;
+            if (handoff.pull_request) {
+              task.review = {
+                ref: handoff.pull_request,
+                repo,
+                author: task.lease?.alias ?? null,
+                updatedAt: iso,
+                approvedLocally: false,
+              };
+            } else {
+              delete task.review;
+            }
+            endLease(task);
+            dirty();
+            afterSave((txDb) => {
+              insertTaskEvents(txDb, projectId, [
+                {
+                  task_id: task.id,
+                  event: "handoff",
+                  actor,
+                  note: handoff.notes_for_next_agent,
+                  detail: {
+                    from: fromStatus,
+                    to: task.status,
+                    git_branch: handoff.git_branch,
+                    last_commit_hash: handoff.last_commit_hash,
+                    files_count: handoff.files_modified.length,
+                    ...(handoff.pull_request?.url ? { pr_url: handoff.pull_request.url } : {}),
+                  },
+                  created_at: iso,
+                },
+              ]);
+            });
+            return {
+              task_id: task.id,
+              status: "NEEDS_REVIEW",
+              unlocked_task_ids: [],
+              next_step_hint: `Handoff dicatat. Task hilir menunggu approve lokal.${handoff.pull_request ? ` ${offlineReview}` : ""}`,
+            } satisfies McpToolOutput<"complete_handoff">;
+          },
+        );
+        break;
+      }
+    }
+    if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
+      await chmod(this.stateFile, 0o600);
+    }
+    return out;
+  }
+
   private async sessionBriefHints(snapshot: SessionBriefHintSnapshot): Promise<string[]> {
     const hints: string[] = [];
     try {
@@ -1078,11 +1333,54 @@ export class LocalService {
       const result = await this.callCrudTool(toolName, parsed.data);
       return contract.output.parse(result) as McpToolOutput<K>;
     }
+    if (isSingleTaskMutationTool(toolName)) {
+      const result = await this.callSingleTaskMutation(toolName, parsed.data);
+      return contract.output.parse(result) as McpToolOutput<K>;
+    }
     if (name === "manage_task") {
       requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
     }
     if (name === "epic_run") {
       requireHumanEpicRunApproval(this.caller, MCP_TOOLS.epic_run.input.parse(parsed.data));
+    }
+    const leaseId = "lease_id" in parsed.data ? parsed.data.lease_id : undefined;
+    const isCodeSearch =
+      toolName === "search_context" &&
+      (parsed.data as { sources?: readonly string[] }).sources?.includes("code");
+    if (isReadOnlyMcpTool(toolName) && leaseId === undefined && !isCodeSearch) {
+      const { out, hintSnapshot } = await this.store.read(
+        this.config.project_id,
+        async (project, db) => {
+          const now = Date.now();
+          const tools = new LocalWorkflow(
+            project,
+            this.config,
+            this.repoRoot,
+            db,
+            now,
+            () => {
+              throw new Error(`Unexpected state mutation in read-only tool: ${toolName}`);
+            },
+            this.caller,
+          );
+          if (toolName === "session_brief") {
+            const { verbose } = MCP_TOOLS.session_brief.input.parse(parsed.data);
+            const { brief, hintSnapshot } = tools.sessionBrief(Boolean(verbose));
+            return { out: contract.output.parse(brief) as McpToolOutput<K>, hintSnapshot };
+          }
+          const run = tools.handlers[toolName] as (data: typeof parsed.data) => unknown;
+          const result = await run(parsed.data);
+          return {
+            out: contract.output.parse(result) as McpToolOutput<K>,
+            hintSnapshot: undefined as SessionBriefHintSnapshot | undefined,
+          };
+        },
+      );
+      if (hintSnapshot) {
+        const hints = await this.sessionBriefHints(hintSnapshot);
+        if (hints.length > 0) return { ...out, hints };
+      }
+      return out;
     }
     const existed = existsSync(this.stateFile);
     const { out, hintSnapshot, claimContext, reviewContext } = await this.store.transaction(
@@ -1099,8 +1397,8 @@ export class LocalService {
           now,
           dirty,
           this.caller,
+          this.resolveEmbeddingClient(),
         );
-        const leaseId = "lease_id" in parsed.data ? parsed.data.lease_id : undefined;
         tools.tick(leaseId, name);
         if (toolName === "session_brief") {
           const { verbose } = MCP_TOOLS.session_brief.input.parse(parsed.data);
@@ -1153,8 +1451,24 @@ export class LocalService {
       if (hints.length > 0) return { ...out, hints };
     }
     if (claimContext) {
-      const pack = await enrichClaimContext(claimContext, this.repoRoot, this.config.platforms);
-      if (pack) return { ...out, context_pack: pack };
+      let pack = await enrichClaimContext(claimContext, this.repoRoot, this.config.platforms);
+      if (pack) {
+        const embClient = this.resolveEmbeddingClient();
+        if (embClient) {
+          const promptInstruction = (out as McpToolOutput<"claim_task">).task.prompt_instruction;
+          const initialPack = pack;
+          pack = await this.store.read(this.config.project_id, (_project, db) =>
+            rerankClaimContextPack({
+              pack: initialPack,
+              promptInstruction,
+              db,
+              projectId: this.config.project_id,
+              embeddingClient: embClient,
+            }),
+          );
+        }
+        return { ...out, context_pack: pack };
+      }
     }
     if (reviewContext) {
       const enriched = await enrichReviewResult(
@@ -1182,6 +1496,7 @@ class LocalWorkflow {
     private readonly now: number,
     private readonly dirty: () => void,
     private readonly caller: "human" | "agent" = "human",
+    private readonly embeddingClient?: EmbeddingClient,
   ) {
     this.tasks = new Map(project.tasks.map((task) => [task.id, task]));
     this.repo = config.repo_name;
@@ -1404,9 +1719,6 @@ class LocalWorkflow {
     get_ready_tasks: (input) => ({
       tasks: this.ready(input, input.limit).map((task) => this.summary(task)),
     }),
-    release_task: (input) => this.release(input),
-    report_blocker: (input) => this.block(input),
-    complete_handoff: (input) => this.handoff(input),
     get_document: (input) => this.document(input),
     save_document: (input) => this.saveDocument(input),
     archive_document: (input) => this.archiveDocument(input),
@@ -1455,12 +1767,13 @@ class LocalWorkflow {
 
   private handleEpicRun(input: Parsed<"epic_run">): McpToolOutput<"epic_run"> {
     if (input.action === "preview") {
-      const check = input.check!;
+      const base = requireEpicRunField(input.base, "preview butuh base branch.");
+      const check = requireEpicRunField(input.check, "preview butuh check command.");
       if (scrubText(check) !== check) {
         fail("invalid_input", "Verification command must not contain credentials.");
       }
       return previewRun(this.root, this.config, this.project, this.db, input.epic_id, {
-        base: input.base!,
+        base,
         check,
       });
     }
@@ -1471,9 +1784,9 @@ class LocalWorkflow {
     }
 
     if (input.action === "start") {
-      const base = input.base!;
-      const check = input.check!;
-      const snapshot = input.snapshot!;
+      const base = requireEpicRunField(input.base, "start butuh base branch.");
+      const check = requireEpicRunField(input.check, "start butuh check command.");
+      const snapshot = requireEpicRunField(input.snapshot, "start butuh snapshot dari preview.");
       if (scrubText(check) !== check) {
         fail("invalid_input", "Verification command must not contain credentials.");
       }
@@ -1513,7 +1826,8 @@ class LocalWorkflow {
     if (!run) fail("not_found", "No local run for this epic.");
     const before = JSON.stringify(run);
     if (input.action === "pause") {
-      this.advanceRun(run, { action: "pause", reason: scrubText(input.reason!) });
+      const reason = requireEpicRunField(input.reason, "pause butuh reason.");
+      this.advanceRun(run, { action: "pause", reason: scrubText(reason) });
     } else if (input.action === "resume") {
       this.advanceRun(run, { action: "resume" });
     } else {
@@ -2349,123 +2663,6 @@ class LocalWorkflow {
     return { result, context };
   }
 
-  /** Hanya holder dengan token lease yang cocok (hash di state) yang boleh memperbarui task. */
-  private held(taskId: string, leaseId: string): LocalTask {
-    const task = this.task(taskId);
-    if (task.lease?.repo !== this.repo || !leaseMatches(task.lease.id, leaseId)) {
-      fail(
-        "not_lock_holder",
-        "Task ini tidak sedang Anda pegang. Ambil ulang dengan claim_task bila lease sudah habis.",
-      );
-    }
-    return task;
-  }
-
-  private release(input: Parsed<"release_task">): McpToolOutput<"release_task"> {
-    const task = this.held(input.task_id, input.lease_id);
-    const fromStatus = task.status;
-    const actor = task.lease?.alias ?? task.persona ?? this.caller;
-    const status = returnClaim(task);
-    this.recordEvent({
-      task_id: task.id,
-      event: "release",
-      actor,
-      detail: { from: fromStatus, to: status, repo: this.repo },
-    });
-    this.dirty();
-    return { status, task_id: task.id };
-  }
-
-  private block(input: Parsed<"report_blocker">): McpToolOutput<"report_blocker"> {
-    const task = this.held(input.task_id, input.lease_id);
-    const fromStatus = task.status;
-    const actor = task.lease?.alias ?? task.persona ?? this.caller;
-    advance(task, "report_blocker");
-    task.blocker = { category: input.category, reason: input.reason };
-    endLease(task);
-    this.recordEvent({
-      task_id: task.id,
-      event: "blocker",
-      actor,
-      note: `[${input.category}] ${input.reason}`,
-      detail: {
-        from: fromStatus,
-        to: task.status,
-        category: input.category,
-        reason: input.reason,
-      },
-    });
-    this.dirty();
-    return { status: "BLOCKED", task_id: task.id };
-  }
-
-  private handoff(input: Parsed<"complete_handoff">): McpToolOutput<"complete_handoff"> {
-    const task = this.held(input.task_id, input.lease_id);
-    const handoff = input.handoff_summary;
-    if (task.branch && task.branch.name !== handoff.git_branch)
-      fail("branch_mismatch", `Kirim handoff dari branch "${task.branch.name}".`);
-    const run = this.taskRun(task);
-    if (run) {
-      this.assertHealthy(run);
-      if (
-        handoff.pull_request ||
-        !fullSha.test(handoff.last_commit_hash) ||
-        localCommit(this.root, runBranch(task.epicId, task.id)) !== handoff.last_commit_hash
-      ) {
-        fail(
-          "run_handoff",
-          "Run handoff needs the current local branch tip (full SHA), without PR metadata.",
-        );
-      }
-      try {
-        runTaskChanges(this.root, run, this.project, task, handoff.last_commit_hash);
-      } catch (error) {
-        if (
-          !(error instanceof LocalServiceError) ||
-          !["run_scope", "run_risk"].includes(error.code)
-        )
-          throw error;
-        this.pauseRun(run, error.message);
-        this.runs.push(run);
-      }
-    }
-    const fromStatus = task.status;
-    const actor = task.lease?.alias ?? task.persona ?? this.caller;
-    advance(task, "complete");
-    task.handoff = handoff;
-    if (handoff.pull_request) {
-      task.review = {
-        ref: handoff.pull_request,
-        repo: this.repo,
-        author: task.lease?.alias ?? null,
-        updatedAt: this.iso,
-        approvedLocally: false,
-      };
-    } else delete task.review;
-    endLease(task);
-    this.recordEvent({
-      task_id: task.id,
-      event: "handoff",
-      actor,
-      note: handoff.notes_for_next_agent,
-      detail: {
-        from: fromStatus,
-        to: task.status,
-        git_branch: handoff.git_branch,
-        last_commit_hash: handoff.last_commit_hash,
-        files_count: handoff.files_modified.length,
-        ...(handoff.pull_request?.url ? { pr_url: handoff.pull_request.url } : {}),
-      },
-    });
-    this.dirty();
-    return {
-      task_id: task.id,
-      status: "NEEDS_REVIEW",
-      unlocked_task_ids: [],
-      next_step_hint: `Handoff dicatat. Task hilir menunggu approve lokal.${handoff.pull_request ? ` ${offlineReview}` : ""}`,
-    };
-  }
-
   manageTask(input: Parsed<"manage_task">, snapshot?: string): McpToolOutput<"manage_task"> {
     const task = this.task(input.task_id);
     if (snapshot !== undefined) {
@@ -2717,6 +2914,7 @@ class LocalWorkflow {
     const contextHits = items.length ? searchLocalContext(input.query, items, input.limit) : [];
     let codeHits: SearchHit[] = [];
     let degraded = false;
+    let reranked = false;
     if (sources.has("code")) {
       const rootOpts = {
         roots: (this.project.workspace_roots ?? []).map((r) => ({
@@ -2730,14 +2928,17 @@ class LocalWorkflow {
           ...rootOpts,
           db: this.db,
           projectId: this.config.project_id,
+          embeddingClient: this.embeddingClient,
         });
         codeHits = res.hits;
         degraded = res.degraded;
+        reranked = res.reranked;
         if (codeHits.length === 0) {
           codeHits = await keywordFallback(this.root, input.query, input.limit, rootOpts);
         }
       } catch {
         degraded = true;
+        reranked = false;
         codeHits = await keywordFallback(this.root, input.query, input.limit, rootOpts);
       }
     }
@@ -2749,7 +2950,7 @@ class LocalWorkflow {
       .slice(0, input.limit);
     return {
       hits,
-      reranked: false,
+      reranked,
       degraded,
     };
   }

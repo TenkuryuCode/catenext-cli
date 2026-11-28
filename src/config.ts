@@ -4,6 +4,7 @@ import {
   type CatenextConfig,
   CatenextConfigSchema,
   checkConfigCompatibility,
+  type EmbeddingsConfig,
   type PlatformId,
 } from "@catenext/shared";
 import { parse } from "yaml";
@@ -116,6 +117,11 @@ export async function loadConfig(
 export function configuredPlatforms(config: CatenextConfig): PlatformId[] {
   // Config sebelum field `platforms` hanya memasang Claude Code dan Cursor.
   return [...new Set(config.platforms ?? (["claude-code", "cursor"] as const))];
+}
+
+/** Return opt-in embeddings configuration if enabled in `.catenext/config.yaml`. */
+export function configuredEmbeddings(config: CatenextConfig): EmbeddingsConfig | undefined {
+  return config.embeddings;
 }
 
 export function isMissingFile(error: unknown): boolean {

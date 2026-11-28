@@ -20,22 +20,9 @@ export function stableNodeCommand(
   resolveReal: (p: string) => string = realpathSync,
   isExecutable: (p: string) => boolean = defaultIsExecutable,
 ): string {
-  const target = safeReal(execPath, resolveReal);
+  const { target, stable } = stableVersionedPath(execPath, resolveReal, isExecutable);
   if (!target) return execPath;
-  const matches = (candidate: string) =>
-    isAbsolute(candidate) &&
-    !hasVersionedSegment(candidate) &&
-    isExecutable(candidate) &&
-    safeReal(candidate, resolveReal) === target;
-
-  if (execPath !== target && matches(execPath)) return execPath;
-  for (const candidate of new Set([
-    target.replace(MANAGER_NODE, "$1node$1current"),
-    target.replace(NVM_NODE, "$1current"),
-    target.replace(VERSION_SEGMENT, "$1current"),
-  ])) {
-    if (candidate !== target && matches(candidate)) return candidate;
-  }
+  if (stable) return stable;
 
   for (const dir of (pathEnv ?? "").split(delimiter)) {
     // Empty/relative PATH entries are cwd-dependent, so do not skip ahead to a later executable.
@@ -45,10 +32,51 @@ export function stableNodeCommand(
       if (!isExecutable(candidate)) continue;
       if (safeReal(candidate, resolveReal) !== target) return execPath;
       // An unversioned runtime or PATH alias can use bare node. Version-pinned PATH is not stable.
-      return !hasVersionedSegment(target) || matches(candidate) ? "node" : execPath;
+      return !hasVersionedSegment(target) ||
+        (!hasVersionedSegment(candidate) && safeReal(candidate, resolveReal) === target)
+        ? "node"
+        : execPath;
     }
   }
   return execPath;
+}
+
+/**
+ * Hindari path skrip berversi (mis. `node/24/24.21.0/...` atau `versions/node/v22.11.0/...`)
+ * bila symlink `current` yang menunjuk ke file yang sama tersedia.
+ */
+export function stableScriptPath(
+  scriptPath: string,
+  resolveReal: (p: string) => string = realpathSync,
+  isFile: (p: string) => boolean = defaultIsFile,
+): string {
+  if (!isAbsolute(scriptPath)) return scriptPath;
+  const { stable } = stableVersionedPath(scriptPath, resolveReal, isFile);
+  return stable ?? scriptPath;
+}
+
+function stableVersionedPath(
+  inputPath: string,
+  resolveReal: (p: string) => string,
+  isValid: (p: string) => boolean,
+): { target: string | null; stable: string | null } {
+  const target = safeReal(inputPath, resolveReal);
+  if (!target) return { target: null, stable: null };
+  const matches = (candidate: string) =>
+    isAbsolute(candidate) &&
+    !hasVersionedSegment(candidate) &&
+    isValid(candidate) &&
+    safeReal(candidate, resolveReal) === target;
+
+  if (inputPath !== target && matches(inputPath)) return { target, stable: inputPath };
+  for (const candidate of new Set([
+    target.replace(MANAGER_NODE, "$1node$1current"),
+    target.replace(NVM_NODE, "$1current"),
+    target.replace(VERSION_SEGMENT, "$1current"),
+  ])) {
+    if (candidate !== target && matches(candidate)) return { target, stable: candidate };
+  }
+  return { target, stable: null };
 }
 
 export function nodeLauncherWarning(command: string): string | null {
@@ -74,6 +102,14 @@ function safeReal(p: string, resolveReal: (p: string) => string): string | null 
 function defaultIsExecutable(p: string): boolean {
   try {
     accessSync(p, constants.X_OK);
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function defaultIsFile(p: string): boolean {
+  try {
     return statSync(p).isFile();
   } catch {
     return false;

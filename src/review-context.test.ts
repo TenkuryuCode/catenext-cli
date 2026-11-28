@@ -682,4 +682,47 @@ describe("review-context unit and integration tests", () => {
     });
     expect(JSON.stringify(meta)).not.toContain(token);
   });
+
+  it("derives detail_pointers.git_diff_command from diffMeta.base_ref when merge-base differs from baseBranch", async () => {
+    git(root, "init", "-b", "main");
+    git(root, "config", "user.name", "Test User");
+    git(root, "config", "user.email", "test@example.com");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/a.ts"), "export const a = 1;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "base commit");
+    const mergeBaseSha = git(root, "rev-parse", "HEAD");
+
+    git(root, "checkout", "-b", "feat/branch");
+    await writeFile(join(root, "src/a.ts"), "export const a = 2;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "feature commit");
+    const headSha = git(root, "rev-parse", "HEAD");
+
+    // Advance main past the merge-base so diffMeta.base_ref resolves to mergeBaseSha !== "main".
+    git(root, "checkout", "main");
+    await writeFile(join(root, "src/other.ts"), "export const other = true;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "advance main");
+
+    const pack = await buildReviewContextPackFromSnapshot(
+      {
+        taskId: randomUUID(),
+        taskPersona: "be",
+        baseBranch: "main",
+        headSha,
+        lastCommitHash: headSha,
+        handoffFiles: ["src/a.ts"],
+        handoffDecisions: ["Use merge-base for diff"],
+        verificationCommand: "pnpm test",
+        compact: false,
+        maxBytes: REVIEW_CONTEXT_PACK_MAX_BYTES,
+      },
+      root,
+    );
+
+    expect(pack.base_branch).toBe("main");
+    expect(pack.diff_meta.base_ref).toBe(mergeBaseSha);
+    expect(pack.detail_pointers.git_diff_command).toBe(`git diff ${mergeBaseSha}...${headSha} --`);
+  });
 });

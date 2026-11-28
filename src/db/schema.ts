@@ -1,6 +1,6 @@
-/** SQLite DDL for local Catenext orchestration (schema version 9). */
+/** SQLite DDL for local Catenext orchestration (schema version 10). */
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const EPIC_RUNS_SQL = `
 CREATE TABLE IF NOT EXISTS epic_runs (
@@ -13,6 +13,24 @@ CREATE TABLE IF NOT EXISTS epic_runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_epic_runs_open_repo
   ON epic_runs(project_id, repo) WHERE closed = 0;
+`;
+
+export const EMBEDDING_CHUNKS_SQL = `
+CREATE TABLE IF NOT EXISTS embedding_chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_kind TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  model TEXT NOT NULL,
+  dims INTEGER NOT NULL CHECK (dims > 0),
+  vector BLOB NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (project_id, source_kind, source_key, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_chunks_project_kind
+  ON embedding_chunks(project_id, source_kind);
 `;
 
 export const CODE_SEARCH_FILES_SQL = `
@@ -213,4 +231,5 @@ CREATE INDEX IF NOT EXISTS idx_files_path ON files(project_id, path);
 
 ${CODE_SEARCH_FILES_SQL}
 ${EPIC_RUNS_SQL}
+${EMBEDDING_CHUNKS_SQL}
 `;

@@ -5,9 +5,10 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CatenextConfigSchema } from "@catenext/shared";
-import { describe, expect, it } from "vitest";
-import { keywordFallback, searchLocalCode } from "./code-search.js";
+import { describe, expect, it, vi } from "vitest";
+import { indexCodeEmbeddings, keywordFallback, searchLocalCode } from "./code-search.js";
 import { openDatabaseAt } from "./db/open.js";
+import { type EmbeddingClient, EmbeddingError } from "./embeddings.js";
 import { LocalService } from "./local-service.js";
 import { DEFAULT_MAX_FILE_BYTES } from "./workspace-walk.js";
 
@@ -431,6 +432,128 @@ describe("local code search", () => {
       } finally {
         roDb.close();
       }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("indexes code chunks incrementally by sha256 and skips unchanged chunks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-embed-index-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      await writeFile(join(root, "src/auth.ts"), "export function verifyJwt() { return true; }\n");
+      await writeFile(join(root, "src/billing.ts"), "export function chargeCard() { return 1; }\n");
+
+      const embedCalls: string[][] = [];
+      const mockClient: EmbeddingClient = {
+        provider: "ollama",
+        model: "nomic-embed-text",
+        endpoint: "http://127.0.0.1:11434",
+        async embed(texts) {
+          embedCalls.push([...texts]);
+          return texts.map((t) =>
+            t.includes("auth") ? new Float32Array([1, 0, 0]) : new Float32Array([0, 1, 0]),
+          );
+        },
+      };
+
+      const first = await indexCodeEmbeddings(root, { client: mockClient });
+      expect(first).toMatchObject({
+        indexed: 2,
+        skipped: 0,
+        deleted: 0,
+        totalChunks: 2,
+        model: "nomic-embed-text",
+        provider: "ollama",
+      });
+      expect(embedCalls).toHaveLength(1);
+
+      // Second run with unchanged files skips both chunks without calling embed()
+      const second = await indexCodeEmbeddings(root, { client: mockClient });
+      expect(second).toMatchObject({ indexed: 0, skipped: 2, deleted: 0, totalChunks: 2 });
+      expect(embedCalls).toHaveLength(1);
+
+      // Modify one file -> only modified chunk is re-embedded
+      await writeFile(
+        join(root, "src/auth.ts"),
+        "export function verifyJwt() { return Boolean(Date.now()); }\n",
+      );
+      const third = await indexCodeEmbeddings(root, { client: mockClient });
+      expect(third).toMatchObject({ indexed: 1, skipped: 1, deleted: 0, totalChunks: 2 });
+      expect(embedCalls).toHaveLength(2);
+      expect(embedCalls[1]).toHaveLength(1);
+      expect(embedCalls[1]?.[0]).toContain("src/auth.ts");
+
+      // Delete one file -> stale chunk is pruned
+      await rm(join(root, "src/billing.ts"));
+      const fourth = await indexCodeEmbeddings(root, { client: mockClient });
+      expect(fourth).toMatchObject({ indexed: 0, skipped: 1, deleted: 1, totalChunks: 1 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blends Vector Cosine + FTS5 BM25 via RRF and falls back gracefully on offline/timeout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "catenext-embed-rrf-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      // File A: semantic match for "authentication" (uses jwt/session), no literal "authentication" word
+      await writeFile(
+        join(root, "src/session.ts"),
+        "export function validateBearerSession(token: string) { return token.length > 0; }\n",
+      );
+      // File B: keyword match for "authentication", plus vector match
+      await writeFile(
+        join(root, "src/auth.ts"),
+        "export function authenticationGuard() { return true; }\n",
+      );
+      // File C: unrelated
+      await writeFile(
+        join(root, "src/math.ts"),
+        "export function addNumbers(a: number, b: number) { return a + b; }\n",
+      );
+
+      const mockClient: EmbeddingClient = {
+        provider: "ollama",
+        model: "nomic-embed-text",
+        endpoint: "http://127.0.0.1:11434",
+        async embed(texts) {
+          return texts.map((t) => {
+            if (t.includes("src/auth.ts")) return new Float32Array([0.9, 0.1, 0]);
+            if (t.includes("src/session.ts")) return new Float32Array([0.85, 0.2, 0]);
+            if (t.includes("src/math.ts")) return new Float32Array([0, 0, 1]);
+            // Query vector for "authentication"
+            return new Float32Array([1, 0, 0]);
+          });
+        },
+      };
+
+      await indexCodeEmbeddings(root, { client: mockClient });
+
+      // Hybrid RRF: returns both auth.ts (FTS5 + Vector) and session.ts (Vector semantic match), with auth.ts ranked #1
+      const hybrid = await searchLocalCode(root, "authentication", 5, {
+        embeddingClient: mockClient,
+      });
+      expect(hybrid.reranked).toBe(true);
+      expect(hybrid.degraded).toBe(false);
+      expect(hybrid.hits.map((h) => h.ref)).toEqual(["src/auth.ts", "src/session.ts"]);
+
+      // Graceful fallback when embedding provider times out / is offline
+      const failingClient: EmbeddingClient = {
+        provider: "ollama",
+        model: "nomic-embed-text",
+        endpoint: "http://127.0.0.1:11434",
+        embed: vi.fn(async () => {
+          throw new EmbeddingError("timeout", "Request timed out");
+        }),
+      };
+
+      const fallback = await searchLocalCode(root, "authentication", 5, {
+        embeddingClient: failingClient,
+      });
+      expect(fallback.reranked).toBe(false);
+      expect(fallback.degraded).toBe(false);
+      expect(fallback.hits.map((h) => h.ref)).toEqual(["src/auth.ts"]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

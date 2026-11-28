@@ -24,6 +24,7 @@ import {
   changeMcp,
   entryBase,
   entryMatchesRoot,
+  entryRole,
   inspectMcp,
   McpConfigError,
   type McpServerEntry,
@@ -120,7 +121,9 @@ export async function planInit(opts: InitOptions): Promise<FileChange[]> {
       entryMatchesRoot(current.entry, root, adapter)
     )
       continue;
-    const entry = scopedEntry(root, adapter, existing ?? opts.mcpCommand);
+    const role =
+      current.entry && existing ? (entryRole(current.entry) ?? "orchestrator") : "orchestrator";
+    const entry = scopedEntry(root, adapter, existing ?? opts.mcpCommand, role);
     const after = changeMcp(before, adapter, entry);
     if (after !== null) changes.push({ path: adapter.path, before, after });
   }

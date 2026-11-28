@@ -14,7 +14,11 @@ import {
   type McpToolInput,
 } from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { indexCodeEmbeddings } from "./code-search.js";
 import * as graphIndex from "./db/graph-index.js";
+import { checkpointWalAndClose, openDatabaseAt } from "./db/open.js";
+import { LocalStore } from "./db/store.js";
+import { type EmbeddingClient, EmbeddingError } from "./embeddings.js";
 import { LocalService } from "./local-service.js";
 import * as skillCatalog from "./skill-catalog.js";
 import * as worktreeStatus from "./worktree-status.js";
@@ -1905,6 +1909,7 @@ describe("LocalService code graph tools", () => {
     );
 
     // Ensure DB exists before indexing; unindexed graph tools report stale: true (not_indexed).
+    await service.callTool("create_epic", { title: "Graph seed" });
     await service.callTool("session_brief", {});
     for (const [name, args] of [
       ["graph_neighbors", { path: "apps/api/src/v1/users/repo.ts" }],
@@ -2025,6 +2030,7 @@ describe("LocalService code graph tools", () => {
     await writeFile(billingSvc, "export function charge() { return 2; }\n");
 
     // Unindexed project: session_brief omits hints.
+    await service.callTool("create_epic", { title: "Graph seed" });
     const unindexedBrief = await service.callTool("session_brief", {});
     expect(unindexedBrief.hints).toBeUndefined();
 
@@ -2480,5 +2486,212 @@ describe("LocalService code graph tools", () => {
     expect(overlapHint).toContain("apps/api/src/routes.ts");
     expect(overlapHint).toContain("apps/api/src/db.ts");
     expect(overlapHint).not.toContain("apps/api/src/only-seq.ts");
+  });
+
+  it("routes read-only MCP calls through store.read and single-task mutations through taskTransaction", async () => {
+    await service.callTool("upsert_persona", { alias: "be", role: "backend" });
+    await service.callTool("save_document", {
+      slug: "blueprint",
+      title: "Blueprint",
+      kind: "architecture",
+      content: "Initial blueprint",
+    });
+    const { id } = await draft([plan("t1", { persona: "be" }), plan("t2", { persona: "be" })]);
+    await manage("approve_plan", id("t1"));
+    await manage("approve_plan", id("t2"));
+
+    const readSpy = vi.spyOn(LocalStore.prototype, "read");
+    const txSpy = vi.spyOn(LocalStore.prototype, "transaction");
+    const taskTxSpy = vi.spyOn(LocalStore.prototype, "taskTransaction");
+
+    await service.callTool("get_project_board", {});
+    await service.callTool("get_ready_tasks", {});
+    await service.callTool("list_epics", {});
+    await service.callTool("list_personas", {});
+    await service.callTool("get_document", { slug: "blueprint" });
+    await service.callTool("search_context", { query: "t1", sources: ["task"] });
+    await service.callTool("session_brief", {});
+
+    expect(readSpy).toHaveBeenCalledTimes(7);
+    expect(txSpy).not.toHaveBeenCalled();
+
+    // Claim t1 (full transaction), then release_task uses taskTransaction.
+    const claim1 = await service.callTool("claim_task", { task_id: id("t1"), agent_alias: "be" });
+    expect(txSpy).toHaveBeenCalledTimes(1);
+    txSpy.mockClear();
+
+    await service.callTool("release_task", { task_id: id("t1"), lease_id: claim1.lease_id });
+    expect(taskTxSpy).toHaveBeenCalledTimes(1);
+    expect(txSpy).not.toHaveBeenCalled();
+
+    // Lease renewal on a read-only call routes through transaction.
+    const claim2 = await service.callTool("claim_task", { task_id: id("t2"), agent_alias: "be" });
+    txSpy.mockClear();
+    readSpy.mockClear();
+    await service.callTool("get_ready_tasks", { lease_id: claim2.lease_id });
+    expect(txSpy).toHaveBeenCalledTimes(1);
+    expect(readSpy).not.toHaveBeenCalled();
+
+    // report_blocker and complete_handoff use taskTransaction.
+    taskTxSpy.mockClear();
+    await service.callTool("report_blocker", {
+      task_id: id("t2"),
+      lease_id: claim2.lease_id,
+      category: "other",
+      reason: "Waiting for schema",
+    });
+    await manage("unblock", id("t2"));
+    const claim3 = await service.callTool("claim_task", { task_id: id("t2"), agent_alias: "be" });
+    await service.callTool("complete_handoff", {
+      task_id: id("t2"),
+      lease_id: claim3.lease_id,
+      handoff_summary: handoff(),
+    });
+    expect(taskTxSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("gates checkGraphFreshness behind TTL and .git/index/.git/HEAD mtime", async () => {
+    await service.callTool("create_epic", { title: "Graph seed" });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await writeFile(join(root, ".git/index"), "idx-1");
+    await writeFile(join(root, ".git/HEAD"), "ref: refs/heads/main\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    const aPath = join(root, "src/a.ts");
+    await writeFile(aPath, "export const a = 1;\n");
+
+    const dbPath = service.stateFile;
+    await graphIndex.indexProjectGraph(dbPath, config.project_id, root);
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    const first = graphIndex.checkGraphFreshness(dbPath, config.project_id, rootDirs);
+    expect(first).toEqual({ stale: false, checked_files: 1 });
+
+    // Modify source file without touching .git/index or .git/HEAD -> cached within TTL
+    const future = new Date(Date.now() + 10_000);
+    await writeFile(aPath, "export const a = 2;\n");
+    await utimes(aPath, future, future);
+
+    const cached = graphIndex.checkGraphFreshness(dbPath, config.project_id, rootDirs);
+    expect(cached).toEqual({ stale: false, checked_files: 1 });
+
+    // Touch .git/index mtime -> invalidates cache immediately and detects modified_files
+    await writeFile(join(root, ".git/index"), "idx-2");
+    await utimes(join(root, ".git/index"), future, future);
+
+    const invalidated = graphIndex.checkGraphFreshness(dbPath, config.project_id, rootDirs);
+    expect(invalidated.stale).toBe(true);
+    expect(invalidated.reason).toBe("modified_files");
+  });
+
+  it("supports hybrid RRF search_context with FTS5 fallback and reranks claim_task context_pack slices within 4096 B", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(
+      join(root, "src/a-unrelated.ts"),
+      "export function formatCurrency(cents: number) { return `$${cents / 100}`; }\n",
+    );
+    await writeFile(
+      join(root, "src/b-relevant.ts"),
+      "export function verifyBearerJwt(token: string) { return token.startsWith('eyJ'); }\n",
+    );
+
+    const mockClient: EmbeddingClient = {
+      provider: "ollama",
+      model: "nomic-embed-text",
+      endpoint: "http://127.0.0.1:11434",
+      async embed(texts) {
+        return texts.map((t) => {
+          if (t.includes("src/b-relevant.ts")) return new Float32Array([1, 0, 0]);
+          if (t.includes("src/a-unrelated.ts")) return new Float32Array([0, 1, 0]);
+          // Prompt / search query vector aligned with b-relevant
+          return new Float32Array([0.95, 0.05, 0]);
+        });
+      },
+    };
+
+    const embService = new LocalService(root, config, "human", { embeddingClient: mockClient });
+    await embService.callTool("upsert_persona", { alias: "be", role: "backend" });
+
+    const epic = await embService.callTool("create_epic", {
+      title: "Hybrid Embeddings",
+      summary: "RRF search and context_pack reranking",
+    });
+    const created = await embService.callTool("create_tasks", {
+      epic_id: epic.epic.id,
+      tasks: [
+        {
+          ref: "t1",
+          title: "Verify JWT bearer tokens",
+          prompt_instruction: "Implement JWT token verification in the auth module",
+          persona: "be",
+          role: "backend",
+          target_repo: config.repo_name,
+          scope_files: ["src/a-unrelated.ts", "src/b-relevant.ts"],
+          depends_on: [],
+        },
+      ],
+    });
+    const taskId = created.created[0]?.task_id;
+    if (!taskId) throw new Error("Expected created task_id");
+    await embService.callTool("manage_task", { action: "approve_plan", task_id: taskId });
+
+    const dbPath = join(root, config.state_file ?? ".catenext/catenext.sqlite");
+    await graphIndex.indexProjectGraph(dbPath, config.project_id, root);
+
+    const db = openDatabaseAt(dbPath);
+    try {
+      await indexCodeEmbeddings(root, {
+        db,
+        projectId: config.project_id,
+        client: mockClient,
+      });
+    } finally {
+      checkpointWalAndClose(db);
+    }
+
+    // 1. search_context uses hybrid RRF (reranked: true) and surfaces semantic match
+    const hybridSearch = await embService.callTool("search_context", {
+      query: "authentication token",
+      sources: ["code"],
+      limit: 5,
+    });
+    expect(hybridSearch.reranked).toBe(true);
+    expect(hybridSearch.degraded).toBe(false);
+    expect(hybridSearch.hits[0]?.ref).toBe("src/b-relevant.ts");
+
+    // 2. Graceful fallback to FTS5 when embedding provider fails/times out
+    const offlineClient: EmbeddingClient = {
+      provider: "ollama",
+      model: "nomic-embed-text",
+      endpoint: "http://127.0.0.1:11434",
+      embed: vi.fn(async () => {
+        throw new EmbeddingError("network_error", "Connection refused");
+      }),
+    };
+    const offlineService = new LocalService(root, config, "human", {
+      embeddingClient: offlineClient,
+    });
+    const fallbackSearch = await offlineService.callTool("search_context", {
+      query: "verifyBearerJwt",
+      sources: ["code"],
+      limit: 5,
+    });
+    expect(fallbackSearch.reranked).toBe(false);
+    expect(fallbackSearch.degraded).toBe(false);
+    expect(fallbackSearch.hits.map((h) => h.ref)).toEqual(["src/b-relevant.ts"]);
+
+    // 3. claim_task reranks context_pack.graph_slice by cosine similarity to prompt_instruction within 4096 B
+    const claimed = await embService.callTool("claim_task", {
+      task_id: taskId,
+      agent_alias: "be",
+      include_context: true,
+    });
+    expect(claimed.context_pack).toBeDefined();
+    expect(claimed.context_pack?.graph_slice?.map((f) => f.path)).toEqual([
+      "src/b-relevant.ts",
+      "src/a-unrelated.ts",
+    ]);
+    expect(Buffer.byteLength(JSON.stringify(claimed.context_pack), "utf8")).toBeLessThanOrEqual(
+      4096,
+    );
   });
 });

@@ -34,6 +34,12 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
     render: (args) => {
       const personas = args.personas || "involved personas";
       const epicLine = args.epic_id ? `Epic: ${args.epic_id}\n` : "";
+      const header = args.goal
+        ? `Run a Catenext kickoff brainstorm for: ${args.goal}`
+        : "No `goal` argument was provided for the Catenext kickoff brainstorm.";
+      const stepsHeading = args.goal
+        ? "Steps:"
+        : "Ask the user what feature or epic goal they want to align on (or inspect `session_brief` / `get_project_board` for active epics and tasks), then proceed with:";
       return {
         description: "Orchestrator-led cross-agent kickoff brainstorm workflow",
         messages: [
@@ -42,10 +48,10 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
             content: {
               type: "text",
               text: [
-                `Run a Catenext kickoff brainstorm for: ${args.goal}`,
+                header,
                 `${epicLine}Personas: ${personas}`,
                 "",
-                "Steps:",
+                stepsHeading,
                 "1. Call session_brief and read catenext://documents/sync-board (get_document).",
                 "2. Align on shared decisions, API/schema contracts, and open asks across the involved personas.",
                 "3. Save compact outcomes to slug `sync-board` via save_document (no secrets, no code dumps, paths only).",
@@ -78,6 +84,15 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
     },
     render: (args) => {
       const focusLine = args.focus ? `Focus: ${args.focus}\n` : "";
+      const header = args.task_id
+        ? `Review Catenext task ${args.task_id}.`
+        : "No `task_id` argument was provided for the Catenext release candidate review.";
+      const stepsHeading = args.task_id
+        ? "Steps:"
+        : "Ask the user which task UUID they want to review (or call `get_project_board` / `session_brief` to list tasks in `NEEDS_REVIEW`), then proceed with:";
+      const step1 = args.task_id
+        ? `1. Inspect task details via get_project_board (task_id: ${args.task_id}), check worktree_status for dirty/ahead state or overlaps, and read catenext://handoffs/${args.task_id}.`
+        : "1. Inspect task details via get_project_board (task_id), check worktree_status for dirty/ahead state or overlaps, and read catenext://handoffs/{task_id}.";
       return {
         description: "Review a Catenext task handoff or release candidate",
         messages: [
@@ -86,11 +101,11 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
             content: {
               type: "text",
               text: [
-                `Review Catenext task ${args.task_id}.`,
+                header,
                 focusLine ? focusLine.trimEnd() : undefined,
                 "",
-                "Steps:",
-                `1. Inspect task details via get_project_board (task_id: ${args.task_id}), check worktree_status for dirty/ahead state or overlaps, and read catenext://handoffs/${args.task_id}.`,
+                stepsHeading,
+                step1,
                 "2. Verify scope adherence, changed files, test/lint/typecheck evidence, and that no credentials or secrets were exposed.",
                 "3. If issues exist, request revision on the same task with actionable feedback; otherwise submit review_pull_request recommendation or present the APPROVAL NEEDED card for human confirmation (catenext review approve).",
               ]
@@ -196,17 +211,6 @@ export function getPrompt(params: unknown): HandlerResult<GetPromptResult> {
       };
     }
     args[key] = value.trim();
-  }
-
-  for (const spec of def.prompt.arguments ?? []) {
-    const value = args[spec.name];
-    if (spec.required && (!value || value.length === 0)) {
-      return {
-        ok: false,
-        code: JSONRPC_INVALID_PARAMS,
-        message: `Missing required prompt argument: ${spec.name}`,
-      };
-    }
   }
 
   return {

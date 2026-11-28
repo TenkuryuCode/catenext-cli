@@ -16,6 +16,7 @@ import {
   changeMcp,
   entryBase,
   entryMatchesRoot,
+  entryRole,
   inspectMcp,
   McpConfigError,
   type McpServerEntry,
@@ -98,10 +99,12 @@ export async function planSync(opts: {
       }
       if (!current.entry || needsFix || opts.force) {
         const base = current.entry && !stale && !opts.force ? entryBase(current.entry) : null;
+        const role =
+          current.entry && base ? (entryRole(current.entry) ?? "orchestrator") : "orchestrator";
         const after = changeMcp(
           before,
           adapter,
-          scopedEntry(root, adapter, base ?? opts.defaultCommand()),
+          scopedEntry(root, adapter, base ?? opts.defaultCommand(), role),
         );
         add(adapter.path, before, after);
         if (before !== after || !current.entry || needsFix) {

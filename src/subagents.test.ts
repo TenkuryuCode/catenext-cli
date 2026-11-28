@@ -78,6 +78,7 @@ describe("subagent persona", () => {
     expect(anti).toContain("subagent: true");
     expect(anti).toContain("mainAgent: false");
     expect(anti).not.toContain("tools:");
+    expect(anti).not.toContain("disallowedTools:");
     expect(anti).toContain("Tool capabilities: write/terminal enabled");
 
     const reviewer = {
@@ -93,7 +94,30 @@ describe("subagent persona", () => {
       "antigravity",
     );
     expect(antiReviewer).not.toContain("tools:");
+    expect(antiReviewer).toContain("disallowedTools: [write_file, edit_file]");
     expect(antiReviewer).toContain("Tool capabilities: read/verify only");
+    expect(antiReviewer).toContain("review_pull_request");
+    expect(antiReviewer).toContain("catenext review list");
+    expect(antiReviewer).toContain("catenext review claim");
+    expect(antiReviewer).toContain("catenext review refresh");
+    expect(antiReviewer).toContain("catenext review submit");
+    expect(antiReviewer).not.toContain("claim_task");
+    expect(antiReviewer).not.toContain("--worktree");
+    expect(antiReviewer).not.toContain("complete_handoff");
+
+    const customReviewer = renderSubagent(
+      {
+        alias: "qa-rev",
+        role: "reviewer",
+        rules: ["Review PRs"],
+        repos: [],
+        scope: "project" as const,
+      },
+      { stack: ["node"], personas: [adel, reviewer] },
+      "claude-code",
+    );
+    expect(customReviewer).toContain("review_pull_request");
+    expect(customReviewer).not.toContain("claim_task");
 
     const scribe = {
       alias: "scribe",
@@ -108,6 +132,7 @@ describe("subagent persona", () => {
       "antigravity",
     );
     expect(antiScribe).not.toContain("tools:");
+    expect(antiScribe).toContain("disallowedTools: [write_file, edit_file]");
     expect(antiScribe).toContain("Tool capabilities: read/verify only");
     expect(antiScribe).toContain("save_document");
 

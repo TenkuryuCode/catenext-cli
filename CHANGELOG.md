@@ -9,6 +9,23 @@ bagian itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workfl
 menolak tag yang versinya belum ada di file ini. Entri versi tidak berarti paket sudah terbit di npm.
 Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
 
+## [0.20.0] - 2026-11-28
+
+### Ditambahkan
+- **Opt-in Hybrid Progressive Semantic Embeddings (PR #87, `0751b1b`):**
+  - Menambahkan konfigurasi opsional `embeddings` (`ollama` | `gemini` | `openai`, API key hanya dari env var `GEMINI_API_KEY`/`OPENAI_API_KEY`, validasi endpoint) pada `Packages/shared` & `apps/cli/src/config.ts`.
+  - Menambahkan tabel SQLite **schema v10** `embedding_chunks` (`sha256`, `model`, `dims`, `vector` BLOB) beserta client `fetch` zero-dependency di `apps/cli/src/embeddings.ts`.
+  - Menambahkan `catenext index --embeddings` (incremental `sha256` chunk caching), ranking hybrid Vector Cosine + FTS5 BM25 via *Reciprocal Rank Fusion* (`RRF_K = 60`) di `search_context` dengan fallback otomatis ke FTS5, serta reranking opsional `context_pack` dalam batas `4,096 B`.
+- **Unit test `@catenext/shared` (PR #86, `6cba49d`):** menambahkan `brief.test.ts` (`findScopeFileOverlaps`, `briefText`) dan `review.test.ts` (`PullRequestUrlSchema`).
+
+### Diubah
+- **Lock-free reads & efisiensi SQLite (PR #86, `6cba49d`):** merutekan panggilan MCP read-only tanpa `lease_id` melalui `store.read` bebas lock, caching `tableColumnNames` per handle `DatabaseSync` (`WeakMap`), menambahkan `LocalStore.taskTransaction` (`loadTask`/`saveTask`), dan membatasi `checkGraphFreshness` dengan TTL 5 detik + signature `mtime` `.git/index`/`.git/HEAD`.
+- **Modularisasi CLI & default `--role orchestrator` (PR #85, `294fad4`):** memindahkan subcommand dari `apps/cli/src/index.ts` (1.905 → 51 baris) ke `apps/cli/src/commands/*`, default `--role orchestrator` & `stableScriptPath` di konfigurasi MCP, serta fallback interaktif `prompts/get` (`kickoff-brainstorm`, `rc-review`).
+- **Stub `reviewer` & kecepatan tes CI (PR #86, `6cba49d`):** membedakan alur stub `reviewer` (`review_pull_request` / `catenext review`), menambahkan `disallowedTools: [write_file, edit_file]` pada stub read/verify Antigravity, dan memindahkan matriks tes CRUD/index ke in-process (`server.test.ts`, `graph-index.test.ts`).
+
+### Diperbaiki
+- **Hardening scrubber, lock & review CLI (PR #86, `6cba49d` & PR #87):** menyaring input tool MCP tak terdaftar (`DEFAULT_SCRUB_SKIP_KEYS`), output tool MCP & `resources/read`, pesan `network_error` embeddings, serta secret multi-kata berkutip; melayani `catenext://handoffs/{task_id}` via `loadTask`; menegakkan `0o600` di `withWriteLock` & menolak lock file hardlink (`st.nlink !== 1`); menyelaraskan `detail_pointers.git_diff_command` dengan `diffMeta.base_ref` dan menambahkan `.choices(["approve", "request_changes"])` pada `--decision`.
+
 ## [0.19.0] - 2026-11-28
 
 ### Ditambahkan
@@ -16,17 +33,20 @@ Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
   - Menambahkan `--role reviewer` (**11** tool read-only/review) pada `catenext mcp`.
   - Menambahkan tool MCP `worktree_status` (inspeksi dirty/ahead/overlap worktree & lease secara read-only, plus dry-run konflik `git merge-tree --write-tree`) dan `epic_run` berbatas (`preview`, `resume`, `pause`, `close`; `start` wajib lewat CLI).
   - Menambahkan `resources/subscribe` dengan notifikasi `notifications/resources/updated`, serta `logging/setLevel` dengan notifikasi `notifications/message`.
+  - Menambahkan fallback interaktif pada `prompts/get` (`apps/cli/src/mcp/handlers/prompts.ts`) saat `goal` atau `task_id` tidak diisi (PR #85, `294fad4`).
 - **Peringatan overlap di `session_brief`:** mendeteksi tabrakan `scope_files` dan worktree secara lock-free di `hints`.
 - **Micro-reindex graf & pemetaan test scope:** menambahkan `microReindexModifiedFiles` (`<= 10` berkas) untuk `--summary`/`--impact` dan `mapScopeFilesToTests` untuk mengisi `ClaimContextPack.test_files` dalam batas `4096 B`.
-- **Gate regresi & benchmark CI (`apps/cli/src/mcp/context-benchmark.test.ts`):** menegaskan anggaran latensi warm-cache `< 15 ms` p50, lock-free `enrichReviewResult`, micro-reindex, batas byte `ClaimContextPack`, dan batas ukuran bundle CLI (`< 1 MB`).
+- **Gate regresi & benchmark CI (`apps/cli/src/mcp/context-benchmark.test.ts`):** menegaskan anggaran latensi warm-cache `< 15 ms` p50, lock-free `enrichReviewResult`, micro-reindex, batas byte `ClaimContextPack`, dan batas ukuran bundle CLI (`< 1 MB`, `876.5kb`).
 
 ### Diubah
 - **RBAC & katalog MCP:** memperketat `--role worker` menjadi **14** tool (tanpa `save_repo_skill`); total katalog kini **31** tool default (**35** dengan `--allow-crud`).
+- **Default `--role orchestrator`, `stableScriptPath` & modularisasi CLI (PR #85, `294fad4`):** konfigurasi MCP yang dihasilkan kini default ke `--role orchestrator` dengan `stableScriptPath` (`apps/cli/src/init/mcp-config.ts`, `mcp-entry.ts`, `node-command.ts`), dan `apps/cli/src/index.ts` dimodularisasi ke `apps/cli/src/commands/*`.
 - **`get_project_board` kompak:** mendukung mode ringkas dan terfilter untuk menghemat token respons.
 - **`buildReviewContextPack` bebas kunci writer SQLite + cache LRU:** memindahkan pengambilan diff git & pengayaan pack (`enrichReviewResult`) ke luar transaksi writer SQLite dengan cache LRU 64 entri berbasis `(task_id, head_sha)` (p50 klaim review `3.31 ms` dari baseline `118.99 ms`).
 
 ### Diperbaiki
 - **Hardening subprocess git, batas `realRoot`, dan scrubber:** membersihkan seluruh env `GIT_*`, menerapkan `--end-of-options` / `--` / `--no-ext-diff` / `--no-textconv`, menyaring path `handoffFiles` tidak aman pada fallback `handoff_only`, dan memperluas `scrubText` ke output diff, worktree, overlap, dan review.
+- **Guard lint `epic run` (PR #85, `294fad4`):** mengganti non-null assertion pada `handleEpicRun` dengan guard runtime `requireEpicRunField`.
 - **Stabilitas tes LRU `review-context.test.ts`:** memparalelkan pengisian cache per batch agar tidak timeout 5000 ms saat eksekusi paralel penuh.
 
 ## [0.18.0] - 2026-11-28

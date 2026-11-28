@@ -2,7 +2,12 @@ import { MCP_TOOLS, type McpToolName } from "@catenext/shared";
 import type { z } from "zod";
 import { requireHumanApproval, requireHumanEpicRunApproval } from "../../approval-policy.js";
 import { findProjectRoot, readConfig } from "../../config.js";
-import { describeRedactions, SCRUB_TOOL_FIELDS, scrubDeep } from "../../scrubber.js";
+import {
+  DEFAULT_SCRUB_SKIP_KEYS,
+  describeRedactions,
+  SCRUB_TOOL_FIELDS,
+  scrubDeep,
+} from "../../scrubber.js";
 import { loadCatalogSkill } from "../../skill-catalog.js";
 import { saveSkill } from "../../skills.js";
 import { isPlainObject, JSONRPC_INVALID_PARAMS } from "./protocol.js";
@@ -93,24 +98,32 @@ export function createToolInvoker(opts: {
       if (!ctx.ok) return text(`Catenext belum siap: ${ctx.error}`);
 
       const keep = SCRUB_TOOL_FIELDS[name];
-      let payload: unknown = initial.data;
+      const skipKeys = keep ? new Set(keep) : DEFAULT_SCRUB_SKIP_KEYS;
       const notes: string[] = [];
 
-      if (keep) {
-        const scrubbed = scrubDeep(initial.data, new Set(keep));
-        // Sensor dapat mengubah ukuran payload; validasi ulang sebelum disimpan.
-        const reparsed = schema.safeParse(scrubbed.value);
-        if (!reparsed.success) return text(`Input ditolak:\n${zodIssues(reparsed.error)}`);
-        payload = reparsed.data;
-        if (scrubbed.total > 0) {
-          const note = describeRedactions(scrubbed);
-          opts.log(note);
-          notes.push(note);
-        }
+      const scrubbedIn = scrubDeep(initial.data, skipKeys);
+      // Sensor dapat mengubah ukuran payload; validasi ulang sebelum disimpan.
+      const reparsed = schema.safeParse(scrubbedIn.value);
+      if (!reparsed.success) return text(`Input ditolak:\n${zodIssues(reparsed.error)}`);
+      const payload = reparsed.data;
+      if (scrubbedIn.total > 0) {
+        const note = describeRedactions(scrubbedIn);
+        opts.log(note);
+        notes.push(note);
       }
 
-      const result = await runTool(ctx, name, payload);
-      const linked = buildResourceLinksForToolResult(name, result, opts.supportsResourceLinks());
+      const rawResult = await runTool(ctx, name, payload);
+      const scrubbedOut = scrubDeep(rawResult, DEFAULT_SCRUB_SKIP_KEYS);
+      if (scrubbedOut.total > 0) {
+        const note = describeRedactions(scrubbedOut);
+        opts.log(note);
+        notes.push(note);
+      }
+      const linked = buildResourceLinksForToolResult(
+        name,
+        scrubbedOut.value,
+        opts.supportsResourceLinks(),
+      );
       return json(linked.payload, notes, linked.links, opts.supportsStructuredContent());
     } catch (err) {
       return text(`Catenext: ${err instanceof Error ? err.message : String(err)}`);

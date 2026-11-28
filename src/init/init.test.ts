@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_PLATFORMS, type PlatformId } from "@catenext/shared";
@@ -67,7 +77,10 @@ it("plans default adapters without writing, then applies repo-scoped launches", 
     const source = await readFile(join(root, adapter.path), "utf8");
     expect(inspectMcp(source, adapter)).toEqual({
       count: 1,
-      entry: { command: "node", args: ["cli.js", "mcp", "--root", expectedRoots[i]] },
+      entry: {
+        command: "node",
+        args: ["cli.js", "mcp", "--role", "orchestrator", "--root", expectedRoots[i]],
+      },
       managed: true,
       compatible: true,
     });
@@ -93,7 +106,7 @@ it("supports OpenCode workspace JSONC and VS Code editor-managed workspace confi
     mcp: {
       catenext: {
         type: "local",
-        command: ["node", "cli.js", "mcp", "--root", root],
+        command: ["node", "cli.js", "mcp", "--role", "orchestrator", "--root", root],
         enabled: true,
       },
     },
@@ -101,7 +114,11 @@ it("supports OpenCode workspace JSONC and VS Code editor-managed workspace confi
   const vscode = JSON.parse(await readFile(join(root, ".vscode/mcp.json"), "utf8"));
   expect(vscode).toEqual({
     servers: {
-      catenext: { type: "stdio", command: "node", args: ["cli.js", "mcp", "--root", root] },
+      catenext: {
+        type: "stdio",
+        command: "node",
+        args: ["cli.js", "mcp", "--role", "orchestrator", "--root", root],
+      },
     },
   });
   const pointers = [
@@ -195,3 +212,42 @@ it("adds local state ignores once without rewriting existing rules", () => {
   expect(ensureGitignore(once)).toBe(once);
   expect(ensureGitignore("/.catenext/\n")).toBe("/.catenext/\n");
 });
+
+it.skipIf(process.platform === "win32")(
+  "avoids versioned Node command and script paths when a current symlink exists",
+  async () => {
+    const base = await realpath(workspace);
+    const versionedDir = join(base, "package", "node", "24", "24.21.0");
+    const nodeBin = join(versionedDir, "bin", "node");
+    const script = join(versionedDir, "lib", "node_modules", "catenext", "dist", "index.js");
+    const currentDir = join(base, "package", "node", "current");
+    const currentNode = join(currentDir, "bin", "node");
+    const currentScript = join(currentDir, "lib", "node_modules", "catenext", "dist", "index.js");
+
+    await mkdir(join(nodeBin, ".."), { recursive: true });
+    await mkdir(join(script, ".."), { recursive: true });
+    await writeFile(nodeBin, "#!/bin/sh\nexit 0\n");
+    await chmod(nodeBin, 0o755);
+    await writeFile(script, "// cli\n");
+    await symlink(versionedDir, currentDir, "dir");
+
+    await applyInit(
+      root,
+      await planInit({
+        root,
+        platforms: ["antigravity"],
+        mcpCommand: { command: nodeBin, args: [script] },
+      }),
+    );
+
+    const antigravity = JSON.parse(await readFile(join(root, ".agents/mcp_config.json"), "utf8"));
+    expect(antigravity).toEqual({
+      mcpServers: {
+        catenext: {
+          command: currentNode,
+          args: [currentScript, "mcp", "--role", "orchestrator", "--root", root],
+        },
+      },
+    });
+  },
+);

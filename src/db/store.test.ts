@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
+  chmod,
   link,
   mkdir,
   mkdtemp,
@@ -18,6 +19,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalServiceError } from "../errors.js";
 import type { LocalTask } from "../local-state.js";
+import { legacyStateJsonPath } from "./migrate.js";
 import { openDatabaseAt } from "./open.js";
 import { loadDocument, loadTask, saveDocumentRow, saveTask } from "./project-codec.js";
 import { LocalStore } from "./store.js";
@@ -261,9 +263,76 @@ describe("LocalStore lock metadata & stale lock recovery", () => {
       code: "invalid_state_file",
     });
   });
+
+  it("rejects hardlinked .lock files", async () => {
+    const other = join(dir, "other.lock");
+    await writeFile(other, JSON.stringify({ pid: 999_999, startedAt: new Date(0).toISOString() }));
+    const lockPath = `${dbPath}.lock`;
+    await link(other, lockPath);
+
+    const store = new LocalStore(dbPath, { lockTimeoutMs: 200, staleLockMs: 50 });
+    await expect(store.transaction(projectId, "catenext", () => {})).rejects.toMatchObject({
+      code: "invalid_state_file",
+    });
+    await rm(lockPath, { force: true });
+  });
 });
 
 describe("LocalStore read-only queries & partial diff persistence", () => {
+  it("enforces 0o600 permissions when query() triggers legacy JSON migration via withWriteLock", async () => {
+    const epicId = randomUUID();
+    const taskId = randomUUID();
+    const jsonPath = legacyStateJsonPath(dbPath);
+    await writeFile(
+      jsonPath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [projectId]: {
+            repos: ["catenext"],
+            epics: [{ id: epicId, title: "JSON Epic", description: null }],
+            personas: [],
+            tasks: [
+              {
+                id: taskId,
+                epicId,
+                title: "From JSON",
+                instruction: "Migrate me",
+                status: "TODO",
+                dependencies: [],
+                target: "catenext",
+                role: "backend",
+                persona: null,
+                requiresApproval: true,
+                revision: 0,
+                stale: false,
+              },
+            ],
+            documents: [],
+          },
+        },
+      }),
+    );
+    await chmod(jsonPath, 0o644);
+
+    const store = new LocalStore(dbPath);
+    const count = await store.query((db) => {
+      const row = db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id = ?").get(taskId) as {
+        n: number;
+      };
+      return row.n;
+    });
+    expect(count).toBe(1);
+    if (process.platform !== "win32") {
+      expect((await stat(dbPath)).mode & 0o777).toBe(0o600);
+      if (existsSync(`${dbPath}-wal`)) {
+        expect((await stat(`${dbPath}-wal`)).mode & 0o777).toBe(0o600);
+      }
+      if (existsSync(`${dbPath}-shm`)) {
+        expect((await stat(`${dbPath}-shm`)).mode & 0o777).toBe(0o600);
+      }
+    }
+  });
   it("reads missing state without creating files or .lock", async () => {
     const missingPath = join(dir, "nonexistent", "state.sqlite");
     const store = new LocalStore(missingPath);

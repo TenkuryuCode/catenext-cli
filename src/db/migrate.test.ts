@@ -241,7 +241,7 @@ describe("SQLite schema migrations", () => {
       expect(result1).toEqual({
         fromVersion: 1,
         toVersion: SCHEMA_VERSION,
-        applied: [2, 3, 4, 5, 6, 7, 8, 9],
+        applied: [2, 3, 4, 5, 6, 7, 8, 9, 10],
       });
 
       const colsAfter = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
@@ -484,7 +484,7 @@ describe("SQLite schema migrations", () => {
       db.exec("ALTER TABLE tasks ADD COLUMN verify_command TEXT");
 
       const res = runSchemaMigrations(db);
-      expect(res).toEqual({ fromVersion: 6, toVersion: SCHEMA_VERSION, applied: [7, 8, 9] });
+      expect(res).toEqual({ fromVersion: 6, toVersion: SCHEMA_VERSION, applied: [7, 8, 9, 10] });
       expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
       const afterCols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
@@ -718,9 +718,28 @@ it("migrates v7 -> v8 -> v9 sequentially and upgrades an existing v8 epic_runs D
         .get(),
     ).toEqual({ name: "epic_runs" });
 
-    const toV9 = runSchemaMigrations(db);
+    const toV9 = runSchemaMigrations(db, { targetVersion: 9 });
     expect(toV9).toEqual({ fromVersion: 8, toVersion: 9, applied: [9] });
     expect(getSchemaVersion(db)).toBe(9);
+
+    const toV10 = runSchemaMigrations(db);
+    expect(toV10).toEqual({ fromVersion: 9, toVersion: 10, applied: [10] });
+    expect(getSchemaVersion(db)).toBe(10);
+
+    const embeddingCols = (
+      db.prepare("PRAGMA table_info(embedding_chunks)").all() as { name: string }[]
+    ).map((c) => c.name);
+    expect(embeddingCols).toEqual([
+      "id",
+      "project_id",
+      "source_kind",
+      "source_key",
+      "sha256",
+      "model",
+      "dims",
+      "vector",
+      "updated_at",
+    ]);
 
     const epicCols = (db.prepare("PRAGMA table_info(epics)").all() as { name: string }[]).map(
       (c) => c.name,

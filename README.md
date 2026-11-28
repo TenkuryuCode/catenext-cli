@@ -43,22 +43,20 @@ catenext verify --platform cursor
 ```
 
 Restart IDE/CLI, lalu percayai server MCP `catenext` jika diminta.
-`catenext mcp` adalah proses **stdio** (bukan HTTP).
+`catenext mcp` adalah proses **stdio** (bukan HTTP). Konfigurasi MCP yang dihasilkan otomatis memakai `--role orchestrator` dan `stableScriptPath` agar path peluncur tetap stabil; `prompts/get` juga mendukung fallback interaktif bila `goal`/`task_id` tidak diisi.
 
 Orchestrator mengikuti **bahasa Anda** di chat; stub persona dan nama tool tetap **Inggris**.
 
 Dokumen lokal (`sync-board`, blueprint): `catenext doc save|get` — baca ringkas dengan
 `--outline` / `--section`, arsip dengan `doc archive|restore` ([detail](#dokumen-dan-skill)).
 
-**v0.17.0 (sudah publish di npm):**
-- Epic run berbatas: `catenext epic run preview|start|resume|pause|close|review|verify`
-- Katalog skill terpadu: `skill list --user-skills` / `init|sync --user-skills` (read-only)
-- Context reviewer kompak: `review claim|refresh --include-context`
-- Ringkasan + arsip epic lokal: `epic summary|archive|restore`
+**v0.19.0 (sudah publish di npm):**
+- **MCP vNext & RBAC:** `resources/*`, `logging/setLevel`, `prompts/*`, `annotations`, `resource_link`/`structuredContent`/`outputSchema`, `get_project_board` kompak, `worktree_status`, dan `epic_run` berbatas (`--role reviewer` 11, `--role worker` 14, 31 default, 35 `--allow-crud`).
+- **Optimasi:** `prepareReviewPullRequest` bebas kunci writer dengan cache LRU 64 entri (`< 15 ms` p50), `microReindexModifiedFiles`, dan `git merge-tree` dry-run.
 
-**v0.18.0 (source; npm belum publish):**
-- **MCP Protocol v2:** `resources/*` (`catenext://documents/{slug}`, `catenext://handoffs/{task_id}`), `prompts/*` (`kickoff-brainstorm`, `rc-review`, `docs-hygiene`), `annotations` standar pada seluruh 33 tool, serta `resource_link`, `structuredContent`, dan `outputSchema` untuk klien `>= 2025-06-18`.
-- **Optimasi & stub Antigravity:** deklarasi `tools` frontmatter persona Antigravity, bundle CLI ~849.9 KB, dan `buildReviewContextPack` ~73% lebih cepat pada p50.
+**v0.20.0 (source `main`; npm belum publish):**
+- **Opt-in Hybrid Progressive Embeddings (schema v10):** `ollama` / `gemini` (`GEMINI_API_KEY`) / `openai` (`OPENAI_API_KEY`), `catenext index --embeddings`, RRF hybrid search + fallback otomatis ke FTS5.
+- **Performa, keamanan & DX:** `store.read` bebas lock, `taskTransaction`, scrubber input/output/resource penuh, lock atomik `wx` + `0o600`, stub `reviewer` + `disallowedTools` Antigravity, default `--role orchestrator` + `stableScriptPath`, fallback `prompts/get`, dan modularisasi `apps/cli/src/commands/*`.
 
 | Klien | `--platform` | Konfigurasi |
 | --- | --- | --- |
@@ -323,19 +321,21 @@ catenext index
 catenext index --summary --depth 2 --max-hubs 12 [--include-tests]
 catenext index --impact <path> [--depth 2] [--limit 20] [--include-tests]
 catenext index --write-doc architecture      # simpan peta arsitektur ke dokumen lokal (default: architecture)
+catenext index --embeddings                  # opsional: indeks vektor inkremental (perlu config.embeddings)
 catenext search "login handler" --code
 ```
 
 - **Graf poliglot:** mendukung JS/TS (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`) dengan resolusi workspace monorepo (`package.json`/`pnpm-workspace.yaml`), `tsconfig.json` (`baseUrl`, `paths`, `extends` dalam batas `realRoot`), dan barrel re-export (`export *`, `export { ... } from`), `.vue`/`.svelte` (blok `<script>`), Python (impor lokal + relatif), Go (`go.mod`), Rust (`mod`, `crate::`, `super::`, `self::`), PHP (`composer.json` PSR-4 dalam batas `realRoot`), serta simbol `.java`/`.kt`.
-- **Peta arsitektur & analisis dampak hemat token:** tool MCP `graph_summary` (`depth` 1–5 default `2`, `max_hubs` 1–30 default `12`, `include_mermaid` default `true`, `include_tests` default `false`) dan `graph_impact` (`depth` 1–3 default `2`, `limit` 1–40 default `20`, `include_tests` default `false`) tersedia read-only untuk `orchestrator` dan `worker` (**29** tool MCP default; **33** dengan `--allow-crud`), bersama `graph_neighbors`, `symbol_search` (keempatnya menyertakan hint kesegaran `stale` / `stale_reason` yang dibatasi), dan `search_context` (`sources: ["code"]`).
-- **Pencarian FTS5:** SQLite FTS5 (`unicode61`, fallback `LIKE`) termasuk `.php`, `.vue`, `.svelte`, `.astro`, `.graphql`, `.proto`, dengan penelusuran `.gitignore`-aware, batas 256 KiB per file, guard symlink `lstat`/`realpath`, dan checkpoint WAL bersih saat koneksi ditutup.
+- **Peta arsitektur & analisis dampak hemat token:** tool MCP `graph_summary` (`depth` 1–5 default `2`, `max_hubs` 1–30 default `12`, `include_mermaid` default `true`, `include_tests` default `false`) dan `graph_impact` (`depth` 1–3 default `2`, `limit` 1–40 default `20`, `include_tests` default `false`) tersedia read-only untuk `orchestrator` dan `worker` (**31** tool MCP default; **35** dengan `--allow-crud`; `--role worker` **14** tool, `--role reviewer` **11** tool), bersama `graph_neighbors`, `symbol_search` (keempatnya menyertakan hint kesegaran `stale` / `stale_reason` yang dibatasi), dan `search_context` (`sources: ["code"]`).
+- **Pencarian FTS5 (default, offline):** SQLite FTS5 (`unicode61`, fallback `LIKE`) + graf kode tanpa konfigurasi tambahan, termasuk `.php`, `.vue`, `.svelte`, `.astro`, `.graphql`, `.proto`, dengan penelusuran `.gitignore`-aware, batas 256 KiB per file, guard symlink `lstat`/`realpath`, dan checkpoint WAL bersih saat koneksi ditutup.
+- **Embedding hibrida opt-in:** aktifkan lewat `embeddings` di `.catenext/config.yaml` (`provider`: `ollama` | `gemini` | `openai`, plus opsional `model`, `dimensions`, `endpoint`) dan env var `GEMINI_API_KEY` atau `OPENAI_API_KEY` untuk provider cloud (`ollama` lokal tanpa key). `catenext index --embeddings` menyimpan chunk vektor ber-hash `sha256` secara inkremental ke tabel `embedding_chunks` (**schema v10**). `search_context` menggabungkan skor kosinus vektor dan FTS5 BM25 lewat RRF (`k=60`), serta `claim_task` (`include_context: true`) mengurutkan ulang `graph_slice` dan `test_files` dalam batas `4.096 B` — dengan fallback otomatis ke FTS5 bila embedding belum diatur, belum diindeks, atau provider tidak terjangkau.
 
 ## Data lokal
 
 | Path | Isi |
 | --- | --- |
-| `.catenext/config.yaml` | Proyek, repo, layout, `state_file` |
-| `.catenext/catenext.sqlite` | Task, handoff, persona, dokumen, graf, FTS5, `epic_runs`, ringkasan/arsip epic (**schema v9**; WAL bersih saat keluar) |
+| `.catenext/config.yaml` | Proyek, repo, layout, `state_file`, `embeddings` (opsional) |
+| `.catenext/catenext.sqlite` | Task, handoff, persona, dokumen, graf, FTS5, `embedding_chunks`, `epic_runs`, ringkasan/arsip epic (**schema v10**; WAL bersih saat keluar) |
 | `.catenext/skills/` | Skill Markdown repo (+ katalog user-global opsional) |
 | `.catenext/cache/` | `cli-session-id` / indeks standalone (cache `*.json` lama dibersihkan otomatis) |
 | `CATENEXT.md` | Master prompt sesi baru |
@@ -357,7 +357,7 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `board` | `get_project_board` | Papan lintas repo |
 | `watch` | - | Monitor board/lease/approval/events (read-only) |
 | `next` / `claim` / `done` | `get_ready_tasks` / `claim_task` / `complete_handoff` | Ambil & serahkan task |
-| `worktree list\|status\|prune` | - | Inventori / status dirty & overlap / prune preview-first |
+| `worktree list\|status\|prune` | `worktree_status` | Inventori / status dirty, ahead, dry-run konflik & overlap / prune preview-first |
 | `template export\|import` | - | Bundle persona + skill (scrub secret) |
 | `block` / `release` | `report_blocker` / `release_task` | Blokir / lepas lease |
 | `task approve` / `review approve` | - (manusia) | Setujui rencana / handoff |
@@ -365,11 +365,11 @@ catenext restore ./catenext-backup.sqlite --force  # cek integritas & skema + si
 | `persona list\|set\|remove` | `list_personas` / `upsert_persona` / `remove_persona` | Persona proyek (+ regen stub) |
 | `skill list\|create\|set\|remove\|load` | - | Skill Markdown (+ `--user-skills` katalog global) |
 | `doc list\|get\|save\|archive\|restore` | `get_document` / `save_document` / `archive_document` / `restore_document` | Dokumen lokal (outline, section, arsip) |
-| `epic` / `epic run` / `epic summary\|archive\|restore` / `task …` | planning tools (+ CRUD opt-in) | Rencana, epic run berbatas, arsip lokal |
+| `epic` / `epic run` / `epic summary\|archive\|restore` / `task …` | `epic_run`, planning tools (+ CRUD opt-in) | Rencana, epic run berbatas, arsip lokal |
 | `review claim\|refresh --include-context` | review tools | Context pack reviewer hemat-token |
 | `doctor` | - | Diagnostik read-only |
 | `backup` / `restore` | - | Snapshot SQLite konsisten (`0600`) & pulihkan dengan cek integritas |
-| `mcp` | - | Stdio MCP (`--allow-crud` opt-in) |
+| `mcp` | - | Stdio MCP (`--role orchestrator\|worker\|reviewer`, `--allow-crud` opt-in) |
 | `index` / `search` | `graph_summary` / `graph_impact` / `graph_neighbors` / `symbol_search` / `search_context` | Graf poliglot, peta arsitektur (`--summary`, `--write-doc`), dampak (`--impact`), & pencarian FTS5 |
 | `log` / `permission …` / `root …` | - | Audit, izin, roots |
 
