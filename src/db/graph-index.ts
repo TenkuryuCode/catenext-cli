@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { accessSync, constants, type Dirent, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -13,7 +14,10 @@ import { collectRootTargets } from "../workspace-roots.js";
 import {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_SKIP_DIRS,
+  type GitignoreRule,
+  isGitignored,
   isWithinRoot,
+  parseGitignore,
   readBoundedUtf8File,
   walkWorkspaceFiles,
 } from "../workspace-walk.js";
@@ -129,6 +133,110 @@ type ExistingFileRow = {
   mtime_ms: number | null;
 };
 
+type ResolvedEdgeTarget = {
+  to: string;
+  kind: "imports" | "reexport";
+};
+
+function createImportResolver(knownFilesByRoot: Map<string | null, Set<string>>) {
+  const psr4ByRoot = new Map<string, ComposerPsr4Entry[]>();
+  const getPsr4ForRoot = (realRoot: string): ComposerPsr4Entry[] => {
+    let cached = psr4ByRoot.get(realRoot);
+    if (!cached) {
+      cached = loadComposerPsr4(realRoot);
+      psr4ByRoot.set(realRoot, cached);
+    }
+    return cached;
+  };
+
+  const goModuleByRoot = new Map<string, string | null>();
+  const getGoModuleForRoot = (realRoot: string): string | null => {
+    if (goModuleByRoot.has(realRoot)) {
+      return goModuleByRoot.get(realRoot) ?? null;
+    }
+    const mod = loadGoModule(realRoot);
+    goModuleByRoot.set(realRoot, mod);
+    return mod;
+  };
+
+  const tsContextByRoot = new Map<string, TsResolutionContext>();
+  const getTsContextForRoot = (realRoot: string): TsResolutionContext => {
+    let cached = tsContextByRoot.get(realRoot);
+    if (!cached) {
+      cached = createTsResolutionContext(realRoot);
+      tsContextByRoot.set(realRoot, cached);
+    }
+    return cached;
+  };
+
+  return (
+    entry: Pick<WalkedEntry, "rootId" | "realRoot" | "prefix" | "full" | "relInRoot" | "ext">,
+    content: string,
+  ): ResolvedEdgeTarget[] => {
+    const rootKnown = knownFilesByRoot.get(entry.rootId);
+    const psr4 = entry.ext === ".php" ? getPsr4ForRoot(entry.realRoot) : undefined;
+    const goMod = entry.ext === ".go" ? getGoModuleForRoot(entry.realRoot) : undefined;
+    const isTsJs = TS_JS_EXT.has(entry.ext);
+    const isSfc = SFC_EXT.has(entry.ext);
+    const tsCtx = isTsJs || isSfc ? getTsContextForRoot(entry.realRoot) : undefined;
+
+    const specs: TsJsImportEntry[] = isTsJs
+      ? parseTsJsImportEntries(content, true)
+      : isSfc
+        ? (() => {
+            const merged = new Map<string, "imports" | "reexport">();
+            for (const block of extractSfcScriptBlocks(content)) {
+              for (const item of parseTsJsImportEntries(block.code, true)) {
+                const prev = merged.get(item.spec);
+                if (!prev || (prev === "reexport" && item.kind === "imports")) {
+                  merged.set(item.spec, item.kind);
+                }
+              }
+            }
+            return [...merged.entries()].map(([spec, kind]) => ({ spec, kind }));
+          })()
+        : parseImports(content, entry.ext).map((spec) => ({ spec, kind: "imports" as const }));
+
+    const byTarget = new Map<string, "imports" | "reexport">();
+    const recordTarget = (target: string, kind: "imports" | "reexport") => {
+      const prev = byTarget.get(target);
+      if (!prev || (prev === "reexport" && kind === "imports")) {
+        byTarget.set(target, kind);
+      }
+    };
+
+    for (const item of specs) {
+      if (entry.ext === ".go") {
+        for (const target of resolveGoImport(
+          item.spec,
+          entry.realRoot,
+          entry.realRoot,
+          goMod ?? null,
+          rootKnown,
+        )) {
+          if (target !== entry.relInRoot) {
+            recordTarget(entry.prefix ? `${entry.prefix}/${target}` : target, "imports");
+          }
+        }
+        continue;
+      }
+      const to = resolveImport(
+        entry.full,
+        item.spec,
+        entry.realRoot,
+        rootKnown,
+        psr4,
+        goMod,
+        tsCtx,
+      );
+      if (to && to !== entry.relInRoot) {
+        recordTarget(entry.prefix ? `${entry.prefix}/${to}` : to, item.kind);
+      }
+    }
+    return [...byTarget.entries()].map(([to, kind]) => ({ to, kind }));
+  };
+}
+
 export async function indexProjectGraph(
   dbOrPath: DatabaseSync | string,
   projectId: string,
@@ -236,10 +344,6 @@ export async function indexProjectGraph(
 
     const idByPath = new Map<string, number>();
     const mtimeOnlyUpdates: Array<{ id: number; rootId: string | null; mtimeMs: number }> = [];
-    type ResolvedEdgeTarget = {
-      to: string;
-      kind: "imports" | "reexport";
-    };
 
     const newFiles: Array<{
       rootId: string | null;
@@ -260,99 +364,7 @@ export async function indexProjectGraph(
     }> = [];
     const refreshedEdges: Array<{ id: number; imports: ResolvedEdgeTarget[] }> = [];
 
-    const psr4ByRoot = new Map<string, ComposerPsr4Entry[]>();
-    const getPsr4ForRoot = (realRoot: string): ComposerPsr4Entry[] => {
-      let cached = psr4ByRoot.get(realRoot);
-      if (!cached) {
-        cached = loadComposerPsr4(realRoot);
-        psr4ByRoot.set(realRoot, cached);
-      }
-      return cached;
-    };
-
-    const goModuleByRoot = new Map<string, string | null>();
-    const getGoModuleForRoot = (realRoot: string): string | null => {
-      if (goModuleByRoot.has(realRoot)) {
-        return goModuleByRoot.get(realRoot) ?? null;
-      }
-      const mod = loadGoModule(realRoot);
-      goModuleByRoot.set(realRoot, mod);
-      return mod;
-    };
-
-    const tsContextByRoot = new Map<string, TsResolutionContext>();
-    const getTsContextForRoot = (realRoot: string): TsResolutionContext => {
-      let cached = tsContextByRoot.get(realRoot);
-      if (!cached) {
-        cached = createTsResolutionContext(realRoot);
-        tsContextByRoot.set(realRoot, cached);
-      }
-      return cached;
-    };
-
-    const resolveImportsForEntry = (entry: WalkedEntry, content: string): ResolvedEdgeTarget[] => {
-      const rootKnown = knownFilesByRoot.get(entry.rootId);
-      const psr4 = entry.ext === ".php" ? getPsr4ForRoot(entry.realRoot) : undefined;
-      const goMod = entry.ext === ".go" ? getGoModuleForRoot(entry.realRoot) : undefined;
-      const isTsJs = TS_JS_EXT.has(entry.ext);
-      const isSfc = SFC_EXT.has(entry.ext);
-      const tsCtx = isTsJs || isSfc ? getTsContextForRoot(entry.realRoot) : undefined;
-
-      const specs: TsJsImportEntry[] = isTsJs
-        ? parseTsJsImportEntries(content, true)
-        : isSfc
-          ? (() => {
-              const merged = new Map<string, "imports" | "reexport">();
-              for (const block of extractSfcScriptBlocks(content)) {
-                for (const item of parseTsJsImportEntries(block.code, true)) {
-                  const prev = merged.get(item.spec);
-                  if (!prev || (prev === "reexport" && item.kind === "imports")) {
-                    merged.set(item.spec, item.kind);
-                  }
-                }
-              }
-              return [...merged.entries()].map(([spec, kind]) => ({ spec, kind }));
-            })()
-          : parseImports(content, entry.ext).map((spec) => ({ spec, kind: "imports" as const }));
-
-      const byTarget = new Map<string, "imports" | "reexport">();
-      const recordTarget = (target: string, kind: "imports" | "reexport") => {
-        const prev = byTarget.get(target);
-        if (!prev || (prev === "reexport" && kind === "imports")) {
-          byTarget.set(target, kind);
-        }
-      };
-
-      for (const item of specs) {
-        if (entry.ext === ".go") {
-          for (const target of resolveGoImport(
-            item.spec,
-            entry.realRoot,
-            entry.realRoot,
-            goMod ?? null,
-            rootKnown,
-          )) {
-            if (target !== entry.relInRoot) {
-              recordTarget(entry.prefix ? `${entry.prefix}/${target}` : target, "imports");
-            }
-          }
-          continue;
-        }
-        const to = resolveImport(
-          entry.full,
-          item.spec,
-          entry.realRoot,
-          rootKnown,
-          psr4,
-          goMod,
-          tsCtx,
-        );
-        if (to && to !== entry.relInRoot) {
-          recordTarget(entry.prefix ? `${entry.prefix}/${to}` : to, item.kind);
-        }
-      }
-      return [...byTarget.entries()].map(([to, kind]) => ({ to, kind }));
-    };
+    const resolveImportsForEntry = createImportResolver(knownFilesByRoot);
 
     for (const entry of entries) {
       const existing = existingByPath.get(entry.rel);
@@ -801,11 +813,14 @@ export type GraphFreshnessResult = {
   stale: boolean;
   reason?: string;
   checked_files?: number;
+  modified_files?: string[];
 };
 
+export const MICRO_REINDEX_MAX_FILES = 10;
 const MAX_FRESHNESS_CHECK_FILES = 100;
 const MAX_UNINDEXED_SCAN_DIRS = 64;
 const MAX_UNINDEXED_SCAN_ENTRIES = 256;
+const MAX_MICRO_GITIGNORE_BYTES = 64 * 1024;
 
 function hasAnyCodeFileBounded(absDir: string): boolean {
   let realRoot: string;
@@ -933,6 +948,7 @@ export function checkGraphFreshness(
     }
 
     let checked = 0;
+    const modifiedFiles: string[] = [];
     for (const row of sampleRows) {
       const rootEntry = rootById.get(row.root_id);
       if (!rootEntry) continue;
@@ -963,8 +979,20 @@ export function checkGraphFreshness(
       }
 
       if (row.mtime_ms === null || diskMtimeMs !== row.mtime_ms) {
-        return { stale: true, reason: "modified_files", checked_files: checked };
+        modifiedFiles.push(row.path);
+        if (modifiedFiles.length > MICRO_REINDEX_MAX_FILES) {
+          return { stale: true, reason: "modified_files", checked_files: checked };
+        }
       }
+    }
+
+    if (modifiedFiles.length > 0) {
+      return {
+        stale: true,
+        reason: "modified_files",
+        checked_files: checked,
+        modified_files: modifiedFiles,
+      };
     }
 
     return { stale: false, checked_files: checked };
@@ -975,6 +1003,7 @@ export type GraphFastPathState = {
   indexed_files: number;
   stale: boolean;
   reason?: string;
+  modified_files?: string[];
 };
 
 export function getGraphIndexFastPathState(
@@ -994,6 +1023,287 @@ export function getGraphIndexFastPathState(
       indexed_files,
       stale: freshness.stale,
       ...(freshness.reason ? { reason: freshness.reason } : {}),
+      ...(freshness.modified_files ? { modified_files: freshness.modified_files } : {}),
+    };
+  });
+}
+
+export type MicroReindexResult = {
+  applied: boolean;
+  reindexed: number;
+  counts: GraphIndexResult;
+};
+
+function splitPrefixedPath(
+  path: string,
+  rootId: string | null,
+): { prefix: string; relInRoot: string } {
+  if (rootId !== null && path.startsWith("@")) {
+    const slashIdx = path.indexOf("/");
+    if (slashIdx > 1) {
+      return { prefix: path.slice(0, slashIdx), relInRoot: path.slice(slashIdx + 1) };
+    }
+  }
+  return { prefix: "", relInRoot: path };
+}
+
+async function isMicroPathIgnoredOrUnsafe(
+  realRoot: string,
+  relInRoot: string,
+  gitignoreCache: Map<string, GitignoreRule[]>,
+): Promise<boolean> {
+  const segments = relInRoot.split("/").filter(Boolean);
+  if (segments.length === 0) return true;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg || seg.startsWith(".")) return true;
+    if (i < segments.length - 1 && DEFAULT_SKIP_DIRS.has(seg)) return true;
+  }
+
+  let activeRules: GitignoreRule[] = [];
+  let curRel = "";
+  let curAbs = realRoot;
+  for (let i = 0; i < segments.length; i++) {
+    let dirRules = gitignoreCache.get(curRel);
+    if (!dirRules) {
+      const raw = await readBoundedUtf8File(
+        join(curAbs, ".gitignore"),
+        realRoot,
+        MAX_MICRO_GITIGNORE_BYTES,
+      );
+      dirRules = raw !== null ? parseGitignore(raw, curRel) : [];
+      gitignoreCache.set(curRel, dirRules);
+    }
+    if (dirRules.length > 0) {
+      activeRules = [...activeRules, ...dirRules];
+    }
+    if (i < segments.length - 1) {
+      const seg = segments[i];
+      if (!seg) return true;
+      curRel = curRel ? `${curRel}/${seg}` : seg;
+      curAbs = join(curAbs, seg);
+      try {
+        const lst = await lstat(curAbs);
+        if (lst.isSymbolicLink() || !lst.isDirectory()) return true;
+      } catch {
+        return true;
+      }
+    }
+  }
+
+  return isGitignored(relInRoot, false, activeRules);
+}
+
+export async function microReindexModifiedFiles(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+  rootDirs: Array<{ rootId: string | null; dir: string }>,
+  modifiedPaths?: readonly string[],
+  options: Pick<GraphIndexOptions, "maxFileBytes"> = {},
+): Promise<MicroReindexResult> {
+  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  if (!Number.isFinite(maxFileBytes) || maxFileBytes <= 0) {
+    return withDatabase(dbOrPath, (db) => ({
+      applied: false,
+      reindexed: 0,
+      counts: readGraphCounts(db, projectId),
+    }));
+  }
+
+  return withDatabaseAsync(dbOrPath, async (db) => {
+    const counts = readGraphCounts(db, projectId);
+    if (counts.files === 0 || !isGraphParserCurrent(db, projectId)) {
+      return { applied: false, reindexed: 0, counts };
+    }
+
+    let targets: string[];
+    if (modifiedPaths !== undefined) {
+      targets = [...new Set(modifiedPaths.filter((p) => p.length > 0))];
+    } else {
+      const freshness = checkGraphFreshness(db, projectId, rootDirs);
+      if (!freshness.stale) {
+        return { applied: true, reindexed: 0, counts };
+      }
+      if (freshness.reason !== "modified_files" || !freshness.modified_files?.length) {
+        return { applied: false, reindexed: 0, counts };
+      }
+      targets = freshness.modified_files;
+    }
+
+    if (targets.length === 0) {
+      return { applied: true, reindexed: 0, counts };
+    }
+    if (targets.length > MICRO_REINDEX_MAX_FILES) {
+      return { applied: false, reindexed: 0, counts };
+    }
+
+    const existingRows = db
+      .prepare("SELECT id, root_id, path, hash, mtime_ms FROM files WHERE project_id = ?")
+      .all(projectId) as ExistingFileRow[];
+    const existingByPath = new Map(existingRows.map((row) => [row.path, row]));
+    const idByPath = new Map(existingRows.map((row) => [row.path, row.id]));
+
+    const knownFilesByRoot = new Map<string | null, Set<string>>();
+    for (const row of existingRows) {
+      const { relInRoot } = splitPrefixedPath(row.path, row.root_id);
+      let rootKnown = knownFilesByRoot.get(row.root_id);
+      if (!rootKnown) {
+        rootKnown = new Set<string>();
+        knownFilesByRoot.set(row.root_id, rootKnown);
+      }
+      rootKnown.add(relInRoot);
+    }
+
+    const rootMetaById = new Map<string | null, { absRoot: string; realRoot: string }>();
+    for (const rootDir of rootDirs) {
+      const absRoot = resolve(rootDir.dir);
+      try {
+        const lst = await lstat(absRoot);
+        if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+        const realRoot = await realpath(absRoot);
+        rootMetaById.set(rootDir.rootId, { absRoot, realRoot });
+      } catch {
+        // Ignore unavailable root
+      }
+    }
+
+    const gitignoreCacheByRoot = new Map<string, Map<string, GitignoreRule[]>>();
+    const resolveImportsForEntry = createImportResolver(knownFilesByRoot);
+    const mtimeOnlyUpdates: Array<{ id: number; mtimeMs: number }> = [];
+    const modifiedFiles: Array<{
+      id: number;
+      hash: string;
+      mtimeMs: number;
+      symbols: Array<{ name: string; kind: string; line: number }>;
+      imports: ResolvedEdgeTarget[];
+    }> = [];
+
+    for (const targetPath of targets) {
+      const existing = existingByPath.get(targetPath);
+      if (!existing) {
+        return { applied: false, reindexed: 0, counts };
+      }
+      const rootMeta = rootMetaById.get(existing.root_id);
+      if (!rootMeta) {
+        return { applied: false, reindexed: 0, counts };
+      }
+      const { prefix, relInRoot } = splitPrefixedPath(existing.path, existing.root_id);
+      const ext = extname(relInRoot).toLowerCase();
+      if (!CODE_EXT.has(ext)) {
+        return { applied: false, reindexed: 0, counts };
+      }
+
+      const candidate = resolve(rootMeta.absRoot, relInRoot);
+      if (toRelInsideRoot(rootMeta.absRoot, candidate) !== relInRoot) {
+        return { applied: false, reindexed: 0, counts };
+      }
+
+      let gitignoreCache = gitignoreCacheByRoot.get(rootMeta.realRoot);
+      if (!gitignoreCache) {
+        gitignoreCache = new Map<string, GitignoreRule[]>();
+        gitignoreCacheByRoot.set(rootMeta.realRoot, gitignoreCache);
+      }
+      if (await isMicroPathIgnoredOrUnsafe(rootMeta.realRoot, relInRoot, gitignoreCache)) {
+        return { applied: false, reindexed: 0, counts };
+      }
+
+      let mtimeMs: number;
+      let realFile: string;
+      try {
+        const lst = await lstat(candidate);
+        if (lst.isSymbolicLink() || !lst.isFile() || lst.size > maxFileBytes) {
+          return { applied: false, reindexed: 0, counts };
+        }
+        realFile = await realpath(candidate);
+        if (!isWithinRoot(rootMeta.realRoot, realFile)) {
+          return { applied: false, reindexed: 0, counts };
+        }
+        mtimeMs = Math.floor(lst.mtimeMs);
+      } catch {
+        return { applied: false, reindexed: 0, counts };
+      }
+
+      const content = await readBoundedUtf8File(realFile, rootMeta.realRoot, maxFileBytes);
+      if (content === null) {
+        return { applied: false, reindexed: 0, counts };
+      }
+
+      const contentHash = hash(content);
+      if (existing.hash === contentHash) {
+        if (existing.mtime_ms !== mtimeMs) {
+          mtimeOnlyUpdates.push({ id: existing.id, mtimeMs });
+        }
+        continue;
+      }
+
+      const symbols = parseSymbols(content, ext);
+      const imports = resolveImportsForEntry(
+        {
+          rootId: existing.root_id,
+          realRoot: rootMeta.realRoot,
+          prefix,
+          full: realFile,
+          relInRoot,
+          ext,
+        },
+        content,
+      );
+      modifiedFiles.push({ id: existing.id, hash: contentHash, mtimeMs, symbols, imports });
+    }
+
+    if (mtimeOnlyUpdates.length === 0 && modifiedFiles.length === 0) {
+      return { applied: true, reindexed: 0, counts };
+    }
+
+    const useSavepoint = typeof dbOrPath !== "string";
+    db.exec(useSavepoint ? "SAVEPOINT graph_micro_reindex" : "BEGIN IMMEDIATE");
+    try {
+      const updateMtime = db.prepare("UPDATE files SET mtime_ms = ? WHERE id = ?");
+      const updateFile = db.prepare("UPDATE files SET hash = ?, mtime_ms = ? WHERE id = ?");
+      const deleteSymbolsForFile = db.prepare(
+        "DELETE FROM symbols WHERE project_id = ? AND file_id = ?",
+      );
+      const deleteEdgesForFile = db.prepare(
+        "DELETE FROM edges WHERE project_id = ? AND from_file_id = ?",
+      );
+      const insertSymbol = db.prepare(
+        "INSERT INTO symbols (project_id, file_id, name, kind, line) VALUES (?, ?, ?, ?, ?)",
+      );
+      const insertEdge = db.prepare(
+        "INSERT INTO edges (project_id, kind, from_file_id, to_file_id, label) VALUES (?, ?, ?, ?, ?)",
+      );
+
+      for (const item of mtimeOnlyUpdates) {
+        updateMtime.run(item.mtimeMs, item.id);
+      }
+
+      for (const item of modifiedFiles) {
+        updateFile.run(item.hash, item.mtimeMs, item.id);
+        deleteSymbolsForFile.run(projectId, item.id);
+        deleteEdgesForFile.run(projectId, item.id);
+        for (const symbol of item.symbols) {
+          insertSymbol.run(projectId, item.id, symbol.name, symbol.kind, symbol.line);
+        }
+        for (const edge of item.imports) {
+          const toId = idByPath.get(edge.to);
+          insertEdge.run(projectId, edge.kind, item.id, toId ?? null, edge.to);
+        }
+      }
+
+      db.exec(useSavepoint ? "RELEASE SAVEPOINT graph_micro_reindex" : "COMMIT");
+    } catch (error) {
+      db.exec(
+        useSavepoint
+          ? "ROLLBACK TO SAVEPOINT graph_micro_reindex; RELEASE SAVEPOINT graph_micro_reindex"
+          : "ROLLBACK",
+      );
+      throw error;
+    }
+
+    return {
+      applied: true,
+      reindexed: mtimeOnlyUpdates.length + modifiedFiles.length,
+      counts: readGraphCounts(db, projectId),
     };
   });
 }

@@ -882,17 +882,46 @@ program
           ...rootsRes.roots.map((r) => ({ rootId: r.id, dir: r.path })),
         ];
 
-        const { getGraphCounts, getGraphIndexFastPathState, indexProjectGraph } = await import(
-          "./db/graph-index.js"
-        );
+        const {
+          getGraphCounts,
+          getGraphIndexFastPathState,
+          indexProjectGraph,
+          MICRO_REINDEX_MAX_FILES,
+          microReindexModifiedFiles,
+        } = await import("./db/graph-index.js");
         const canFastPath = Boolean((opts.summary || opts.impact) && !opts.force);
         const fastState = canFastPath
           ? getGraphIndexFastPathState(dbPath, config.project_id, rootDirs)
           : undefined;
         const skippedIndex = Boolean(fastState && fastState.indexed_files > 0 && !fastState.stale);
-        const result = skippedIndex
-          ? getGraphCounts(dbPath, config.project_id)
-          : await indexProjectGraph(dbPath, config.project_id, root, { rebuildEdges: opts.force });
+        let result: Awaited<ReturnType<typeof indexProjectGraph>>;
+        if (skippedIndex) {
+          result = getGraphCounts(dbPath, config.project_id);
+        } else if (
+          canFastPath &&
+          fastState &&
+          fastState.indexed_files > 0 &&
+          fastState.reason === "modified_files" &&
+          fastState.modified_files &&
+          fastState.modified_files.length > 0 &&
+          fastState.modified_files.length <= MICRO_REINDEX_MAX_FILES
+        ) {
+          const micro = await microReindexModifiedFiles(
+            dbPath,
+            config.project_id,
+            rootDirs,
+            fastState.modified_files,
+          );
+          result = micro.applied
+            ? micro.counts
+            : await indexProjectGraph(dbPath, config.project_id, root, {
+                rebuildEdges: opts.force,
+              });
+        } else {
+          result = await indexProjectGraph(dbPath, config.project_id, root, {
+            rebuildEdges: opts.force,
+          });
+        }
 
         const includeTests = Boolean(opts.includeTests);
         const wantDoc = opts.writeDoc !== undefined && opts.writeDoc !== false;

@@ -1,15 +1,26 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { CatenextConfigSchema, type McpToolName } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import {
+  LoggingMessageNotificationSchema,
+  ResourceUpdatedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { indexProjectGraph } from "../db/graph-index.js";
 import { LocalService } from "../local-service.js";
 import { ROLE_TOOLS } from "./catalog.js";
-import { createCatenextMcpServer, LOCAL_TOOLS, type ServerContext } from "./server.js";
+import {
+  createCatenextMcpServer,
+  LOCAL_TOOLS,
+  SERVER_INSTRUCTIONS,
+  type ServerContext,
+} from "./server.js";
 import type { McpTransport } from "./stdio.js";
 
 const TASK = "11111111-2222-4333-8444-555555555555";
@@ -414,7 +425,7 @@ describe("server MCP catenext", () => {
   it("tools/list mengembalikan schema ringkas tanpa regex UUID panjang namun validasi runtime tetap ketat", async () => {
     const { client, calls } = await setup();
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(29);
+    expect(tools).toHaveLength(LOCAL_TOOLS.length);
     for (const t of tools) {
       expect(t.description ?? "").not.toContain("\n");
       expect((t.description ?? "").trim().split(/\s+/).length).toBeLessThanOrEqual(12);
@@ -431,7 +442,7 @@ describe("server MCP catenext", () => {
   it("tools/list menyertakan MCP annotations pada setiap tool", async () => {
     const { client } = await setup();
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(29);
+    expect(tools).toHaveLength(LOCAL_TOOLS.length);
     for (const t of tools) {
       expect(t.annotations).toBeDefined();
       expect(typeof t.annotations?.readOnlyHint).toBe("boolean");
@@ -735,8 +746,9 @@ describe("server MCP catenext", () => {
 
     expect(client.getServerCapabilities()).toMatchObject({
       tools: {},
-      resources: {},
+      resources: { subscribe: true },
       prompts: {},
+      logging: {},
     });
 
     const listed = await client.listResources();
@@ -1095,5 +1107,404 @@ describe("server MCP catenext", () => {
     expect(callReply.result.content).toEqual([
       { type: "text", text: JSON.stringify({ ready: 1, blocked: 0, draft: 0 }) },
     ]);
+  });
+
+  it("supports resources/subscribe, resources/unsubscribe, and emits notifications/resources/updated on mutations", async () => {
+    const updatedUris: string[] = [];
+    const { client } = await setup((call) => {
+      if (call.name === "save_document") {
+        const { slug } = call.body as { slug: string };
+        if (slug === "fail-doc") throw new Error("Simulated failure");
+        return { slug, version: 2 };
+      }
+      if (call.name === "archive_document" || call.name === "restore_document") {
+        return { ok: true };
+      }
+      if (call.name === "complete_handoff") {
+        return { task_id: TASK, status: "NEEDS_REVIEW", unlocked_task_ids: [] };
+      }
+      return { ok: 1 };
+    });
+
+    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+      updatedUris.push(notification.params.uri);
+    });
+
+    const docUri = "catenext://documents/sync-board";
+    const handoffUri = `catenext://handoffs/${TASK}`;
+
+    await client.subscribeResource({ uri: docUri });
+    await client.subscribeResource({ uri: handoffUri });
+
+    await expect(client.subscribeResource({ uri: "catenext://unknown/foo" })).rejects.toMatchObject(
+      {
+        code: -32002,
+      },
+    );
+    await expect(client.subscribeResource({ uri: "" })).rejects.toMatchObject({
+      code: -32602,
+    });
+
+    await client.callTool({
+      name: "save_document",
+      arguments: {
+        slug: "sync-board",
+        title: "Sync Board",
+        kind: "decision",
+        content: "# Updated",
+        expected_version: 1,
+      },
+    });
+    await client.callTool({
+      name: "archive_document",
+      arguments: { slug: "sync-board" },
+    });
+    await client.callTool({
+      name: "restore_document",
+      arguments: { slug: "sync-board" },
+    });
+    await client.callTool({
+      name: "save_document",
+      arguments: {
+        slug: "other-doc",
+        title: "Other",
+        kind: "decision",
+        content: "# Other",
+        expected_version: 0,
+      },
+    });
+    await client.callTool({
+      name: "complete_handoff",
+      arguments: { lease_id: TASK, task_id: TASK, handoff_summary: HANDOFF },
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(updatedUris).toEqual([docUri, docUri, docUri, handoffUri]);
+
+    // Unsubscribe and verify no further notifications for docUri
+    await client.unsubscribeResource({ uri: docUri });
+    await client.callTool({
+      name: "save_document",
+      arguments: {
+        slug: "sync-board",
+        title: "Sync Board",
+        kind: "decision",
+        content: "# Updated again",
+        expected_version: 2,
+      },
+    });
+    // Failed mutation should not notify even if subscribed
+    await client.subscribeResource({ uri: "catenext://documents/fail-doc" });
+    const failed = await client.callTool({
+      name: "save_document",
+      arguments: {
+        slug: "fail-doc",
+        title: "Fail",
+        kind: "decision",
+        content: "# Fail",
+        expected_version: 0,
+      },
+    });
+    expect(failed.isError).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(updatedUris).toEqual([docUri, docUri, docUri, handoffUri]);
+  });
+
+  it("supports logging/setLevel and emits structured notifications/message filtered by severity", async () => {
+    const messages: Array<{ level: string; logger?: string; data: unknown }> = [];
+    const { client } = await setup();
+
+    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+      messages.push({
+        level: notification.params.level,
+        logger: notification.params.logger,
+        data: notification.params.data,
+      });
+    });
+
+    await expect(
+      client.setLoggingLevel("verbose" as Parameters<typeof client.setLoggingLevel>[0]),
+    ).rejects.toMatchObject({ code: -32602 });
+
+    await client.setLoggingLevel("warning");
+    await client.callTool({ name: "session_brief", arguments: {} });
+    await client.callTool({ name: "claim_task", arguments: { task_id: "not-a-uuid" } });
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(messages).toEqual([
+      {
+        level: "warning",
+        logger: "catenext.mcp",
+        data: { event: "tools/call", tool: "claim_task", ok: false },
+      },
+    ]);
+
+    messages.length = 0;
+    await client.setLoggingLevel("debug");
+    await client.subscribeResource({ uri: "catenext://documents/sync-board" });
+    await client.callTool({ name: "session_brief", arguments: {} });
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(messages).toEqual([
+      {
+        level: "info",
+        logger: "catenext.mcp",
+        data: { event: "logging/setLevel", level: "debug" },
+      },
+      {
+        level: "debug",
+        logger: "catenext.mcp",
+        data: { event: "resources/subscribe", uri: "catenext://documents/sync-board" },
+      },
+      {
+        level: "info",
+        logger: "catenext.mcp",
+        data: { event: "tools/call", tool: "session_brief", ok: true },
+      },
+    ]);
+  });
+
+  it("references --role reviewer and worktree_status in SERVER_INSTRUCTIONS and workflow prompts", async () => {
+    expect(SERVER_INSTRUCTIONS).toContain("--role reviewer");
+    expect(SERVER_INSTRUCTIONS).toContain("worktree_status");
+
+    const { client } = await setup();
+    const { prompts } = await client.listPrompts();
+    const rcPrompt = prompts.find((p) => p.name === "rc-review");
+    expect(rcPrompt?.description).toContain("--role reviewer");
+
+    const rcRendered = await client.getPrompt({
+      name: "rc-review",
+      arguments: { task_id: TASK },
+    });
+    const rcText = (rcRendered.messages[0]?.content as { text?: string } | undefined)?.text;
+    expect(rcText).toContain("worktree_status");
+
+    const kickoffRendered = await client.getPrompt({
+      name: "kickoff-brainstorm",
+      arguments: { goal: "Ship MCP v0.19" },
+    });
+    const kickoffText = (kickoffRendered.messages[0]?.content as { text?: string } | undefined)
+      ?.text;
+    expect(kickoffText).toContain("worktree_status");
+  });
+
+  it("rejects epic_run start over JSON-RPC without forwarding to the service", async () => {
+    const { client, calls } = await setup(undefined, undefined, "orchestrator");
+    const result = await client.callTool({
+      name: "epic_run",
+      arguments: {
+        epic_id: TASK,
+        action: "start",
+        base: "main",
+        check: "pnpm test",
+        snapshot: "a".repeat(64),
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(`catenext epic run start ${TASK}`);
+    expect(calls).toEqual([]);
+  });
+
+  it("executes worktree_status, bounded epic_run, and compact/filtered get_project_board via LocalService", async () => {
+    const execGit = promisify(execFile);
+    const repoDir = await mkdtemp(join(tmpdir(), "catenext-mcp-tools-"));
+    try {
+      await execGit("git", ["init", "-b", "main"], { cwd: repoDir });
+      await execGit("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+      await execGit("git", ["config", "user.name", "Test"], { cwd: repoDir });
+      await mkdir(join(repoDir, "src"), { recursive: true });
+      await writeFile(join(repoDir, ".gitignore"), ".catenext/\n");
+      await writeFile(join(repoDir, "src/index.ts"), "export const v = 1;\n");
+      await execGit("git", ["add", "."], { cwd: repoDir });
+      await execGit("git", ["commit", "-m", "init"], { cwd: repoDir });
+      await writeFile(join(repoDir, "src/dirty.ts"), "export const dirty = true;\n");
+
+      const config = CatenextConfigSchema.parse({
+        schema_version: 1,
+        project_id: randomUUID(),
+        repo_name: "api",
+        state_file: ".catenext/catenext.sqlite",
+      });
+      const human = new LocalService(repoDir, config, "human");
+      await human.ensureSeed();
+      const agent = new LocalService(repoDir, config, "agent");
+
+      const { epic } = (await human.callTool("create_epic", {
+        title: "Bounded MCP Epic",
+      })) as { epic: { id: string } };
+      const longTitle = `Implement bounded epic run and compact board support with extra descriptive context ${"x".repeat(40)}`;
+      const { created } = await human.callTool("create_tasks", {
+        epic_id: epic.id,
+        tasks: [
+          {
+            ref: "t1",
+            title: longTitle,
+            prompt_instruction: "Edit src/a.ts only",
+            target_repo: "api",
+            persona: "be",
+            scope_files: ["src/a.ts"],
+            verify_command: "pnpm test",
+          },
+          {
+            ref: "t2",
+            title: "Second bounded task",
+            prompt_instruction: "Edit src/b.ts after t1",
+            depends_on: ["t1"],
+            target_repo: "api",
+            persona: "be",
+            scope_files: ["src/b.ts"],
+            verify_command: "pnpm test",
+          },
+        ],
+      });
+
+      const server = createCatenextMcpServer({
+        version: "test",
+        role: "orchestrator",
+        context: async () => ({ ok: true, service: agent, root: repoDir }),
+        log: () => {},
+      });
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "claude-code", version: "1.0.0" });
+      const transport: McpTransport = {
+        async start() {
+          a.onmessage = transport.onmessage;
+          a.onclose = transport.onclose;
+          await a.start();
+        },
+        close: () => a.close(),
+        send: (msg) => a.send("error" in msg ? { ...msg, id: msg.id ?? undefined } : msg),
+      };
+      await Promise.all([server.connect(transport), client.connect(b)]);
+
+      try {
+        // 1. worktree_status
+        const wtRes = await client.callTool({ name: "worktree_status", arguments: {} });
+        expect(wtRes.isError).toBeUndefined();
+        const wtData = JSON.parse(textOf(wtRes)) as {
+          worktrees: Array<{
+            branch: string | null;
+            dirty_count: number;
+            modified_files: string[];
+          }>;
+          overlaps: unknown[];
+        };
+        expect(wtData.worktrees).toHaveLength(1);
+        expect(wtData.worktrees[0]).toMatchObject({
+          branch: "main",
+          dirty_count: 1,
+          modified_files: ["src/dirty.ts"],
+        });
+        expect(wtData.overlaps).toEqual([]);
+
+        // 2. get_project_board: default vs compact + filtering
+        const fullRes = await client.callTool({
+          name: "get_project_board",
+          arguments: { epic_id: epic.id },
+        });
+        const compactRes = await client.callTool({
+          name: "get_project_board",
+          arguments: { epic_id: epic.id, compact: true, status: ["DRAFT"], limit: 1 },
+        });
+        const fullBoard = JSON.parse(textOf(fullRes)) as {
+          repos: unknown[];
+          personas: unknown[];
+          tasks: Array<{ title: string }>;
+          truncated: boolean;
+        };
+        const compactBoard = JSON.parse(textOf(compactRes)) as {
+          repos: unknown[];
+          personas: unknown[];
+          tasks: Array<{ title: string }>;
+          truncated: boolean;
+        };
+        expect(fullBoard.personas.length).toBeGreaterThan(0);
+        expect(fullBoard.repos.length).toBeGreaterThan(0);
+        expect(fullBoard.tasks).toHaveLength(2);
+        expect(fullBoard.truncated).toBe(false);
+        expect(compactBoard.personas).toEqual([]);
+        expect(compactBoard.repos).toEqual([]);
+        expect(compactBoard.tasks).toHaveLength(1);
+        expect(compactBoard.tasks[0]?.title.length).toBeLessThanOrEqual(60);
+        expect(compactBoard.truncated).toBe(true);
+        expect(textOf(compactRes).length).toBeLessThan(textOf(fullRes).length);
+
+        // 3. epic_run: preview via MCP, start blocked for agent, start via human CLI boundary, then resume/pause/close via MCP
+        const previewRes = await client.callTool({
+          name: "epic_run",
+          arguments: { epic_id: epic.id, action: "preview", base: "main", check: "pnpm test" },
+        });
+        expect(previewRes.isError).toBeUndefined();
+        const preview = JSON.parse(textOf(previewRes)) as {
+          snapshot: string;
+          integration_branch: string;
+          max_worktrees: number;
+          max_revisions_per_task: number;
+        };
+        expect(preview.snapshot).toMatch(/^[a-f0-9]{64}$/);
+        expect(preview.max_worktrees).toBe(2);
+        expect(preview.max_revisions_per_task).toBe(2);
+
+        await expect(
+          agent.callTool("epic_run", {
+            epic_id: epic.id,
+            action: "start",
+            base: "main",
+            check: "pnpm test",
+            snapshot: preview.snapshot,
+          }),
+        ).rejects.toMatchObject({ code: "human_approval_required" });
+
+        await human.epicRun(epic.id, {
+          action: "start",
+          base: "main",
+          check: "pnpm test",
+          snapshot: preview.snapshot,
+        });
+
+        const resumeRes = await client.callTool({
+          name: "epic_run",
+          arguments: { epic_id: epic.id, action: "resume" },
+        });
+        const resumed = JSON.parse(textOf(resumeRes)) as {
+          status: string;
+          host_mode: string;
+          unattended_supported: boolean;
+          eligible: string[];
+        };
+        expect(resumed).toMatchObject({
+          status: "RUNNING",
+          host_mode: "stepped",
+          unattended_supported: false,
+          eligible: [created[0]?.task_id],
+        });
+
+        const pauseRes = await client.callTool({
+          name: "epic_run",
+          arguments: { epic_id: epic.id, action: "pause", reason: "Waiting for human check" },
+        });
+        expect(JSON.parse(textOf(pauseRes))).toMatchObject({
+          status: "PAUSED",
+          reason: "Waiting for human check",
+          eligible: [],
+        });
+
+        const closeRes = await client.callTool({
+          name: "epic_run",
+          arguments: { epic_id: epic.id, action: "close" },
+        });
+        expect(JSON.parse(textOf(closeRes))).toMatchObject({
+          status: "CLOSED",
+          eligible: [],
+        });
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
   });
 });

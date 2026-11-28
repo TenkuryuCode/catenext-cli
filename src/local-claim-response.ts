@@ -4,7 +4,10 @@ import type { LocalTask } from "./local-state.js";
 type ClaimResult = McpToolOutput<"claim_task">;
 
 export function dependencyHandoffs(task: LocalTask, tasks: ReadonlyMap<string, LocalTask>) {
+  const seen = new Set<string>();
   return task.dependencies.flatMap((id) => {
+    if (seen.has(id)) return [];
+    seen.add(id);
     const dep = tasks.get(id);
     if (!dep?.handoff) return [];
     const integrated =

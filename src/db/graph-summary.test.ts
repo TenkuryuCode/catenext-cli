@@ -4,13 +4,21 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { CatenextConfigSchema, GraphImpactOutput, GraphSummaryOutput } from "@catenext/shared";
+import {
+  CatenextConfigSchema,
+  CLAIM_CONTEXT_PACK_MAX_BYTES,
+  GraphImpactOutput,
+  GraphSummaryOutput,
+} from "@catenext/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { boundClaimContextPack, snapshotClaimContext } from "../local-claim-context.js";
 import { LocalService } from "../local-service.js";
+import type { LocalProject, LocalTask } from "../local-state.js";
 import { indexProjectGraph } from "./graph-index.js";
 import {
   analyzeGraphImpact,
   groupForPath,
+  mapScopeFilesToTests,
   renderArchitectureMarkdown,
   renderImpactMarkdown,
   summarizeProjectGraph,
@@ -689,5 +697,134 @@ describe("analyzeGraphImpact", () => {
     expect(md).toContain("# Impact analysis: `src/core.ts`");
     expect(md).toContain("stale (modified_files)");
     expect(md).toContain("| `src/service.ts` | 1 | direct | - | 1 |");
+  });
+});
+
+describe("mapScopeFilesToTests & ClaimContextPack", () => {
+  it("maps scope_files to related tests via reverse edges and naming conventions", async () => {
+    await mkdir(join(root, "src/auth"), { recursive: true });
+    await mkdir(join(root, "src/billing/__tests__"), { recursive: true });
+    await mkdir(join(root, "tests/auth"), { recursive: true });
+    await mkdir(join(root, "pkg"), { recursive: true });
+    await mkdir(join(root, "py"), { recursive: true });
+
+    await writeFile(join(root, "src/auth/login.ts"), "export function login() { return true; }\n");
+    await writeFile(
+      join(root, "src/auth/service.ts"),
+      `import { login } from "./login.js";\nexport function runAuth() { return login(); }\n`,
+    );
+    await writeFile(
+      join(root, "src/auth/login.spec.ts"),
+      `import { login } from "./login.js";\nexport const t1 = login();\n`,
+    );
+    await writeFile(
+      join(root, "tests/auth/service.test.ts"),
+      `import { runAuth } from "../../src/auth/service.js";\nexport const t2 = runAuth();\n`,
+    );
+    await writeFile(join(root, "src/billing/index.ts"), "export function charge() { return 1; }\n");
+    await writeFile(
+      join(root, "src/billing/__tests__/billing.test.ts"),
+      "export const bTest = 1;\n",
+    );
+    await writeFile(join(root, "pkg/store.go"), "package pkg\nfunc Store() {}\n");
+    await writeFile(join(root, "pkg/store_test.go"), "package pkg\nfunc TestStore() {}\n");
+    await writeFile(join(root, "py/worker.py"), "def work():\n    return 1\n");
+    await writeFile(join(root, "py/test_worker.py"), "def test_work():\n    assert True\n");
+
+    await indexProjectGraph(dbPath, projectId, root);
+
+    // Direct + transitive reverse edges + naming match
+    expect(mapScopeFilesToTests(dbPath, projectId, ["src/auth/login.ts"])).toEqual([
+      "src/auth/login.spec.ts",
+      "tests/auth/service.test.ts",
+    ]);
+
+    // Depth=1 excludes transitive 2-hop test
+    expect(mapScopeFilesToTests(dbPath, projectId, ["src/auth/login.ts"], { depth: 1 })).toEqual([
+      "src/auth/login.spec.ts",
+    ]);
+
+    // Entry-file naming match (index.ts -> __tests__/billing.test.ts), Go & Python naming
+    expect(mapScopeFilesToTests(dbPath, projectId, ["src/billing/index.ts"])).toEqual([
+      "src/billing/__tests__/billing.test.ts",
+    ]);
+    expect(mapScopeFilesToTests(dbPath, projectId, ["pkg/store.go"])).toEqual([
+      "pkg/store_test.go",
+    ]);
+    expect(mapScopeFilesToTests(dbPath, projectId, ["py/worker.py"])).toEqual([
+      "py/test_worker.py",
+    ]);
+  });
+
+  it("populates pack.test_files in snapshotClaimContext and stays within 4096 B cap", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/engine.ts"), `export function runEngine() { return 42; }\n`);
+    await writeFile(
+      join(root, "src/engine.test.ts"),
+      `import { runEngine } from "./engine.js";\nexport const ok = runEngine();\n`,
+    );
+    await indexProjectGraph(dbPath, projectId, root);
+
+    const project: LocalProject = {
+      repos: ["default"],
+      epics: [],
+      personas: [],
+      tasks: [],
+      documents: [],
+      permissions: [],
+      workspace_roots: [],
+      session_prefs: {},
+      platform_setup: [],
+    };
+    const task = {
+      id: randomUUID(),
+      epicId: null,
+      title: "Engine task",
+      description: "",
+      status: "IN_PROGRESS",
+      role: "backend",
+      persona: "be",
+      priority: 1,
+      depends_on: [],
+      blocks: [],
+      scope_files: ["src/engine.ts"],
+      doc_refs: [],
+      verify_command: null,
+      prompt_instruction: null,
+      acceptance_criteria: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+    } as unknown as LocalTask;
+
+    const db = openDatabaseAt(dbPath);
+    try {
+      const snap = snapshotClaimContext({
+        project,
+        task,
+        db,
+        projectId,
+        graphRootDirs: () => [{ rootId: null, dir: root }],
+      });
+      expect(snap.pack.test_files).toEqual(["src/engine.test.ts"]);
+      const fitted = boundClaimContextPack(snap.pack);
+      expect(fitted.test_files).toEqual(["src/engine.test.ts"]);
+      expect(Buffer.byteLength(JSON.stringify(fitted), "utf8")).toBeLessThanOrEqual(
+        CLAIM_CONTEXT_PACK_MAX_BYTES,
+      );
+
+      // When pack exceeds 4096 B, boundClaimContextPack drops test_files to stay within cap.
+      const oversizedPack = {
+        ...snap.pack,
+        sync_board_excerpt: "x".repeat(4050),
+      };
+      const bounded = boundClaimContextPack(oversizedPack);
+      expect(bounded.truncated).toBe(true);
+      expect(bounded.test_files).toBeUndefined();
+      expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+        CLAIM_CONTEXT_PACK_MAX_BYTES,
+      );
+    } finally {
+      db.close();
+    }
   });
 });

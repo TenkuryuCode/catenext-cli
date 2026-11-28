@@ -10,6 +10,7 @@ import { z } from "zod";
 import {
   buildMcpToolCatalog,
   compactJsonSchema,
+  MCP_ROLES,
   ROLE_TOOLS,
   TOOL_ANNOTATIONS,
   TOOL_DESCRIPTIONS,
@@ -108,6 +109,7 @@ describe("MCP tool catalog compaction & role filtering", () => {
       "symbol_search",
       "graph_summary",
       "graph_impact",
+      "worktree_status",
     ] as const;
     for (const name of readOnlyTools) {
       expect(TOOL_ANNOTATIONS[name]).toEqual({
@@ -117,6 +119,13 @@ describe("MCP tool catalog compaction & role filtering", () => {
         openWorldHint: false,
       });
     }
+
+    expect(TOOL_ANNOTATIONS.epic_run).toEqual({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
 
     const destructiveTools = [
       "cancel_task",
@@ -148,14 +157,17 @@ describe("MCP tool catalog compaction & role filtering", () => {
   });
 
   it("filters tool lists by role and preserves full default tool set", () => {
+    expect(MCP_ROLES).toEqual(["orchestrator", "worker", "reviewer"]);
     expect(toolsForRole()).toEqual(MCP_TOOL_NAMES.filter((name) => !isMcpCrudTool(name)));
-    expect(toolsForRole()).toHaveLength(29);
+    expect(toolsForRole()).toHaveLength(31);
 
     const orch = toolsForRole("orchestrator");
     expect(orch).toEqual([...ROLE_TOOLS.orchestrator]);
     expect(orch).toContain("session_brief");
     expect(orch).toContain("create_tasks");
     expect(orch).toContain("manage_task");
+    expect(orch).toContain("worktree_status");
+    expect(orch).toContain("epic_run");
     expect(orch).not.toContain("claim_task");
     expect(orch).not.toContain("complete_handoff");
 
@@ -164,15 +176,38 @@ describe("MCP tool catalog compaction & role filtering", () => {
     expect(worker).toContain("get_ready_tasks");
     expect(worker).toContain("claim_task");
     expect(worker).toContain("complete_handoff");
+    expect(worker).not.toContain("save_repo_skill");
     expect(worker).not.toContain("create_tasks");
     expect(worker).not.toContain("manage_task");
     expect(worker).not.toContain("upsert_persona");
 
+    const reviewer = toolsForRole("reviewer");
+    expect(reviewer).toEqual([...ROLE_TOOLS.reviewer]);
+    expect(reviewer).toContain("get_project_board");
+    expect(reviewer).toContain("get_project_context");
+    expect(reviewer).toContain("list_epics");
+    expect(reviewer).toContain("get_document");
+    expect(reviewer).toContain("search_context");
+    expect(reviewer).toContain("load_skill");
+    expect(reviewer).toContain("graph_neighbors");
+    expect(reviewer).toContain("symbol_search");
+    expect(reviewer).toContain("graph_summary");
+    expect(reviewer).toContain("graph_impact");
+    expect(reviewer).toContain("review_pull_request");
+    expect(reviewer).not.toContain("claim_task");
+    expect(reviewer).not.toContain("complete_handoff");
+    expect(reviewer).not.toContain("save_document");
+    expect(reviewer).not.toContain("save_repo_skill");
+    expect(reviewer).not.toContain("manage_task");
+    expect(reviewer).not.toContain("epic_run");
+
     expect(buildMcpToolCatalog("worker").length).toBe(worker.length);
     expect(buildMcpToolCatalog("orchestrator").length).toBe(orch.length);
+    expect(buildMcpToolCatalog("reviewer").length).toBe(reviewer.length);
     expect(toolsForRole(undefined, true)).toEqual([...MCP_TOOL_NAMES]);
     expect(toolsForRole("orchestrator", true)).toEqual([...orch, ...MCP_CRUD_TOOLS]);
     expect(toolsForRole("worker", true)).toEqual(worker);
+    expect(toolsForRole("reviewer", true)).toEqual(reviewer);
   });
 
   it("attaches compact object outputSchema to every tool in the catalog", () => {

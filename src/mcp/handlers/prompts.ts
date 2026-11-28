@@ -49,7 +49,7 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
                 "1. Call session_brief and read catenext://documents/sync-board (get_document).",
                 "2. Align on shared decisions, API/schema contracts, and open asks across the involved personas.",
                 "3. Save compact outcomes to slug `sync-board` via save_document (no secrets, no code dumps, paths only).",
-                "4. Confirm DRAFT/TODO tasks, dependencies, and isolated worktree boundaries before delegating.",
+                "4. Inspect active worktrees via worktree_status and confirm DRAFT/TODO tasks, dependencies, and isolated worktree boundaries before delegating.",
               ].join("\n"),
             },
           },
@@ -62,7 +62,7 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
       name: "rc-review",
       title: "Release Candidate Review",
       description:
-        "Review a completed task handoff or release candidate for correctness, scope, and verification evidence.",
+        "Review a completed task handoff or release candidate for correctness, scope, and verification evidence (prefer MCP --role reviewer).",
       arguments: [
         {
           name: "task_id",
@@ -90,7 +90,7 @@ const PROMPT_DEFINITIONS: PromptDefinition[] = [
                 focusLine ? focusLine.trimEnd() : undefined,
                 "",
                 "Steps:",
-                `1. Inspect task details via get_project_board (task_id: ${args.task_id}) and read catenext://handoffs/${args.task_id}.`,
+                `1. Inspect task details via get_project_board (task_id: ${args.task_id}), check worktree_status for dirty/ahead state or overlaps, and read catenext://handoffs/${args.task_id}.`,
                 "2. Verify scope adherence, changed files, test/lint/typecheck evidence, and that no credentials or secrets were exposed.",
                 "3. If issues exist, request revision on the same task with actionable feedback; otherwise submit review_pull_request recommendation or present the APPROVAL NEEDED card for human confirmation (catenext review approve).",
               ]

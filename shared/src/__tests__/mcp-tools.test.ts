@@ -5,7 +5,10 @@ import {
   ClaimTaskOutput,
   CompleteHandoffInput,
   CreateTasksInput,
+  EpicRunInput,
+  EpicRunOutput,
   findCycle,
+  GetProjectBoardInput,
   GetReadyTasksInput,
   GraphImpactInput,
   GraphImpactOutput,
@@ -18,6 +21,8 @@ import {
   SearchContextInput,
   SymbolSearchOutput,
   UpsertPersonaInput,
+  WorktreeStatusInput,
+  WorktreeStatusOutput,
 } from "../index.js";
 
 const EPIC = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
@@ -33,6 +38,7 @@ describe("registry tool MCP", () => {
         "complete_handoff",
         "create_epic",
         "create_tasks",
+        "epic_run",
         "get_document",
         "get_project_board",
         "get_project_context",
@@ -60,6 +66,7 @@ describe("registry tool MCP", () => {
         "update_task",
         "update_epic",
         "upsert_persona",
+        "worktree_status",
       ].sort(),
     );
   });
@@ -439,5 +446,97 @@ describe("findCycle", () => {
         { task: "b", dependsOn: "a" },
       ]),
     ).toEqual(["a", "b", "a"]);
+  });
+});
+
+describe("worktree_status, epic_run, dan get_project_board filtering", () => {
+  const SNAPSHOT = "a".repeat(64);
+
+  it("memvalidasi WorktreeStatusInput dan WorktreeStatusOutput", () => {
+    expect(WorktreeStatusInput.safeParse({}).success).toBe(true);
+    expect(
+      WorktreeStatusOutput.safeParse({
+        worktrees: [
+          {
+            path: "/tmp/wt",
+            branch: "feat/x",
+            head: "abc1234",
+            prunable: false,
+            dirty_count: 1,
+            modified_files: ["src/index.ts"],
+            ahead_count: 2,
+            ahead_files: ["src/index.ts"],
+            lease: { task_id: EXISTING, persona: "be" },
+          },
+        ],
+        overlaps: [{ file: "src/index.ts", worktrees: ["/tmp/wt"] }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("memvalidasi aksi epic_run preview|start|resume|pause|close", () => {
+    expect(
+      EpicRunInput.safeParse({
+        epic_id: EPIC,
+        action: "preview",
+        base: "main",
+        check: "pnpm test",
+      }).success,
+    ).toBe(true);
+    expect(
+      EpicRunInput.safeParse({
+        epic_id: EPIC,
+        action: "preview",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      EpicRunInput.safeParse({
+        epic_id: EPIC,
+        action: "start",
+        base: "main",
+        check: "pnpm test",
+        snapshot: SNAPSHOT,
+      }).success,
+    ).toBe(true);
+    expect(
+      EpicRunInput.safeParse({
+        epic_id: EPIC,
+        action: "start",
+        base: "main",
+        check: "pnpm test",
+      }).success,
+    ).toBe(false);
+
+    expect(EpicRunInput.safeParse({ epic_id: EPIC, action: "resume" }).success).toBe(true);
+    expect(EpicRunInput.safeParse({ epic_id: EPIC, action: "close" }).success).toBe(true);
+    expect(
+      EpicRunInput.safeParse({ epic_id: EPIC, action: "pause", reason: "waiting on schema" })
+        .success,
+    ).toBe(true);
+    expect(EpicRunInput.safeParse({ epic_id: EPIC, action: "pause" }).success).toBe(false);
+    expect(EpicRunInput.safeParse({ epic_id: EPIC, action: "review" }).success).toBe(false);
+
+    expect(
+      EpicRunOutput.safeParse({
+        snapshot: SNAPSHOT,
+        integration_branch: `catenext/run/${EPIC}/integration`,
+        status: "RUNNING",
+        eligible: [EXISTING],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("memvalidasi filtering get_project_board (epic_id, status, limit, compact)", () => {
+    const parsed = GetProjectBoardInput.parse({
+      epic_id: EPIC,
+      status: ["TODO", "IN_PROGRESS"],
+      limit: 25,
+      compact: true,
+    });
+    expect(parsed.epic_id).toBe(EPIC);
+    expect(parsed.status).toEqual(["TODO", "IN_PROGRESS"]);
+    expect(parsed.limit).toBe(25);
+    expect(parsed.compact).toBe(true);
   });
 });

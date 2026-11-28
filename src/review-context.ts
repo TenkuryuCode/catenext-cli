@@ -1,5 +1,9 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { realpathSync, statSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import { devNull } from "node:os";
+import { isAbsolute, resolve } from "node:path";
+import { promisify } from "node:util";
 import {
   briefText,
   REVIEW_CONTEXT_PACK_MAX_BYTES,
@@ -13,6 +17,9 @@ import {
 } from "@catenext/shared";
 import type { LocalProject, LocalReview, LocalTask } from "./local-state.js";
 import { scrubText } from "./scrubber.js";
+import { isWithinRoot } from "./workspace-walk.js";
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_MAX_CHANGED_FILES = 15;
 const COMPACT_MAX_CHANGED_FILES = 5;
@@ -20,6 +27,69 @@ const DEFAULT_MAX_DECISIONS = 5;
 const COMPACT_MAX_DECISIONS = 3;
 const DEFAULT_EXCERPT_LIMIT = 600;
 const COMPACT_EXCERPT_LIMIT = 240;
+export const REVIEW_DIFF_CACHE_MAX_ENTRIES = 64;
+
+const HEX_SHA_RE = /^[0-9a-f]{7,64}$/i;
+const FULL_SHA_RE = /^[0-9a-f]{40,64}$/i;
+
+interface CachedRawGitDiff {
+  realRoot: string;
+  baseBranch: string;
+  baseRef: string;
+  rawFiles: readonly ReviewChangedFile[];
+  additions: number;
+  deletions: number;
+}
+
+const reviewDiffCache = new Map<string, CachedRawGitDiff>();
+
+export function clearReviewContextCache(): void {
+  reviewDiffCache.clear();
+}
+
+export function getReviewContextCacheSize(): number {
+  return reviewDiffCache.size;
+}
+
+function makeDiffCacheKey(taskId: string, headSha: string): string {
+  return `${taskId}\0${headSha.toLowerCase()}`;
+}
+
+function getCachedRawDiff(
+  taskId: string | undefined,
+  headSha: string,
+  realRoot: string,
+  baseBranch: string,
+): CachedRawGitDiff | undefined {
+  if (!taskId) return undefined;
+  const key = makeDiffCacheKey(taskId, headSha);
+  const entry = reviewDiffCache.get(key);
+  if (!entry) return undefined;
+  if (entry.realRoot !== realRoot || entry.baseBranch !== baseBranch) {
+    reviewDiffCache.delete(key);
+    return undefined;
+  }
+  // Refresh LRU order.
+  reviewDiffCache.delete(key);
+  reviewDiffCache.set(key, entry);
+  return entry;
+}
+
+function setCachedRawDiff(
+  taskId: string | undefined,
+  headSha: string,
+  entry: CachedRawGitDiff,
+): void {
+  if (!taskId) return;
+  const key = makeDiffCacheKey(taskId, headSha);
+  if (reviewDiffCache.has(key)) {
+    reviewDiffCache.delete(key);
+  } else if (reviewDiffCache.size >= REVIEW_DIFF_CACHE_MAX_ENTRIES) {
+    const oldest = reviewDiffCache.keys().next().value;
+    if (oldest !== undefined) reviewDiffCache.delete(oldest);
+  }
+  reviewDiffCache.set(key, entry);
+}
 
 type UnsizedReviewContextPack = Omit<ReviewContextPack, "byte_length">;
 
@@ -95,51 +165,207 @@ export function evaluateScopeDrift(
   };
 }
 
-function runGitReadOnly(cwd: string, args: string[]): string | null {
-  const env = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
-  );
+function cleanGitEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+}
+
+function gitBaseArgs(args: readonly string[]): string[] {
+  return [
+    "--no-optional-locks",
+    "--no-replace-objects",
+    "-c",
+    `core.hooksPath=${devNull}`,
+    ...args,
+  ];
+}
+
+function isSafeGitRef(ref: string): boolean {
+  if (!ref || ref.length > 255) return false;
+  if (ref.startsWith("-") || ref.includes("..") || ref.includes("@{")) return false;
+  return !/[\0\r\n\s~^:?*[\\]/.test(ref);
+}
+
+function isValidHeadSha(sha: string): boolean {
+  return HEX_SHA_RE.test(sha);
+}
+
+function resolveGitRootSync(repoRoot: string): string | null {
   try {
-    return execFileSync(
-      "git",
-      ["--no-optional-locks", "--no-replace-objects", "-c", `core.hooksPath=${devNull}`, ...args],
-      {
-        cwd,
-        env,
-        encoding: "utf8",
-        timeout: 1500,
-        maxBuffer: 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const realRoot = realpathSync(repoRoot);
+    return statSync(realRoot).isDirectory() ? realRoot : null;
   } catch {
     return null;
   }
 }
 
-function resolveGitMergeBase(cwd: string, baseBranch: string, headSha: string): string | null {
+async function resolveGitRootAsync(repoRoot: string): Promise<string | null> {
+  try {
+    const realRoot = await realpath(repoRoot);
+    return (await stat(realRoot)).isDirectory() ? realRoot : null;
+  } catch {
+    return null;
+  }
+}
+
+const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
+
+function hasControlChar(value: string): boolean {
+  return Array.from(value).some((ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
+  });
+}
+
+function sanitizeSafeRepoRelPath(rawPath: string): string | null {
+  if (!rawPath || hasControlChar(rawPath)) return null;
+  if (isAbsolute(rawPath) || WINDOWS_DRIVE_RE.test(rawPath)) return null;
+  if (rawPath.startsWith("/") || rawPath.startsWith("\\")) return null;
+  const normalized = normalizePath(rawPath).replace(/^(?:\.\/)+/, "");
+  if (!normalized || normalized === ".") return null;
+  if (WINDOWS_DRIVE_RE.test(normalized) || normalized.startsWith("/")) return null;
+  const segments = normalized.split("/");
+  if (segments.some((seg) => seg === "" || seg === "." || seg === "..")) return null;
+  return normalized;
+}
+
+function isSafeRepoRelPath(realRoot: string, rawPath: string): string | null {
+  const normalized = sanitizeSafeRepoRelPath(rawPath);
+  if (!normalized) return null;
+  const resolved = resolve(realRoot, normalized);
+  return isWithinRoot(realRoot, resolved) ? normalized : null;
+}
+
+function runGitReadOnly(cwd: string, args: string[]): string | null {
+  try {
+    return execFileSync("git", gitBaseArgs(args), {
+      cwd,
+      env: cleanGitEnv(),
+      encoding: "utf8",
+      timeout: 1500,
+      maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function runGitReadOnlyAsync(cwd: string, args: string[]): Promise<string | null> {
+  try {
+    const child = execFileAsync("git", gitBaseArgs(args), {
+      cwd,
+      env: cleanGitEnv(),
+      encoding: "utf8",
+      timeout: 1500,
+      maxBuffer: 1024 * 1024,
+    });
+    child.child.stdin?.end();
+    const { stdout } = await child;
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+function isSameCommitSha(sha: string, headSha: string): boolean {
+  return sha === headSha || sha.toLowerCase().startsWith(headSha.toLowerCase());
+}
+
+function resolveGitMergeBase(realRoot: string, baseBranch: string, headSha: string): string | null {
+  if (!isSafeGitRef(baseBranch) || !isValidHeadSha(headSha)) return null;
   const localRef = `refs/heads/${baseBranch}`;
   const originRef = `refs/remotes/origin/${baseBranch}`;
-  const isSameCommit = (sha: string) =>
-    sha === headSha || sha.toLowerCase().startsWith(headSha.toLowerCase());
 
   for (const ref of [localRef, originRef, baseBranch]) {
-    const out = runGitReadOnly(cwd, ["merge-base", ref, headSha]);
+    const out = runGitReadOnly(realRoot, ["merge-base", "--end-of-options", ref, headSha]);
     const sha = out?.trim();
-    if (!sha || !/^[0-9a-f]{40,64}$/i.test(sha)) continue;
-    if (!isSameCommit(sha)) return sha;
+    if (!sha || !FULL_SHA_RE.test(sha)) continue;
+    if (!isSameCommitSha(sha, headSha)) return sha;
     if (ref === localRef) {
       // Local baseBranch already resolved to headSha; bare baseBranch would resolve identically.
       // Only check origin/<baseBranch> in case local baseBranch has unpushed commits.
-      const originOut = runGitReadOnly(cwd, ["merge-base", originRef, headSha]);
+      const originOut = runGitReadOnly(realRoot, [
+        "merge-base",
+        "--end-of-options",
+        originRef,
+        headSha,
+      ]);
       const originSha = originOut?.trim();
-      if (originSha && /^[0-9a-f]{40,64}$/i.test(originSha) && !isSameCommit(originSha)) {
+      if (originSha && FULL_SHA_RE.test(originSha) && !isSameCommitSha(originSha, headSha)) {
         return originSha;
       }
       return null;
     }
   }
   return null;
+}
+
+async function resolveGitMergeBaseAsync(
+  realRoot: string,
+  baseBranch: string,
+  headSha: string,
+): Promise<string | null> {
+  if (!isSafeGitRef(baseBranch) || !isValidHeadSha(headSha)) return null;
+  const localRef = `refs/heads/${baseBranch}`;
+  const originRef = `refs/remotes/origin/${baseBranch}`;
+
+  for (const ref of [localRef, originRef, baseBranch]) {
+    const out = await runGitReadOnlyAsync(realRoot, [
+      "merge-base",
+      "--end-of-options",
+      ref,
+      headSha,
+    ]);
+    const sha = out?.trim();
+    if (!sha || !FULL_SHA_RE.test(sha)) continue;
+    if (!isSameCommitSha(sha, headSha)) return sha;
+    if (ref === localRef) {
+      const originOut = await runGitReadOnlyAsync(realRoot, [
+        "merge-base",
+        "--end-of-options",
+        originRef,
+        headSha,
+      ]);
+      const originSha = originOut?.trim();
+      if (originSha && FULL_SHA_RE.test(originSha) && !isSameCommitSha(originSha, headSha)) {
+        return originSha;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function buildGitDiffArgs(mergeBase: string | null, headSha: string): string[] {
+  return mergeBase
+    ? [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--raw",
+        "--numstat",
+        "-z",
+        "-M",
+        "--end-of-options",
+        mergeBase,
+        headSha,
+        "--",
+      ]
+    : [
+        "diff-tree",
+        "--no-commit-id",
+        "-r",
+        "--root",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--raw",
+        "--numstat",
+        "-z",
+        "-M",
+        "--end-of-options",
+        headSha,
+        "--",
+      ];
 }
 
 function statusFromGitCode(code: string): ReviewChangedFile["status"] {
@@ -158,7 +384,10 @@ function statusFromGitCode(code: string): ReviewChangedFile["status"] {
   }
 }
 
-function parseGitDiffZ(combinedOut: string): {
+function parseGitDiffZ(
+  combinedOut: string,
+  realRoot?: string,
+): {
   files: ReviewChangedFile[];
   additions: number;
   deletions: number;
@@ -226,93 +455,58 @@ function parseGitDiffZ(combinedOut: string): {
     }
     if (!filePath) continue;
 
+    const statusInfo = statusByPath.get(filePath);
+    const prevRaw = previousPath ?? statusInfo?.previous_path;
+    const safePath = realRoot ? isSafeRepoRelPath(realRoot, filePath) : normalizePath(filePath);
+    if (!safePath) continue;
+    const safePrev = prevRaw
+      ? realRoot
+        ? isSafeRepoRelPath(realRoot, prevRaw)
+        : normalizePath(prevRaw)
+      : undefined;
+
     const binary = addRaw === "-" || delRaw === "-";
     const additions = binary ? 0 : Number.parseInt(addRaw, 10) || 0;
     const deletions = binary ? 0 : Number.parseInt(delRaw, 10) || 0;
     totalAdditions += additions;
     totalDeletions += deletions;
 
-    const statusInfo = statusByPath.get(filePath);
-    const prev = previousPath ?? statusInfo?.previous_path;
     files.push({
-      path: normalizePath(filePath),
-      status: statusInfo?.status ?? (prev ? "renamed" : "modified"),
+      path: safePath,
+      status: statusInfo?.status ?? (safePrev ? "renamed" : "modified"),
       additions,
       deletions,
       ...(binary ? { binary: true } : {}),
-      ...(prev ? { previous_path: normalizePath(prev) } : {}),
+      ...(safePrev ? { previous_path: safePrev } : {}),
     });
   }
 
   return { files, additions: totalAdditions, deletions: totalDeletions };
 }
 
-export function collectScopedDiffMeta(options: {
-  repoRoot: string;
-  baseBranch: string;
-  headSha: string;
+function finalizeScopedDiffMeta(options: {
+  source: ReviewDiffMeta["source"];
+  baseRef?: string;
+  rawFiles: readonly ReviewChangedFile[];
+  additions: number;
+  deletions: number;
   handoffFiles: readonly string[];
   scopeFiles?: readonly string[];
-  maxFiles?: number;
+  maxFiles: number;
 }): ReviewDiffMeta {
-  const {
-    repoRoot,
-    baseBranch,
-    headSha,
-    handoffFiles,
-    scopeFiles,
-    maxFiles = DEFAULT_MAX_CHANGED_FILES,
-  } = options;
+  const { source, baseRef, handoffFiles, scopeFiles, maxFiles, additions, deletions } = options;
+  let rawFiles = options.rawFiles.map((file) => ({ ...file }));
 
-  let rawFiles: ReviewChangedFile[] = [];
-  let source: ReviewDiffMeta["source"] = "handoff_only";
-  let baseRef: string | undefined;
-  let additions = 0;
-  let deletions = 0;
-
-  if (/^[0-9a-f]{7,64}$/i.test(headSha)) {
-    const mergeBase = resolveGitMergeBase(repoRoot, baseBranch, headSha);
-    const diffArgs = mergeBase
-      ? [
-          "diff",
-          "--no-ext-diff",
-          "--no-textconv",
-          "--raw",
-          "--numstat",
-          "-z",
-          "-M",
-          mergeBase,
-          headSha,
-          "--",
-        ]
-      : [
-          "diff-tree",
-          "--no-commit-id",
-          "-r",
-          "--root",
-          "--no-ext-diff",
-          "--no-textconv",
-          "--raw",
-          "--numstat",
-          "-z",
-          "-M",
-          headSha,
-          "--",
-        ];
-    const diffOut = runGitReadOnly(repoRoot, diffArgs);
-    if (diffOut !== null) {
-      const parsed = parseGitDiffZ(diffOut);
-      rawFiles = parsed.files;
-      additions = parsed.additions;
-      deletions = parsed.deletions;
-      source = "git_diff";
-      baseRef = mergeBase ?? baseBranch;
-    }
-  }
+  const safeHandoffPaths = [
+    ...new Set(
+      handoffFiles
+        .map(sanitizeSafeRepoRelPath)
+        .filter((filePath): filePath is string => filePath !== null),
+    ),
+  ];
 
   if (source === "handoff_only") {
-    const uniqueHandoff = [...new Set(handoffFiles.map(normalizePath).filter(Boolean))];
-    rawFiles = uniqueHandoff.map((path) => ({
+    rawFiles = safeHandoffPaths.map((path) => ({
       path,
       status: "handoff" as const,
       additions: 0,
@@ -320,10 +514,7 @@ export function collectScopedDiffMeta(options: {
     }));
   }
 
-  const allChangedPaths =
-    rawFiles.length > 0
-      ? rawFiles.map((f) => f.path)
-      : [...new Set(handoffFiles.map(normalizePath).filter(Boolean))];
+  const allChangedPaths = rawFiles.length > 0 ? rawFiles.map((f) => f.path) : safeHandoffPaths;
   const scopeDrift = evaluateScopeDrift(allChangedPaths, scopeFiles);
 
   const annotatedFiles = rawFiles.map((file) => {
@@ -333,18 +524,168 @@ export function collectScopedDiffMeta(options: {
   });
 
   const filesTruncated = annotatedFiles.length > maxFiles;
-  const changedFiles = annotatedFiles.slice(0, maxFiles);
+  const changedFiles = annotatedFiles.slice(0, maxFiles).map((file) => ({
+    ...file,
+    path: scrubText(file.path),
+    ...(file.previous_path !== undefined ? { previous_path: scrubText(file.previous_path) } : {}),
+  }));
+  const scrubbedBaseRef = baseRef ? scrubText(baseRef) : undefined;
+  const scrubbedScopeDrift = scopeDrift
+    ? {
+        scope_files: scopeDrift.scope_files.map((entry) => scrubText(entry)),
+        in_scope_files: scopeDrift.in_scope_files.map((entry) => scrubText(entry)),
+        out_of_scope_files: scopeDrift.out_of_scope_files.map((entry) => scrubText(entry)),
+        untouched_scope_files: scopeDrift.untouched_scope_files.map((entry) => scrubText(entry)),
+        drift_detected: scopeDrift.drift_detected,
+      }
+    : undefined;
 
   return {
     source,
-    ...(baseRef ? { base_ref: baseRef } : {}),
+    ...(scrubbedBaseRef ? { base_ref: scrubbedBaseRef } : {}),
     total_files: annotatedFiles.length,
     additions,
     deletions,
     changed_files: changedFiles,
     ...(filesTruncated ? { files_truncated: true } : {}),
-    ...(scopeDrift ? { scope_drift: scopeDrift } : {}),
+    ...(scrubbedScopeDrift ? { scope_drift: scrubbedScopeDrift } : {}),
   };
+}
+
+export function collectScopedDiffMeta(options: {
+  repoRoot: string;
+  baseBranch: string;
+  headSha: string;
+  handoffFiles: readonly string[];
+  scopeFiles?: readonly string[];
+  maxFiles?: number;
+  taskId?: string;
+}): ReviewDiffMeta {
+  const {
+    repoRoot,
+    baseBranch,
+    headSha,
+    handoffFiles,
+    scopeFiles,
+    maxFiles = DEFAULT_MAX_CHANGED_FILES,
+    taskId,
+  } = options;
+
+  let rawFiles: readonly ReviewChangedFile[] = [];
+  let source: ReviewDiffMeta["source"] = "handoff_only";
+  let baseRef: string | undefined;
+  let additions = 0;
+  let deletions = 0;
+
+  const realRoot = isValidHeadSha(headSha) ? resolveGitRootSync(repoRoot) : null;
+  if (realRoot) {
+    const cached = getCachedRawDiff(taskId, headSha, realRoot, baseBranch);
+    if (cached) {
+      rawFiles = cached.rawFiles;
+      additions = cached.additions;
+      deletions = cached.deletions;
+      source = "git_diff";
+      baseRef = cached.baseRef;
+    } else if (isSafeGitRef(baseBranch)) {
+      const mergeBase = resolveGitMergeBase(realRoot, baseBranch, headSha);
+      const diffOut = runGitReadOnly(realRoot, buildGitDiffArgs(mergeBase, headSha));
+      if (diffOut !== null) {
+        const parsed = parseGitDiffZ(diffOut, realRoot);
+        rawFiles = parsed.files;
+        additions = parsed.additions;
+        deletions = parsed.deletions;
+        source = "git_diff";
+        baseRef = mergeBase ?? baseBranch;
+        setCachedRawDiff(taskId, headSha, {
+          realRoot,
+          baseBranch,
+          baseRef,
+          rawFiles: parsed.files.map((f) => ({ ...f })),
+          additions,
+          deletions,
+        });
+      }
+    }
+  }
+
+  return finalizeScopedDiffMeta({
+    source,
+    baseRef,
+    rawFiles,
+    additions,
+    deletions,
+    handoffFiles,
+    scopeFiles,
+    maxFiles,
+  });
+}
+
+export async function collectScopedDiffMetaAsync(options: {
+  repoRoot: string;
+  baseBranch: string;
+  headSha: string;
+  handoffFiles: readonly string[];
+  scopeFiles?: readonly string[];
+  maxFiles?: number;
+  taskId?: string;
+}): Promise<ReviewDiffMeta> {
+  const {
+    repoRoot,
+    baseBranch,
+    headSha,
+    handoffFiles,
+    scopeFiles,
+    maxFiles = DEFAULT_MAX_CHANGED_FILES,
+    taskId,
+  } = options;
+
+  let rawFiles: readonly ReviewChangedFile[] = [];
+  let source: ReviewDiffMeta["source"] = "handoff_only";
+  let baseRef: string | undefined;
+  let additions = 0;
+  let deletions = 0;
+
+  const realRoot = isValidHeadSha(headSha) ? await resolveGitRootAsync(repoRoot) : null;
+  if (realRoot) {
+    const cached = getCachedRawDiff(taskId, headSha, realRoot, baseBranch);
+    if (cached) {
+      rawFiles = cached.rawFiles;
+      additions = cached.additions;
+      deletions = cached.deletions;
+      source = "git_diff";
+      baseRef = cached.baseRef;
+    } else if (isSafeGitRef(baseBranch)) {
+      const mergeBase = await resolveGitMergeBaseAsync(realRoot, baseBranch, headSha);
+      const diffOut = await runGitReadOnlyAsync(realRoot, buildGitDiffArgs(mergeBase, headSha));
+      if (diffOut !== null) {
+        const parsed = parseGitDiffZ(diffOut, realRoot);
+        rawFiles = parsed.files;
+        additions = parsed.additions;
+        deletions = parsed.deletions;
+        source = "git_diff";
+        baseRef = mergeBase ?? baseBranch;
+        setCachedRawDiff(taskId, headSha, {
+          realRoot,
+          baseBranch,
+          baseRef,
+          rawFiles: parsed.files.map((f) => ({ ...f })),
+          additions,
+          deletions,
+        });
+      }
+    }
+  }
+
+  return finalizeScopedDiffMeta({
+    source,
+    baseRef,
+    rawFiles,
+    additions,
+    deletions,
+    handoffFiles,
+    scopeFiles,
+    maxFiles,
+  });
 }
 
 function extractReviewerSyncBoardExcerpt(
@@ -609,74 +950,121 @@ export function isStaleReviewCommit(options: {
   return false;
 }
 
-export function buildReviewContextPack(options: {
-  repoRoot: string;
+export interface ReviewContextSnapshot {
+  taskId: string;
+  taskPersona: string | null;
+  scopeFiles?: readonly string[];
+  taskVerifyCommand?: string | null;
+  docRefs?: readonly string[];
+  gitBranch?: string;
+  headSha: string;
+  lastCommitHash: string;
+  baseBranch: string;
+  handoffFiles: readonly string[];
+  handoffDecisions: readonly string[];
+  verificationCommand: string | null;
+  epicSummaryText?: string;
+  syncBoardContent?: string;
+  compact: boolean;
+  maxBytes: number;
+}
+
+export function snapshotReviewContext(options: {
   project: LocalProject;
   task: LocalTask;
   review: LocalReview;
   compact?: boolean;
   maxBytes?: number;
-}): ReviewContextPack {
+}): ReviewContextSnapshot {
   const {
-    repoRoot,
     project,
     task,
     review,
     compact = false,
     maxBytes = REVIEW_CONTEXT_PACK_MAX_BYTES,
   } = options;
-
   const headSha = review.ref.head_sha;
-  const lastCommitHash = task.handoff?.last_commit_hash ?? headSha;
-  const baseBranch = review.ref.base_branch;
+  const epic = project.epics.find((e) => e.id === task.epicId);
+  const syncDoc = project.documents.find((d) => d.slug === "sync-board" && !d.archived_at);
   const gitBranch = task.handoff?.git_branch ?? task.branch?.name;
-  const handoffFiles = task.handoff?.files_modified ?? [];
 
-  const diffMeta = collectScopedDiffMeta({
-    repoRoot,
-    baseBranch,
+  return {
+    taskId: task.id,
+    taskPersona: task.persona,
+    ...(task.scope_files ? { scopeFiles: [...task.scope_files] } : {}),
+    ...(task.verify_command !== undefined ? { taskVerifyCommand: task.verify_command } : {}),
+    ...(task.doc_refs?.length ? { docRefs: [...task.doc_refs] } : {}),
+    ...(gitBranch ? { gitBranch } : {}),
     headSha,
-    handoffFiles,
-    scopeFiles: task.scope_files,
-    maxFiles: compact ? COMPACT_MAX_CHANGED_FILES : DEFAULT_MAX_CHANGED_FILES,
-  });
+    lastCommitHash: task.handoff?.last_commit_hash ?? headSha,
+    baseBranch: review.ref.base_branch,
+    handoffFiles: [...(task.handoff?.files_modified ?? [])],
+    handoffDecisions: [...(task.handoff?.key_decisions ?? [])],
+    verificationCommand: task.handoff?.verification_command ?? null,
+    ...(epic
+      ? { epicSummaryText: `${epic.title}${epic.description ? `: ${epic.description}` : ""}` }
+      : {}),
+    ...(syncDoc ? { syncBoardContent: syncDoc.content } : {}),
+    compact,
+    maxBytes,
+  };
+}
 
-  const rawDecisions = (task.handoff?.key_decisions ?? []).map((d) =>
-    briefText(scrubText(d), compact ? 120 : 150),
-  );
+function assembleReviewContextPack(
+  snapshot: ReviewContextSnapshot,
+  diffMeta: ReviewDiffMeta,
+): ReviewContextPack {
+  const {
+    taskId,
+    taskPersona,
+    taskVerifyCommand: rawTaskVerifyCommand,
+    docRefs,
+    gitBranch: rawGitBranch,
+    headSha,
+    lastCommitHash,
+    baseBranch,
+    handoffDecisions: rawHandoffDecisions,
+    verificationCommand: rawVerificationCommand,
+    epicSummaryText,
+    syncBoardContent,
+    compact,
+    maxBytes,
+  } = snapshot;
+
+  const rawDecisions = rawHandoffDecisions.map((d) => briefText(scrubText(d), compact ? 120 : 150));
   const maxDecisions = compact ? COMPACT_MAX_DECISIONS : DEFAULT_MAX_DECISIONS;
   const decisionsTruncated = rawDecisions.length > maxDecisions;
   const handoffDecisions = rawDecisions.slice(0, maxDecisions);
 
   const verificationCommand =
-    task.handoff?.verification_command != null
-      ? scrubText(task.handoff.verification_command)
-      : null;
+    rawVerificationCommand != null ? scrubText(rawVerificationCommand) : null;
   const taskVerifyCommand =
-    task.verify_command !== undefined ? scrubText(task.verify_command) : undefined;
+    rawTaskVerifyCommand !== undefined
+      ? rawTaskVerifyCommand === null
+        ? null
+        : scrubText(rawTaskVerifyCommand)
+      : undefined;
 
-  const epic = project.epics.find((e) => e.id === task.epicId);
-  const epicSummaryExcerpt = epic
-    ? briefText(
-        scrubText(`${epic.title}${epic.description ? `: ${epic.description}` : ""}`),
-        compact ? 140 : 240,
-      )
+  const epicSummaryExcerpt = epicSummaryText
+    ? briefText(scrubText(epicSummaryText), compact ? 140 : 240)
     : undefined;
 
-  const syncDoc = project.documents.find((d) => d.slug === "sync-board" && !d.archived_at);
-  const syncBoardExcerpt = syncDoc
+  const syncBoardExcerpt = syncBoardContent
     ? extractReviewerSyncBoardExcerpt(
-        syncDoc.content,
-        task.id,
-        task.persona,
+        syncBoardContent,
+        taskId,
+        taskPersona,
         compact ? COMPACT_EXCERPT_LIMIT : DEFAULT_EXCERPT_LIMIT,
       )
     : undefined;
 
+  const gitBranch = rawGitBranch ? scrubText(rawGitBranch) : undefined;
+  const safeBaseBranch = scrubText(baseBranch);
+
   const detailPointers: ReviewDetailPointers = {
-    git_diff_command: `git diff ${baseBranch}...${headSha} --`,
+    git_diff_command: `git diff ${safeBaseBranch}...${headSha} --`,
     git_show_stat_command: `git show --stat ${headSha}`,
-    ...(task.doc_refs?.length ? { doc_refs: [...task.doc_refs] } : {}),
+    ...(docRefs?.length ? { doc_refs: docRefs.map((ref) => scrubText(ref)) } : {}),
     mcp_tools: compact
       ? ["get_document (section)", "search_context (code)"]
       : [
@@ -687,11 +1075,11 @@ export function buildReviewContextPack(options: {
   };
 
   const unsized: UnsizedReviewContextPack = {
-    task_id: task.id,
+    task_id: taskId,
     reviewed_commit_sha: headSha,
     head_sha: headSha,
     last_commit_hash: lastCommitHash,
-    base_branch: baseBranch,
+    base_branch: safeBaseBranch,
     ...(gitBranch ? { git_branch: gitBranch } : {}),
     diff_meta: diffMeta,
     handoff_decisions: handoffDecisions,
@@ -704,6 +1092,49 @@ export function buildReviewContextPack(options: {
   };
 
   return boundReviewContextPack(unsized, maxBytes);
+}
+
+export async function buildReviewContextPackFromSnapshot(
+  snapshot: ReviewContextSnapshot,
+  repoRoot: string,
+): Promise<ReviewContextPack> {
+  const diffMeta = await collectScopedDiffMetaAsync({
+    repoRoot,
+    baseBranch: snapshot.baseBranch,
+    headSha: snapshot.headSha,
+    handoffFiles: snapshot.handoffFiles,
+    scopeFiles: snapshot.scopeFiles,
+    maxFiles: snapshot.compact ? COMPACT_MAX_CHANGED_FILES : DEFAULT_MAX_CHANGED_FILES,
+    taskId: snapshot.taskId,
+  });
+  return assembleReviewContextPack(snapshot, diffMeta);
+}
+
+export function buildReviewContextPackFromSnapshotSync(
+  snapshot: ReviewContextSnapshot,
+  repoRoot: string,
+): ReviewContextPack {
+  const diffMeta = collectScopedDiffMeta({
+    repoRoot,
+    baseBranch: snapshot.baseBranch,
+    headSha: snapshot.headSha,
+    handoffFiles: snapshot.handoffFiles,
+    scopeFiles: snapshot.scopeFiles,
+    maxFiles: snapshot.compact ? COMPACT_MAX_CHANGED_FILES : DEFAULT_MAX_CHANGED_FILES,
+    taskId: snapshot.taskId,
+  });
+  return assembleReviewContextPack(snapshot, diffMeta);
+}
+
+export function buildReviewContextPack(options: {
+  repoRoot: string;
+  project: LocalProject;
+  task: LocalTask;
+  review: LocalReview;
+  compact?: boolean;
+  maxBytes?: number;
+}): ReviewContextPack {
+  return buildReviewContextPackFromSnapshotSync(snapshotReviewContext(options), options.repoRoot);
 }
 
 export function withReviewResponseByteLength<T extends Exclude<ReviewResult, { reviews: unknown }>>(

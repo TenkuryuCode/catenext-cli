@@ -12,12 +12,16 @@ import { LocalServiceError } from "./errors.js";
 import { advance, leaseEnd, leaseKey, leaseMatches } from "./local-lease.js";
 import { allowsRepo, type LocalProject, type LocalReview, type LocalTask } from "./local-state.js";
 import {
-  buildReviewContextPack,
+  buildReviewContextPackFromSnapshot,
+  buildReviewContextPackFromSnapshotSync,
   isStaleReviewCommit,
+  type ReviewContextSnapshot,
+  snapshotReviewContext,
   withReviewResponseByteLength,
 } from "./review-context.js";
+import { scrubText } from "./scrubber.js";
 
-interface ReviewWorkflow {
+export interface ReviewWorkflow {
   project: LocalProject;
   tasks: ReadonlyMap<string, LocalTask>;
   repoRoot: string;
@@ -30,45 +34,56 @@ interface ReviewWorkflow {
   recordEvent: (event: Omit<NewTaskEvent, "created_at">) => void;
 }
 
+export interface PreparedReviewResult {
+  result: ReviewResult;
+  contextSnapshot?: ReviewContextSnapshot;
+  includeByteLength?: boolean;
+}
+
 export const offlineReview =
   "Review lokal saja. Status, head SHA, dan merge PR di host tidak diperiksa.";
+
+function isActiveReviewLease(lease: LocalReview["lease"], now: number): boolean {
+  return lease !== undefined && Date.parse(lease.expiresAt) > now;
+}
 
 function reviewEntry(
   task: LocalTask,
   review: LocalReview,
   status: "NEEDS_REVIEW" | "REVISION_REQUESTED" | "DONE",
+  now: number,
 ) {
+  const activeLease = isActiveReviewLease(review.lease, now) ? review.lease : undefined;
   const stage: PullRequestState["stage"] = review.approvedLocally
     ? "approved_locally"
     : status === "REVISION_REQUESTED"
       ? "changes_requested"
       : review.decision?.value === "approve"
         ? "awaiting_human_approval"
-        : review.lease
+        : activeLease
           ? "in_review"
           : "awaiting_review";
   return {
     task_id: task.id,
-    title: task.title,
+    title: scrubText(task.title),
     status,
     review: {
       ...(review.ref.url ? { url: review.ref.url } : {}),
-      base_branch: review.ref.base_branch,
+      base_branch: scrubText(review.ref.base_branch),
       head_sha: review.ref.head_sha,
       stage,
       checked_at: review.updatedAt,
-      reviewer: review.lease?.reviewer ?? review.decision?.reviewer ?? null,
+      reviewer: activeLease?.reviewer ?? review.decision?.reviewer ?? null,
       merge_sha: null,
     },
   };
 }
 
-export function reviewPullRequest(
+export function prepareReviewPullRequest(
   input: ReviewRequest,
   {
     project,
     tasks,
-    repoRoot,
     repo,
     overrides,
     now,
@@ -76,20 +91,23 @@ export function reviewPullRequest(
     personaForAlias,
     dirty,
     recordEvent,
-  }: ReviewWorkflow,
-): ReviewResult {
+  }: Omit<ReviewWorkflow, "repoRoot"> & { repoRoot?: string },
+): PreparedReviewResult {
   if (input.action === "list") {
+    if (input.limit <= 0) return { result: { reviews: [] } };
     return {
-      reviews: project.tasks
-        .flatMap((task) =>
-          task.status === "NEEDS_REVIEW" &&
-          task.review?.repo === repo &&
-          !task.review.lease &&
-          !task.review.decision
-            ? [reviewEntry(task, task.review, "NEEDS_REVIEW")]
-            : [],
-        )
-        .slice(0, input.limit),
+      result: {
+        reviews: project.tasks
+          .flatMap((task) =>
+            task.status === "NEEDS_REVIEW" &&
+            task.review?.repo === repo &&
+            !isActiveReviewLease(task.review.lease, now) &&
+            !task.review.decision
+              ? [reviewEntry(task, task.review, "NEEDS_REVIEW", now)]
+              : [],
+          )
+          .slice(0, input.limit),
+      },
     };
   }
   const task = tasks.get(input.task_id);
@@ -100,42 +118,48 @@ export function reviewPullRequest(
   const status = task.status;
   if (status !== "NEEDS_REVIEW" && status !== "DONE" && status !== "REVISION_REQUESTED")
     throw new LocalServiceError("review_not_pending", "Tunggu handoff berikutnya.");
-  const entry = reviewEntry(task, review, status);
+  const entry = reviewEntry(task, review, status, now);
   if (input.action === "refresh") {
     if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
       return {
-        ...entry,
-        stale_commit: true,
-        warning: `Review tidak cocok: head SHA handoff sudah berubah. ${offlineReview}`,
+        result: {
+          ...entry,
+          stale_commit: true,
+          warning: `Review tidak cocok: head SHA handoff sudah berubah. ${offlineReview}`,
+        },
       };
     }
-    const contextPack =
-      input.include_context === true
-        ? buildReviewContextPack({
-            repoRoot,
-            project,
-            task,
-            review,
-            compact: Boolean(input.compact),
-          })
-        : undefined;
+    const includeContext = input.include_context === true;
+    const includeByteLength = includeContext || input.compact === true;
+    const contextSnapshot = includeContext
+      ? snapshotReviewContext({
+          project,
+          task,
+          review,
+          compact: Boolean(input.compact),
+        })
+      : undefined;
     const refreshed = {
       ...entry,
       notice: offlineReview,
-      ...(contextPack ? { review_context_pack: contextPack } : {}),
     };
-    return input.include_context === true || input.compact === true
-      ? withReviewResponseByteLength(refreshed)
-      : refreshed;
+    return {
+      result:
+        includeByteLength && !contextSnapshot ? withReviewResponseByteLength(refreshed) : refreshed,
+      ...(contextSnapshot ? { contextSnapshot } : {}),
+      ...(includeByteLength ? { includeByteLength: true } : {}),
+    };
   }
   if (status !== "NEEDS_REVIEW")
-    return { ...entry, warning: `Review tidak menunggu keputusan. ${offlineReview}` };
+    return { result: { ...entry, warning: `Review tidak menunggu keputusan. ${offlineReview}` } };
   if (input.action === "claim") {
     if (isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha })) {
       return {
-        ...entry,
-        stale_commit: true,
-        warning: `Review tidak diambil: head SHA handoff sudah berubah. ${offlineReview}`,
+        result: {
+          ...entry,
+          stale_commit: true,
+          warning: `Review tidak diambil: head SHA handoff sudah berubah. ${offlineReview}`,
+        },
       };
     }
     const alias =
@@ -152,8 +176,14 @@ export function reviewPullRequest(
         "self_review",
         "Persona implementer tidak dapat menjadi reviewer PR ini.",
       );
+    if (review.lease && !isActiveReviewLease(review.lease, now)) {
+      delete review.lease;
+      dirty();
+    }
     if (review.lease || review.decision)
-      return { ...entry, warning: `Review sudah diambil atau diputuskan. ${offlineReview}` };
+      return {
+        result: { ...entry, warning: `Review sudah diambil atau diputuskan. ${offlineReview}` },
+      };
     const leaseId = randomUUID();
     review.lease = {
       id: leaseKey(leaseId),
@@ -162,37 +192,55 @@ export function reviewPullRequest(
     };
     review.updatedAt = iso;
     dirty();
-    const contextPack =
-      input.include_context === true
-        ? buildReviewContextPack({
-            repoRoot,
-            project,
-            task,
-            review,
-            compact: Boolean(input.compact),
-          })
-        : undefined;
+    const includeContext = input.include_context === true;
+    const includeByteLength = includeContext || input.compact === true;
+    const contextSnapshot = includeContext
+      ? snapshotReviewContext({
+          project,
+          task,
+          review,
+          compact: Boolean(input.compact),
+        })
+      : undefined;
     const rawNotes = task.handoff?.notes_for_next_agent;
+    const scrubbedNotes = rawNotes !== undefined ? scrubText(rawNotes) : undefined;
     const notes =
-      rawNotes !== undefined && input.compact === true ? briefText(rawNotes, 160) : rawNotes;
+      scrubbedNotes !== undefined && input.compact === true
+        ? briefText(scrubbedNotes, 160)
+        : scrubbedNotes;
     const claimed = {
-      ...reviewEntry(task, review, status),
+      ...reviewEntry(task, review, status, now),
       lease_id: leaseId,
       lease_expires_at: review.lease.expiresAt,
       ...(notes !== undefined ? { notes_for_next_agent: notes } : {}),
       notice: offlineReview,
-      ...(contextPack ? { review_context_pack: contextPack } : {}),
     };
-    return input.include_context === true || input.compact === true
-      ? withReviewResponseByteLength(claimed)
-      : claimed;
+    return {
+      result:
+        includeByteLength && !contextSnapshot ? withReviewResponseByteLength(claimed) : claimed,
+      ...(contextSnapshot ? { contextSnapshot } : {}),
+      ...(includeByteLength ? { includeByteLength: true } : {}),
+    };
   }
   const staleSubmit = isStaleReviewCommit({ task, review, expectedHeadSha: input.head_sha });
+  if (review.lease && !isActiveReviewLease(review.lease, now)) {
+    delete review.lease;
+    dirty();
+    return {
+      result: {
+        ...entry,
+        ...(staleSubmit ? { stale_commit: true as const } : {}),
+        warning: `Review tidak disimpan: lease review sudah kadaluarsa. ${offlineReview}`,
+      },
+    };
+  }
   if (!review.lease || !leaseMatches(review.lease.id, input.lease_id) || staleSubmit) {
     return {
-      ...entry,
-      ...(staleSubmit ? { stale_commit: true as const } : {}),
-      warning: `Review tidak disimpan: lease atau head SHA handoff tidak cocok. ${offlineReview}`,
+      result: {
+        ...entry,
+        ...(staleSubmit ? { stale_commit: true as const } : {}),
+        warning: `Review tidak disimpan: lease atau head SHA handoff tidak cocok. ${offlineReview}`,
+      },
     };
   }
   const reviewer = review.lease.reviewer;
@@ -218,13 +266,45 @@ export function reviewPullRequest(
   review.updatedAt = iso;
   dirty();
   return {
-    ...reviewEntry(
-      task,
-      review,
-      input.decision === "approve" ? "NEEDS_REVIEW" : "REVISION_REQUESTED",
-    ),
-    notice: offlineReview,
+    result: {
+      ...reviewEntry(
+        task,
+        review,
+        input.decision === "approve" ? "NEEDS_REVIEW" : "REVISION_REQUESTED",
+        now,
+      ),
+      notice: offlineReview,
+    },
   };
+}
+
+export async function enrichReviewResult(
+  prepared: PreparedReviewResult,
+  repoRoot: string,
+): Promise<ReviewResult> {
+  const { result, contextSnapshot, includeByteLength } = prepared;
+  if ("reviews" in result) return result;
+  if (!contextSnapshot) {
+    return includeByteLength ? withReviewResponseByteLength(result) : result;
+  }
+  const contextPack = await buildReviewContextPackFromSnapshot(contextSnapshot, repoRoot);
+  const enriched = {
+    ...result,
+    review_context_pack: contextPack,
+  };
+  return includeByteLength ? withReviewResponseByteLength(enriched) : enriched;
+}
+
+export function reviewPullRequest(input: ReviewRequest, workflow: ReviewWorkflow): ReviewResult {
+  const prepared = prepareReviewPullRequest(input, workflow);
+  const { result, contextSnapshot, includeByteLength } = prepared;
+  if ("reviews" in result || !contextSnapshot) return result;
+  const contextPack = buildReviewContextPackFromSnapshotSync(contextSnapshot, workflow.repoRoot);
+  const enriched = {
+    ...result,
+    review_context_pack: contextPack,
+  };
+  return includeByteLength ? withReviewResponseByteLength(enriched) : enriched;
 }
 
 export function reviseTask(

@@ -1,6 +1,6 @@
 import { MCP_TOOLS, type McpToolName } from "@catenext/shared";
 import type { z } from "zod";
-import { requireHumanApproval } from "../../approval-policy.js";
+import { requireHumanApproval, requireHumanEpicRunApproval } from "../../approval-policy.js";
 import { findProjectRoot, readConfig } from "../../config.js";
 import { describeRedactions, SCRUB_TOOL_FIELDS, scrubDeep } from "../../scrubber.js";
 import { loadCatalogSkill } from "../../skill-catalog.js";
@@ -84,6 +84,9 @@ export function createToolInvoker(opts: {
       if (!initial.success) return text(`Input ditolak:\n${zodIssues(initial.error)}`);
       if (name === "manage_task") {
         requireHumanApproval("agent", MCP_TOOLS.manage_task.input.parse(initial.data));
+      }
+      if (name === "epic_run") {
+        requireHumanEpicRunApproval("agent", MCP_TOOLS.epic_run.input.parse(initial.data));
       }
 
       const ctx = await opts.context();

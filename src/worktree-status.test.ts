@@ -14,6 +14,7 @@ import {
   formatWorktreeStatus,
   parseGitDiffNameOnly,
   parseGitStatusPorcelain,
+  parseMergeTreeConflicts,
   parseWorktreeListPorcelain,
   readWorktreeOverlapHint,
   readWorktreeStatus,
@@ -641,4 +642,256 @@ esac
     tempDirs.push(dir);
     await expect(readWorktreeStatus(dir)).rejects.toBeInstanceOf(WorktreeError);
   });
+});
+
+describe("parseMergeTreeConflicts", () => {
+  it("parses NUL-delimited and newline-delimited merge-tree conflict output", () => {
+    const sha = "a".repeat(40);
+    expect(parseMergeTreeConflicts(`${sha}\0src/a.ts\0src/b.ts\0src/a.ts\0`)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+    ]);
+    expect(parseMergeTreeConflicts(`${sha}\nsrc/a.ts\nsrc/c.ts\n`)).toEqual([
+      "src/a.ts",
+      "src/c.ts",
+    ]);
+    expect(parseMergeTreeConflicts(`${sha}\0`)).toEqual([]);
+    expect(parseMergeTreeConflicts("")).toEqual([]);
+  });
+});
+
+describe("readWorktreeStatus merge_dry_run", () => {
+  const commitFile = async (wt: string, name: string, content: string, msg: string) => {
+    await writeFile(join(wt, name), content);
+    git(wt, "add", name);
+    git(
+      wt,
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "-m",
+      msg,
+    );
+  };
+
+  it("omits merge_conflicts unless mergeDryRun is enabled and reports clean merges", async () => {
+    const { dir, root } = await initGitRepo();
+    const wt1 = join(dir, "wt-clean-merge-1");
+    const wt2 = join(dir, "wt-clean-merge-2");
+    git(root, "worktree", "add", "-b", "feat/clean-a", "--", wt1, "main");
+    git(root, "worktree", "add", "-b", "feat/clean-b", "--", wt2, "main");
+
+    await commitFile(wt1, "only-a.ts", "export const a = 1;\n", "a commit");
+    await commitFile(wt2, "only-b.ts", "export const b = 2;\n", "b commit");
+
+    const defaultRes = await readWorktreeStatus(root);
+    expect(defaultRes.merge_conflicts).toBeUndefined();
+
+    const dryRunRes = await readWorktreeStatus(root, { mergeDryRun: true });
+    expect(dryRunRes.merge_conflicts).toEqual([]);
+    expect(formatWorktreeStatus(dryRunRes)).toContain("No merge-tree conflicts.");
+    expect(git(root, "status", "--porcelain")).toBe("");
+    expect(git(wt1, "status", "--porcelain")).toBe("");
+    expect(git(wt2, "status", "--porcelain")).toBe("");
+  });
+
+  it("detects merge-tree conflicts across branches and moved base without mutating checkouts", async () => {
+    const { dir, root } = await initGitRepo();
+    const wt1 = join(dir, "wt-conflict-1");
+    const wt2 = join(dir, "wt-conflict-2");
+    git(root, "worktree", "add", "-b", "feat/c1", "--", wt1, "main");
+    git(root, "worktree", "add", "-b", "feat/c2", "--", wt2, "main");
+
+    await commitFile(wt1, "shared.ts", "export const a = 11;\n", "wt1 change");
+    await commitFile(wt2, "shared.ts", "export const a = 22;\n", "wt2 change");
+    // Also advance main on shared.ts so both branches conflict with main too.
+    await commitFile(root, "shared.ts", "export const a = 33;\n", "main change");
+
+    const headMainBefore = git(root, "rev-parse", "HEAD");
+    const head1Before = git(wt1, "rev-parse", "HEAD");
+    const head2Before = git(wt2, "rev-parse", "HEAD");
+
+    const result = await readWorktreeStatus(root, { mergeDryRun: true });
+    expect(result.merge_conflicts).toBeDefined();
+    expect(result.merge_conflicts).toEqual(
+      expect.arrayContaining([
+        {
+          source: "feat/c1",
+          target: "main",
+          conflicts: ["shared.ts"],
+          conflict_count: 1,
+        },
+        {
+          source: "feat/c2",
+          target: "main",
+          conflicts: ["shared.ts"],
+          conflict_count: 1,
+        },
+        {
+          source: "feat/c1",
+          target: "feat/c2",
+          conflicts: ["shared.ts"],
+          conflict_count: 1,
+        },
+      ]),
+    );
+    expect(formatWorktreeStatus(result)).toContain(
+      "MERGE CONFLICT: feat/c1 <-> feat/c2 (1): shared.ts",
+    );
+
+    // Zero checkout, index, or HEAD mutation in any worktree.
+    expect(git(root, "rev-parse", "HEAD")).toBe(headMainBefore);
+    expect(git(wt1, "rev-parse", "HEAD")).toBe(head1Before);
+    expect(git(wt2, "rev-parse", "HEAD")).toBe(head2Before);
+    expect(git(root, "status", "--porcelain")).toBe("");
+    expect(git(wt1, "status", "--porcelain")).toBe("");
+    expect(git(wt2, "status", "--porcelain")).toBe("");
+  });
+
+  it("ignores unsafe flag-like marker base_branch values and supports MCP worktree_status merge_dry_run", async () => {
+    const { dir, root } = await initGitRepo();
+    const config = CatenextConfigSchema.parse({
+      schema_version: 1,
+      project_id: randomUUID(),
+      repo_name: "fixture",
+      layout: "monorepo",
+    });
+    await mkdir(join(root, ".catenext"));
+    await writeFile(join(root, ".catenext/config.yaml"), JSON.stringify(config));
+
+    const wt1 = join(dir, "wt-sec-1");
+    const wt2 = join(dir, "wt-sec-2");
+    git(root, "worktree", "add", "-b", "feat/sec-1", "--", wt1, "main");
+    git(root, "worktree", "add", "-b", "feat/sec-2", "--", wt2, "main");
+
+    // Poison marker base_branch with flag-like input; must be rejected safely.
+    const markerPath = join(git(wt1, "rev-parse", "--absolute-git-dir"), "catenext-worktree.json");
+    await writeFile(
+      markerPath,
+      JSON.stringify({ branch: "feat/sec-1", base_branch: "--upload-pack=evil" }),
+    );
+
+    await commitFile(wt1, "shared.ts", "export const a = 101;\n", "sec1");
+    await commitFile(wt2, "shared.ts", "export const a = 202;\n", "sec2");
+
+    const service = new LocalService(root, config);
+    const mcpResult = await service.callTool("worktree_status", { merge_dry_run: true });
+    expect(mcpResult.merge_conflicts).toEqual([
+      {
+        source: "feat/sec-1",
+        target: "feat/sec-2",
+        conflicts: ["shared.ts"],
+        conflict_count: 1,
+      },
+    ]);
+  });
+
+  it("scrubs secrets from worktrees[].path, branch, modified_files, ahead_files, and overlaps", async () => {
+    const token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234";
+    const { dir, root } = await initGitRepo();
+    const wt1 = join(dir, `wt-one-${token}`);
+    const wt2 = join(dir, "wt-two");
+    git(root, "worktree", "add", "-b", `feat/${token}`, "--", wt1, "main");
+    git(root, "worktree", "add", "-b", "feat/two", "--", wt2, "main");
+
+    await commitFile(wt1, `ahead-${token}.ts`, "export const a = 1;\n", "ahead secret file");
+    await writeFile(join(wt1, `dirty-${token}.ts`), "export const d1 = 1;\n");
+    await writeFile(join(wt2, `dirty-${token}.ts`), "export const d2 = 2;\n");
+
+    const result = await readWorktreeStatus(root);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(token);
+    expect(serialized).toContain("[REDACTED:github_token]");
+
+    const wt1Entry = result.worktrees.find((wt) => wt.branch === "feat/[REDACTED:github_token]");
+    expect(wt1Entry).toBeDefined();
+    expect(wt1Entry?.path).toContain("wt-one-[REDACTED:github_token]");
+    expect(wt1Entry?.ahead_files).toEqual(["ahead-[REDACTED:github_token].ts"]);
+    expect(wt1Entry?.modified_files).toEqual(["dirty-[REDACTED:github_token].ts"]);
+
+    expect(result.overlaps).toEqual([
+      {
+        file: "dirty-[REDACTED:github_token].ts",
+        worktrees: [expect.stringContaining("wt-one-[REDACTED:github_token]"), wt2],
+      },
+    ]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "strips all GIT_* env vars and passes --no-ext-diff, --no-textconv, and trailing -- to git diff",
+    async () => {
+      const dir = await realpath(await mkdtemp(join(tmpdir(), "catenext-wt-sec-env-")));
+      tempDirs.push(dir);
+      const bin = join(dir, "bin");
+      const linked = join(dir, "linked");
+      const envTrace = join(dir, "git-env-trace");
+      const diffArgsTrace = join(dir, "git-diff-args");
+      await mkdir(bin);
+      await mkdir(linked);
+      await writeFile(envTrace, "");
+      await writeFile(diffArgsTrace, "");
+      await writeFile(
+        join(bin, "git"),
+        `#!/bin/sh
+env | grep '^GIT_' >> "$CATENEXT_TEST_ENV_TRACE" || true
+case "$2" in
+  worktree)
+    printf 'worktree %s\\nHEAD ${"a".repeat(40)}\\nbranch refs/heads/main\\n\\n' "$PWD"
+    printf 'worktree %s/linked\\nHEAD ${"b".repeat(40)}\\nbranch refs/heads/feat/ahead\\n\\n' "$PWD"
+    ;;
+  symbolic-ref) exit 1 ;;
+  rev-parse)
+    if [ "$3" = "--git-dir" ]; then exit 1; fi
+    case "$*" in
+      *"refs/heads/main^{commit}"*) printf '%s\\n' '${"a".repeat(40)}' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  status) exit 0 ;;
+  diff)
+    printf '%s\\n' "$@" > "$CATENEXT_TEST_DIFF_ARGS"
+    printf 'src/changed.ts\\0'
+    ;;
+  *) exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+
+      vi.stubEnv("CATENEXT_TEST_ENV_TRACE", envTrace);
+      vi.stubEnv("CATENEXT_TEST_DIFF_ARGS", diffArgsTrace);
+      vi.stubEnv("PATH", bin);
+      vi.stubEnv("GIT_DIR", "/tmp/evil-git-dir");
+      vi.stubEnv("GIT_EXTERNAL_DIFF", "/tmp/evil-ext-diff");
+      vi.stubEnv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil'");
+      vi.stubEnv("GIT_EXEC_PATH", "/tmp/evil-exec");
+
+      try {
+        const result = await readWorktreeStatus(dir);
+        const capturedEnv = await readFile(envTrace, "utf8");
+        expect(capturedEnv.trim()).toBe("");
+
+        const capturedDiffArgs = (await readFile(diffArgsTrace, "utf8")).trim().split("\n");
+        expect(capturedDiffArgs).toEqual([
+          "--no-optional-locks",
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--name-only",
+          "-z",
+          "--end-of-options",
+          "refs/heads/main...HEAD",
+          "--",
+        ]);
+        const linkedEntry = result.worktrees.find((wt) => wt.branch === "feat/ahead");
+        expect(linkedEntry?.ahead_files).toEqual(["src/changed.ts"]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 });

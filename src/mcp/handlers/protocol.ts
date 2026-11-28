@@ -3,6 +3,7 @@ import {
   type JsonRpcErrorResponse,
   type JsonRpcId,
   type JsonRpcMessage,
+  type JsonRpcNotification,
   type JsonRpcSuccessResponse,
   type McpTransport,
 } from "../stdio.js";
@@ -24,6 +25,38 @@ export const JSONRPC_INTERNAL_ERROR = -32603;
 export const JSONRPC_RESOURCE_NOT_FOUND = -32002;
 export const RESOURCE_LINK_MIN_PROTOCOL = "2025-06-18";
 export const STRUCTURED_CONTENT_MIN_PROTOCOL = "2025-06-18";
+
+export const MCP_LOG_LEVELS = [
+  "debug",
+  "info",
+  "notice",
+  "warning",
+  "error",
+  "critical",
+  "alert",
+  "emergency",
+] as const;
+
+export type McpLogLevel = (typeof MCP_LOG_LEVELS)[number];
+
+const LOG_LEVEL_SEVERITY: Record<McpLogLevel, number> = {
+  debug: 0,
+  info: 1,
+  notice: 2,
+  warning: 3,
+  error: 4,
+  critical: 5,
+  alert: 6,
+  emergency: 7,
+};
+
+export function isMcpLogLevel(value: unknown): value is McpLogLevel {
+  return typeof value === "string" && Object.hasOwn(LOG_LEVEL_SEVERITY, value);
+}
+
+export function shouldEmitLogLevel(minLevel: McpLogLevel, level: McpLogLevel): boolean {
+  return LOG_LEVEL_SEVERITY[level] >= LOG_LEVEL_SEVERITY[minLevel];
+}
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -89,5 +122,18 @@ export function createJsonRpcResponder(opts: {
     await safeSend(transport, msg);
   };
 
-  return { sendResult, sendError };
+  const sendNotification = async (
+    transport: McpTransport,
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<void> => {
+    const msg: JsonRpcNotification = {
+      jsonrpc: JSONRPC_VERSION,
+      method,
+      ...(params !== undefined ? { params: params as JsonRpcNotification["params"] } : {}),
+    };
+    await safeSend(transport, msg);
+  };
+
+  return { sendResult, sendError, sendNotification };
 }

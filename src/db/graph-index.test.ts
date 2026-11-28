@@ -16,6 +16,8 @@ import {
   indexProjectGraph,
   loadGoModule,
   loadWorkspacePackages,
+  MICRO_REINDEX_MAX_FILES,
+  microReindexModifiedFiles,
   parseImports,
   parseSymbols,
   queryClaimGraphSlice,
@@ -1994,6 +1996,152 @@ describe("workspace package, tsconfig alias, barrel re-export & freshness", () =
       } finally {
         db.close();
       }
+    }
+  });
+});
+
+describe("microReindexModifiedFiles", () => {
+  it("reindexes <= 10 modified files in place without a full workspace walk", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    const aPath = join(root, "src/a.ts");
+    const bPath = join(root, "src/b.ts");
+    const cPath = join(root, "src/c.ts");
+    await writeFile(aPath, 'import { b } from "./b.js";\nexport function useA() { return b(); }\n');
+    await writeFile(bPath, "export function b() { return 1; }\n");
+    await writeFile(cPath, "export function c() { return 2; }\n");
+
+    const initial = await indexProjectGraph(dbPath, projectId, root);
+    expect(initial.files).toBe(3);
+
+    // Add a new unindexed file on disk and modify a.ts + touch b.ts (same hash, newer mtime).
+    await writeFile(join(root, "src/unwalked.ts"), "export const unwalked = true;\n");
+    await writeFile(
+      aPath,
+      'import { c } from "./c.js";\nexport function updatedA() { return c(); }\n',
+    );
+    const future = new Date(Date.now() + 10_000);
+    await utimes(aPath, future, future);
+    await utimes(bPath, future, future);
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    const state = getGraphIndexFastPathState(dbPath, projectId, rootDirs);
+    expect(state.stale).toBe(true);
+    expect(state.reason).toBe("modified_files");
+    expect(state.modified_files?.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+
+    const micro = await microReindexModifiedFiles(dbPath, projectId, rootDirs);
+    expect(micro).toEqual({
+      applied: true,
+      reindexed: 2,
+      counts: { files: 3, symbols: 3, edges: 1 },
+    });
+
+    // Unwalked file was not added, and a.ts symbols + edges reflect the new import.
+    const neighbors = queryGraphNeighbors(dbPath, projectId, {
+      paths: ["src/a.ts"],
+      include_symbols: true,
+    });
+    expect(neighbors.files).toEqual([
+      {
+        path: "src/a.ts",
+        edges: [{ kind: "imports", from: "src/a.ts", to: "src/c.ts", label: "src/c.ts" }],
+        symbols: ["updatedA"],
+      },
+    ]);
+    expect(symbolSearch(dbPath, projectId, "unwalked", 10)).toEqual([]);
+    const checkDb = openDatabaseAt(dbPath);
+    try {
+      expect(checkGraphFreshness(checkDb, projectId, rootDirs)).toEqual({
+        stale: false,
+        checked_files: 3,
+      });
+    } finally {
+      checkDb.close();
+    }
+  });
+
+  it("declines micro-reindex when > MICRO_REINDEX_MAX_FILES drift", async () => {
+    await mkdir(join(root, "src"), { recursive: true });
+    const count = MICRO_REINDEX_MAX_FILES + 1;
+    const future = new Date(Date.now() + 10_000);
+    const paths: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const rel = `src/f${i}.ts`;
+      paths.push(rel);
+      await writeFile(join(root, rel), `export const v${i} = ${i};\n`);
+    }
+    await indexProjectGraph(dbPath, projectId, root);
+
+    for (let i = 0; i < count; i++) {
+      const full = join(root, `src/f${i}.ts`);
+      await writeFile(full, `export const v${i} = ${i + 100};\n`);
+      await utimes(full, future, future);
+    }
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    const checkDb = openDatabaseAt(dbPath);
+    let freshness: ReturnType<typeof checkGraphFreshness>;
+    try {
+      freshness = checkGraphFreshness(checkDb, projectId, rootDirs);
+    } finally {
+      checkDb.close();
+    }
+    expect(freshness.stale).toBe(true);
+    expect(freshness.reason).toBe("modified_files");
+    expect(freshness.modified_files).toBeUndefined();
+
+    const micro = await microReindexModifiedFiles(dbPath, projectId, rootDirs, paths);
+    expect(micro).toEqual({
+      applied: false,
+      reindexed: 0,
+      counts: { files: count, symbols: count, edges: 0 },
+    });
+  });
+
+  it("enforces realRoot, symlink, and .gitignore guards", async () => {
+    await mkdir(join(root, "src/sub"), { recursive: true });
+    const targetPath = join(root, "src/sub/mod.ts");
+    const ignoredPath = join(root, "src/ignored.ts");
+    await writeFile(targetPath, "export const mod = 1;\n");
+    await writeFile(ignoredPath, "export const ign = 1;\n");
+    await indexProjectGraph(dbPath, projectId, root);
+
+    const rootDirs = [{ rootId: null, dir: root }];
+    const outsideDir = await mkdtemp(join(tmpdir(), "catenext-micro-outside-"));
+    try {
+      // Outside / traversal path rejected
+      const traversal = await microReindexModifiedFiles(dbPath, projectId, rootDirs, [
+        "../outside.ts",
+      ]);
+      expect(traversal.applied).toBe(false);
+
+      // .gitignore newly ignoring an indexed file causes guard rejection
+      await writeFile(join(root, ".gitignore"), "src/ignored.ts\n");
+      await writeFile(ignoredPath, "export const ign = 2;\n");
+      const gitignored = await microReindexModifiedFiles(dbPath, projectId, rootDirs, [
+        "src/ignored.ts",
+      ]);
+      expect(gitignored.applied).toBe(false);
+
+      // Symlink file pointing outside realRoot causes guard rejection
+      const outsideFile = join(outsideDir, "secret.ts");
+      await writeFile(outsideFile, "export const secret = 1;\n");
+      await rm(targetPath);
+      await symlink(outsideFile, targetPath);
+      const symlinkedFile = await microReindexModifiedFiles(dbPath, projectId, rootDirs, [
+        "src/sub/mod.ts",
+      ]);
+      expect(symlinkedFile.applied).toBe(false);
+
+      // Symlinked directory on path causes guard rejection
+      await rm(join(root, "src/sub"), { recursive: true, force: true });
+      await symlink(outsideDir, join(root, "src/sub"));
+      const symlinkedDir = await microReindexModifiedFiles(dbPath, projectId, rootDirs, [
+        "src/sub/mod.ts",
+      ]);
+      expect(symlinkedDir.applied).toBe(false);
+    } finally {
+      await rm(outsideDir, { recursive: true, force: true });
     }
   });
 });

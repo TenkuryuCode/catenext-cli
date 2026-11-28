@@ -13,7 +13,8 @@ import { checkpointWalAndClose, openDatabaseAt } from "./open.js";
 const MAX_GROUP_EDGES = 30;
 const MAX_KEY_SYMBOLS = 6;
 const MAX_MERMAID_NODES = 25;
-const TEST_FILE_RE = /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.[^/]+$/i;
+const TEST_FILE_RE =
+  /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.[^/]+$|_test\.[^/]+$|(^|\/)test_[^/]+\.py$/i;
 
 export type GraphRootDir = {
   rootId: string | null;
@@ -568,4 +569,226 @@ export function renderImpactMarkdown(impact: GraphImpactOutputType): string {
   }
 
   return `${lines.join("\n")}\n`;
+}
+
+export type MapScopeFilesToTestsOptions = {
+  depth?: number;
+  limit?: number;
+};
+
+type ParsedFileStem = {
+  rootPrefix: string;
+  dir: string;
+  stem: string;
+  parentDirName: string;
+};
+
+const GENERIC_ENTRY_STEMS = new Set(["index", "mod", "__init__"]);
+
+function splitRootPrefix(normalizedPath: string): { rootPrefix: string; relPath: string } {
+  if (normalizedPath.startsWith("@")) {
+    const slash = normalizedPath.indexOf("/");
+    if (slash > 1) {
+      return {
+        rootPrefix: normalizedPath.slice(0, slash),
+        relPath: normalizedPath.slice(slash + 1),
+      };
+    }
+  }
+  return { rootPrefix: "", relPath: normalizedPath };
+}
+
+function stripExt(fileName: string): string {
+  if (fileName.endsWith(".d.ts")) return fileName.slice(0, -5);
+  const dot = fileName.lastIndexOf(".");
+  return dot > 0 ? fileName.slice(0, dot) : fileName;
+}
+
+function parseScopeStem(filePath: string): ParsedFileStem {
+  const { rootPrefix, relPath } = splitRootPrefix(filePath);
+  const slash = relPath.lastIndexOf("/");
+  const dir = slash === -1 ? "" : relPath.slice(0, slash);
+  const fileName = slash === -1 ? relPath : relPath.slice(slash + 1);
+  const stem = stripExt(fileName).toLowerCase();
+  const parentDirName = dir.split("/").pop()?.toLowerCase() ?? "";
+  return { rootPrefix, dir, stem, parentDirName };
+}
+
+function parseTestStem(filePath: string): ParsedFileStem {
+  const { rootPrefix, relPath } = splitRootPrefix(filePath);
+  const slash = relPath.lastIndexOf("/");
+  const dir = slash === -1 ? "" : relPath.slice(0, slash);
+  const fileName = slash === -1 ? relPath : relPath.slice(slash + 1);
+  const rawStem = stripExt(fileName);
+  let stem = rawStem;
+  const dotTest = rawStem.match(/^(.+)\.(?:test|spec)$/i);
+  if (dotTest?.[1]) {
+    stem = dotTest[1];
+  } else {
+    const underTest = rawStem.match(/^(.+)_test$/i);
+    if (underTest?.[1]) {
+      stem = underTest[1];
+    } else {
+      const pyTest = rawStem.match(/^test_(.+)$/i);
+      if (pyTest?.[1]) {
+        stem = pyTest[1];
+      } else {
+        const classTest = rawStem.match(/^(.+)Test$/);
+        if (classTest?.[1]) stem = classTest[1];
+      }
+    }
+  }
+  const parentDirName = dir.split("/").pop()?.toLowerCase() ?? "";
+  return { rootPrefix, dir, stem: stem.toLowerCase(), parentDirName };
+}
+
+function stripLeadingSourceRoot(dir: string): string {
+  return dir.replace(/^(?:src|lib|app)(?:\/|$)/, "");
+}
+
+function stripTestRoot(dir: string): string {
+  return dir.replace(/(?:^|\/)(?:__tests__|tests?)(?:\/|$)/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function isUnderTestDir(dir: string): boolean {
+  return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)/i.test(dir);
+}
+
+function scoreNamingMatch(scope: ParsedFileStem, test: ParsedFileStem): number | null {
+  if (scope.rootPrefix !== test.rootPrefix) return null;
+  if (!scope.stem || !test.stem) return null;
+
+  const matchesPrimaryStem = test.stem === scope.stem || test.stem.startsWith(`${scope.stem}.`);
+  const isGeneric = GENERIC_ENTRY_STEMS.has(scope.stem);
+  const matchesAltStem =
+    isGeneric &&
+    scope.parentDirName.length > 0 &&
+    (test.stem === scope.parentDirName || test.stem.startsWith(`${scope.parentDirName}.`));
+
+  if (test.dir === scope.dir && matchesPrimaryStem) {
+    return 15;
+  }
+
+  const colocatedTestsDir = scope.dir ? `${scope.dir}/__tests__` : "__tests__";
+  if (test.dir === colocatedTestsDir && (matchesPrimaryStem || matchesAltStem)) {
+    return 16;
+  }
+
+  const matchesAcrossDirs = (!isGeneric && matchesPrimaryStem) || matchesAltStem;
+  if (!matchesAcrossDirs || !isUnderTestDir(test.dir)) {
+    return null;
+  }
+
+  const scopeNorm = stripLeadingSourceRoot(scope.dir);
+  const testNorm = stripTestRoot(test.dir);
+  if (scopeNorm && testNorm && (testNorm === scopeNorm || testNorm.endsWith(`/${scopeNorm}`))) {
+    return 25;
+  }
+
+  return 35;
+}
+
+export function mapScopeFilesToTests(
+  dbOrPath: DatabaseSync | string,
+  projectId: string,
+  scopeFiles: readonly string[],
+  opts: MapScopeFilesToTestsOptions = {},
+): string[] {
+  const normalizedScopes = [
+    ...new Set(
+      scopeFiles
+        .map((p) => p.replaceAll("\\", "/").trim().replace(/^\.\//, ""))
+        .filter((p) => p.length > 0),
+    ),
+  ];
+  if (normalizedScopes.length === 0) return [];
+
+  const maxDepth = Math.min(3, Math.max(1, Math.floor(opts.depth ?? 2)));
+  const limit = Math.min(40, Math.max(1, Math.floor(opts.limit ?? 10)));
+
+  return withDatabase(dbOrPath, (db) => {
+    const fileRows = db
+      .prepare("SELECT id, path FROM files WHERE project_id = ?")
+      .all(projectId) as Array<{ id: number; path: string }>;
+    if (fileRows.length === 0) return [];
+
+    const fileById = new Map<number, string>();
+    const fileByPath = new Map<string, number>();
+    const testEntries: Array<{ path: string; parsed: ParsedFileStem }> = [];
+    for (const row of fileRows) {
+      fileById.set(row.id, row.path);
+      fileByPath.set(row.path, row.id);
+      if (isTestFilePath(row.path)) {
+        testEntries.push({ path: row.path, parsed: parseTestStem(row.path) });
+      }
+    }
+    if (testEntries.length === 0) return [];
+
+    const scores = new Map<string, number>();
+    const record = (path: string, score: number) => {
+      const prev = scores.get(path);
+      if (prev === undefined || score < prev) scores.set(path, score);
+    };
+
+    const scopeIds: number[] = [];
+    for (const scope of normalizedScopes) {
+      const id = fileByPath.get(scope);
+      if (id !== undefined) {
+        scopeIds.push(id);
+        if (isTestFilePath(scope)) record(scope, 0);
+      }
+    }
+
+    if (scopeIds.length > 0) {
+      const edgeRows = db
+        .prepare("SELECT from_file_id, to_file_id FROM edges WHERE project_id = ?")
+        .all(projectId) as Array<{ from_file_id: number | null; to_file_id: number | null }>;
+      const reverseAdj = new Map<number, Set<number>>();
+      for (const edge of edgeRows) {
+        if (edge.from_file_id === null || edge.to_file_id === null) continue;
+        if (edge.from_file_id === edge.to_file_id) continue;
+        let deps = reverseAdj.get(edge.to_file_id);
+        if (!deps) {
+          deps = new Set<number>();
+          reverseAdj.set(edge.to_file_id, deps);
+        }
+        deps.add(edge.from_file_id);
+      }
+
+      const visited = new Set<number>(scopeIds);
+      let frontier = [...scopeIds];
+      for (let distance = 1; distance <= maxDepth && frontier.length > 0; distance++) {
+        const nextFrontier: number[] = [];
+        for (const nodeId of frontier) {
+          const deps = reverseAdj.get(nodeId);
+          if (!deps) continue;
+          for (const depId of deps) {
+            if (visited.has(depId)) continue;
+            visited.add(depId);
+            nextFrontier.push(depId);
+            const depPath = fileById.get(depId);
+            if (depPath && isTestFilePath(depPath)) {
+              record(depPath, distance * 10);
+            }
+          }
+        }
+        frontier = nextFrontier;
+      }
+    }
+
+    for (const scope of normalizedScopes) {
+      const parsedScope = parseScopeStem(scope);
+      for (const testEntry of testEntries) {
+        const score = scoreNamingMatch(parsedScope, testEntry.parsed);
+        if (score !== null) {
+          record(testEntry.path, score);
+        }
+      }
+    }
+
+    return [...scores.entries()]
+      .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+      .slice(0, limit)
+      .map(([path]) => path);
+  });
 }

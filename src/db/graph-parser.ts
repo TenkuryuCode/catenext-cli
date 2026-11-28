@@ -28,18 +28,18 @@ export const SFC_EXT = new Set([".vue", ".svelte"]);
 
 const TS_JS_SYMBOL_PATTERNS: Array<[RegExp, string]> = [
   [
-    /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?function\s+([A-Za-z_][\w$]*)/,
+    /^(?:\s*export\s+(?:default\s+)?|(?=\S))(?:declare\s+)?(?:async\s+)?function\s+([A-Za-z_][\w$]*)/,
     "function",
   ],
   [
-    /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_][\w$]*)/,
+    /^(?:\s*export\s+(?:default\s+)?|(?=\S))(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_][\w$]*)/,
     "class",
   ],
-  [/^(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_][\w$]*)/, "interface"],
-  [/^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_][\w$]*)/, "enum"],
-  [/^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_][\w$]*)\b(?:\s*<.*>)?\s*=/, "type"],
+  [/^(?:\s*export\s+|(?=\S))(?:declare\s+)?interface\s+([A-Za-z_][\w$]*)/, "interface"],
+  [/^(?:\s*export\s+|(?=\S))(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_][\w$]*)/, "enum"],
+  [/^(?:\s*export\s+|(?=\S))(?:declare\s+)?type\s+([A-Za-z_][\w$]*)\b(?:\s*<.*>)?\s*=/, "type"],
   [
-    /^(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_][\w$]*)\s*(?::[^=]+)?=/,
+    /^(?:\s*export\s+|(?=\S))(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_][\w$]*)\s*(?::[^=]+)?=/,
     "variable",
   ],
 ];
@@ -233,6 +233,83 @@ export type TsJsImportEntry = {
   kind: "imports" | "reexport";
 };
 
+const REGEX_PREFIX_KEYWORDS = new Set([
+  "return",
+  "throw",
+  "case",
+  "default",
+  "delete",
+  "void",
+  "typeof",
+  "in",
+  "instanceof",
+  "new",
+  "yield",
+  "await",
+  "of",
+  "else",
+  "do",
+  "export",
+]);
+
+function canPrecedeRegexLiteral(out: string): boolean {
+  let k = out.length - 1;
+  while (k >= 0 && (out[k] === " " || out[k] === "\t" || out[k] === "\n" || out[k] === "\r")) {
+    k--;
+  }
+  if (k < 0) return true;
+  const ch = out[k] ?? "";
+  if (ch === "+" || ch === "-") {
+    return out[k - 1] !== ch;
+  }
+  if (ch === ">") {
+    return out[k - 1] === "=";
+  }
+  if ("({[;,:=!?&|^~*%}".includes(ch)) {
+    return true;
+  }
+  if (/[A-Za-z0-9_$]/.test(ch)) {
+    let start = k;
+    while (start > 0 && /[A-Za-z0-9_$]/.test(out[start - 1] ?? "")) {
+      start--;
+    }
+    if (start > 0 && out[start - 1] === ".") return false;
+    return REGEX_PREFIX_KEYWORDS.has(out.slice(start, k + 1));
+  }
+  return false;
+}
+
+function findRegexLiteralEnd(content: string, startSlash: number): number {
+  let j = startSlash + 1;
+  let inClass = false;
+  while (j < content.length) {
+    const rc = content[j] ?? "";
+    if (rc === "\n" || rc === "\r") return -1;
+    if (rc === "\\") {
+      if (j + 1 >= content.length) return -1;
+      const escaped = content[j + 1] ?? "";
+      if (escaped === "\n" || escaped === "\r") return -1;
+      j += 2;
+      continue;
+    }
+    if (rc === "[" && !inClass) {
+      inClass = true;
+      j++;
+      continue;
+    }
+    if (rc === "]" && inClass) {
+      inClass = false;
+      j++;
+      continue;
+    }
+    if (rc === "/" && !inClass) {
+      return j;
+    }
+    j++;
+  }
+  return -1;
+}
+
 function maskTsJsComments(content: string): string {
   let out = "";
   let i = 0;
@@ -269,11 +346,18 @@ function maskTsJsComments(content: string): string {
     }
     if (ch === "/" && next === "*") {
       const closeIdx = content.indexOf("*/", i + 2);
-      if (closeIdx !== -1) {
-        for (let j = i; j < closeIdx + 2; j++) {
-          out += content[j] === "\n" ? "\n" : " ";
-        }
-        i = closeIdx + 2;
+      const endIdx = closeIdx !== -1 ? closeIdx + 2 : content.length;
+      for (let j = i; j < endIdx; j++) {
+        out += content[j] === "\n" ? "\n" : " ";
+      }
+      i = endIdx;
+      continue;
+    }
+    if (ch === "/" && canPrecedeRegexLiteral(out)) {
+      const endSlash = findRegexLiteralEnd(content, i);
+      if (endSlash !== -1) {
+        out += `/${" ".repeat(endSlash - i - 1)}/`;
+        i = endSlash + 1;
         continue;
       }
     }
@@ -311,7 +395,7 @@ export function parseTsJsImportEntries(
     }
   }
 
-  const callRe = /(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
+  const callRe = /(?<![.\w$])(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
   for (const match of cleaned.matchAll(callRe)) {
     add(match[1], "imports");
   }
@@ -705,11 +789,10 @@ function lineAtOffset(text: string, offset: number): number {
   return line;
 }
 
-function parseTsJsReexportSymbols(
-  content: string,
+function parseTsJsReexportSymbolsFromCleaned(
+  cleaned: string,
   lineOffset = 0,
 ): Array<{ name: string; kind: string; line: number }> {
-  const cleaned = maskTsJsComments(content);
   const results: Array<{ name: string; kind: string; line: number }> = [];
 
   const nsRe =
@@ -775,8 +858,9 @@ function parseTsJsSymbolsForBlock(
   content: string,
   lineOffset = 0,
 ): Array<{ name: string; kind: string; line: number }> {
+  const cleaned = maskTsJsComments(content);
   const symbols: Array<{ name: string; kind: string; line: number }> = [];
-  const lines = content.split(/\r?\n/);
+  const lines = cleaned.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
     for (const [re, kind] of TS_JS_SYMBOL_PATTERNS) {
@@ -787,7 +871,7 @@ function parseTsJsSymbolsForBlock(
       }
     }
   }
-  symbols.push(...parseTsJsReexportSymbols(content, lineOffset));
+  symbols.push(...parseTsJsReexportSymbolsFromCleaned(cleaned, lineOffset));
   const seen = new Set<string>();
   const deduped: Array<{ name: string; kind: string; line: number }> = [];
   for (const sym of symbols.sort((a, b) => a.line - b.line)) {
@@ -847,7 +931,7 @@ export function parseSymbols(
     }
   }
   if (!normalizedExt) {
-    symbols.push(...parseTsJsReexportSymbols(content, 0));
+    symbols.push(...parseTsJsReexportSymbolsFromCleaned(maskTsJsComments(content), 0));
     symbols.sort((a, b) => a.line - b.line);
   }
   return symbols.slice(0, MAX_INDEXED_FILE_SYMBOLS);

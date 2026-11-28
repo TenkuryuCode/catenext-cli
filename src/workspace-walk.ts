@@ -4,6 +4,8 @@ import { extname, isAbsolute, join, relative } from "node:path";
 
 export const DEFAULT_MAX_FILE_BYTES = 256 * 1024;
 const MAX_GITIGNORE_BYTES = 64 * 1024;
+const MAX_WALK_DEPTH = 64;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export const DEFAULT_SKIP_DIRS: ReadonlySet<string> = new Set([
   ".git",
@@ -133,7 +135,15 @@ function globToRegexSource(pattern: string): string {
       const close = findCharClassEnd(pattern, i + 1);
       if (close !== -1) {
         let body = pattern.slice(i + 1, close);
-        if (body.startsWith("!")) body = `^${body.slice(1)}`;
+        if (body.startsWith("!")) {
+          const rest = body.slice(1);
+          body = `^${rest.startsWith("]") ? `\\]${rest.slice(1)}` : rest}`;
+        } else if (body.startsWith("^")) {
+          const rest = body.slice(1);
+          body = `\\^${rest.startsWith("]") ? `\\]${rest.slice(1)}` : rest}`;
+        } else if (body.startsWith("]")) {
+          body = `\\]${body.slice(1)}`;
+        }
         out += `[${body}]`;
         i = close + 1;
         continue;
@@ -190,22 +200,19 @@ export function parseGitignore(content: string, baseRel = ""): GitignoreRule[] {
   return rules;
 }
 
-export function isGitignored(
-  relPath: string,
-  isDir: boolean,
+function matchesRulesForEntry(
+  normalizedPath: string,
+  entryIsDir: boolean,
   rules: readonly GitignoreRule[],
 ): boolean {
-  const normalized = relPath.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
-  if (!normalized || rules.length === 0) return false;
-
   let ignored = false;
   for (const rule of rules) {
-    if (rule.dirOnly && !isDir) continue;
+    if (rule.dirOnly && !entryIsDir) continue;
     let relFromBase: string;
     if (!rule.baseRel) {
-      relFromBase = normalized;
-    } else if (normalized.startsWith(`${rule.baseRel}/`)) {
-      relFromBase = normalized.slice(rule.baseRel.length + 1);
+      relFromBase = normalizedPath;
+    } else if (normalizedPath.startsWith(`${rule.baseRel}/`)) {
+      relFromBase = normalizedPath.slice(rule.baseRel.length + 1);
     } else {
       continue;
     }
@@ -219,11 +226,38 @@ export function isGitignored(
   return ignored;
 }
 
+export function isGitignored(
+  relPath: string,
+  isDir: boolean,
+  rules: readonly GitignoreRule[],
+): boolean {
+  const normalized = relPath.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+  if (!normalized || rules.length === 0) return false;
+
+  const segments = normalized.split("/");
+  if (segments.length > 1) {
+    let prefix = "";
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      const seg = segments[i];
+      if (!seg) continue;
+      prefix = prefix ? `${prefix}/${seg}` : seg;
+      if (matchesRulesForEntry(prefix, true, rules)) {
+        return true;
+      }
+    }
+  }
+
+  return matchesRulesForEntry(normalized, isDir, rules);
+}
+
 export async function readBoundedUtf8File(
   filePath: string,
   realRoot: string,
   maxFileBytes = DEFAULT_MAX_FILE_BYTES,
 ): Promise<string | null> {
+  if (!Number.isFinite(maxFileBytes) || maxFileBytes <= 0) {
+    return null;
+  }
   let lst: Stats;
   try {
     lst = await lstat(filePath);
@@ -243,11 +277,11 @@ export async function readBoundedUtf8File(
     return null;
   }
   try {
-    const content = await readFile(filePath, "utf8");
-    if (Buffer.byteLength(content, "utf8") > maxFileBytes) {
+    const buf = await readFile(realFile);
+    if (buf.byteLength > maxFileBytes || buf.includes(0)) {
       return null;
     }
-    return content;
+    return utf8Decoder.decode(buf);
   } catch {
     return null;
   }
@@ -271,7 +305,13 @@ export async function walkWorkspaceFiles(
   const extensions = options.extensions;
   const skipDirs = options.skipDirs ?? DEFAULT_SKIP_DIRS;
   const skipDotEntries = options.skipDotEntries ?? false;
-  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const rawMaxFileBytes = options.maxFileBytes;
+  const maxFileBytes =
+    rawMaxFileBytes === undefined
+      ? DEFAULT_MAX_FILE_BYTES
+      : Number.isFinite(rawMaxFileBytes)
+        ? Math.floor(rawMaxFileBytes)
+        : DEFAULT_MAX_FILE_BYTES;
   const honorGitignore = options.honorGitignore ?? true;
 
   let realRoot: string;
@@ -281,6 +321,10 @@ export async function walkWorkspaceFiles(
     return { realRoot: root, files: [] };
   }
 
+  if (maxFileBytes <= 0) {
+    return { realRoot, files: [] };
+  }
+
   const visitedDirs = new Set<string>([realRoot]);
   const files: WalkedFile[] = [];
 
@@ -288,13 +332,16 @@ export async function walkWorkspaceFiles(
     dir: string,
     relDir: string,
     inheritedRules: GitignoreRule[],
+    depth: number,
   ): Promise<void> {
+    if (depth >= MAX_WALK_DEPTH) return;
     let entries: Dirent[];
     try {
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
       return;
     }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     let activeRules = inheritedRules;
     if (honorGitignore) {
@@ -338,7 +385,7 @@ export async function walkWorkspaceFiles(
           continue;
         }
         visitedDirs.add(realChildDir);
-        await visit(full, rel, activeRules);
+        await visit(full, rel, activeRules, depth + 1);
         continue;
       }
 
@@ -367,6 +414,6 @@ export async function walkWorkspaceFiles(
     }
   }
 
-  await visit(realRoot, "", []);
+  await visit(realRoot, "", [], 0);
   return { realRoot, files };
 }

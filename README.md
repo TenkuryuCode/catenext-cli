@@ -50,11 +50,15 @@ Orchestrator mengikuti **bahasa Anda** di chat; stub persona dan nama tool tetap
 Dokumen lokal (`sync-board`, blueprint): `catenext doc save|get` — baca ringkas dengan
 `--outline` / `--section`, arsip dengan `doc archive|restore` ([detail](#dokumen-dan-skill)).
 
-**v0.17.0 (source; npm belum publish):**
+**v0.17.0 (sudah publish di npm):**
 - Epic run berbatas: `catenext epic run preview|start|resume|pause|close|review|verify`
 - Katalog skill terpadu: `skill list --user-skills` / `init|sync --user-skills` (read-only)
 - Context reviewer kompak: `review claim|refresh --include-context`
 - Ringkasan + arsip epic lokal: `epic summary|archive|restore`
+
+**v0.18.0 (source; npm belum publish):**
+- **MCP Protocol v2:** `resources/*` (`catenext://documents/{slug}`, `catenext://handoffs/{task_id}`), `prompts/*` (`kickoff-brainstorm`, `rc-review`, `docs-hygiene`), `annotations` standar pada seluruh 33 tool, serta `resource_link`, `structuredContent`, dan `outputSchema` untuk klien `>= 2025-06-18`.
+- **Optimasi & stub Antigravity:** deklarasi `tools` frontmatter persona Antigravity, bundle CLI ~849.9 KB, dan `buildReviewContextPack` ~73% lebih cepat pada p50.
 
 | Klien | `--platform` | Konfigurasi |
 | --- | --- | --- |

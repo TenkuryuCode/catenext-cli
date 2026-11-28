@@ -1,19 +1,35 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   CatenextConfigSchema,
+  CLAIM_CONTEXT_PACK_MAX_BYTES,
   estimateTokens,
   type HandoffSummary,
   type McpToolName,
+  REVIEW_CONTEXT_PACK_MAX_BYTES,
 } from "@catenext/shared";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { indexProjectGraph, microReindexModifiedFiles } from "../db/graph-index.js";
+import { mapScopeFilesToTests } from "../db/graph-summary.js";
+import { openDatabaseAt } from "../db/open.js";
+import { boundClaimContextPack, snapshotClaimContext } from "../local-claim-context.js";
+import { enrichReviewResult, prepareReviewPullRequest } from "../local-review-workflow.js";
 import { LocalService } from "../local-service.js";
+import type { LocalProject, LocalReview, LocalTask } from "../local-state.js";
+import {
+  buildReviewContextPackFromSnapshot,
+  clearReviewContextCache,
+  collectScopedDiffMetaAsync,
+  snapshotReviewContext,
+} from "../review-context.js";
 import type { McpRole } from "./catalog.js";
 import { createCatenextMcpServer } from "./server.js";
 import type { McpTransport } from "./stdio.js";
@@ -50,6 +66,7 @@ const tempRoots: string[] = [];
 const activeClosers: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  clearReviewContextCache();
   while (activeClosers.length > 0) {
     await activeClosers.pop()?.();
   }
@@ -235,10 +252,10 @@ describe("MCP context pack, compact handoffs, and artifact retrieval benchmark",
     const orch = getProfile("orchestrator_no_crud");
     const def = getProfile("default_no_crud");
     const all = getProfile("all_with_crud");
-    expect(worker.toolCount).toBe(15);
-    expect(orch.toolCount).toBe(24);
-    expect(def.toolCount).toBe(29);
-    expect(all.toolCount).toBe(33);
+    expect(worker.toolCount).toBe(14);
+    expect(orch.toolCount).toBe(26);
+    expect(def.toolCount).toBe(31);
+    expect(all.toolCount).toBe(35);
     expect(worker.responseBytes).toBeLessThan(def.responseBytes * 0.65);
     expect(orch.responseBytes).toBeLessThan(all.responseBytes * 0.8);
 
@@ -797,4 +814,325 @@ describe("MCP context pack, compact handoffs, and artifact retrieval benchmark",
       console.log("SCENARIO_BENCHMARK", JSON.stringify(results));
     }
   }, 60_000);
+
+  it("enforces warm-cache review pack p50 < 15 ms and lock-free enrichReviewResult outside SQLite writer lock", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "catenext-bench-review-cache-"));
+    tempRoots.push(repoRoot);
+    await exec("git", ["init", "-b", "main"], { cwd: repoRoot });
+    await exec("git", ["config", "user.email", "bench@example.com"], { cwd: repoRoot });
+    await exec("git", ["config", "user.name", "Bench"], { cwd: repoRoot });
+    await mkdir(join(repoRoot, "src"), { recursive: true });
+    await writeFile(join(repoRoot, "src/auth.ts"), "export const version = 1;\n", "utf8");
+    await exec("git", ["add", "."], { cwd: repoRoot });
+    await exec("git", ["commit", "-m", "init"], { cwd: repoRoot });
+
+    await exec("git", ["checkout", "-b", "feat/review-cache"], { cwd: repoRoot });
+    await writeFile(
+      join(repoRoot, "src/auth.ts"),
+      "export const version = 2;\nexport const ready = true;\n",
+      "utf8",
+    );
+    await exec("git", ["add", "src/auth.ts"], { cwd: repoRoot });
+    await exec("git", ["commit", "-m", "feat: update auth"], { cwd: repoRoot });
+    const headSha = await gitHead(repoRoot);
+
+    const { service, epicId } = await setupSeededProject(repoRoot);
+    const taskId = randomUUID();
+    const now = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const iso = new Date(now).toISOString();
+    const review: LocalReview = {
+      ref: { base_branch: "main", head_sha: headSha },
+      repo: "catenext",
+      author: "be",
+      updatedAt: iso,
+      approvedLocally: false,
+    };
+    const task: LocalTask = {
+      id: taskId,
+      epicId,
+      title: "Review cache regression task",
+      instruction: "Verify diff and context pack",
+      status: "NEEDS_REVIEW",
+      dependencies: [],
+      target: "catenext",
+      role: "backend",
+      persona: "be",
+      position: 0,
+      requiresApproval: true,
+      revision: 0,
+      stale: false,
+      scope_files: ["src/auth.ts"],
+      handoff: {
+        files_modified: ["src/auth.ts"],
+        key_decisions: ["DECISION-CACHE-1: bump auth version"],
+        notes_for_next_agent: "Inspect auth diff and verify cache behavior.",
+        verification_command: "pnpm test",
+        git_branch: "feat/review-cache",
+        last_commit_hash: headSha,
+        pull_request: { base_branch: "main", head_sha: headSha },
+      },
+      review,
+    };
+    const project: LocalProject = {
+      repos: ["catenext"],
+      epics: [{ id: epicId, title: "Review Cache", description: null }],
+      personas: [
+        { alias: "be", role: "backend", rules: [], repos: [] },
+        { alias: "reviewer", role: "reviewer", rules: [], repos: [] },
+      ],
+      tasks: [task],
+      documents: [
+        {
+          slug: "sync-board",
+          title: "Sync Board",
+          kind: "decision",
+          version: 1,
+          updated_by: "be",
+          updated_at: iso,
+          size: 120,
+          content: buildSyncBoardContent([{ taskId, decision: "DECISION-CACHE-1" }]),
+        },
+      ],
+      permissions: [],
+      workspace_roots: [],
+      session_prefs: {},
+      platform_setup: [],
+    };
+    const snapshot = snapshotReviewContext({ project, task, review, compact: true });
+
+    // Cold call primes (taskId, headSha) cache.
+    const coldMeta = await collectScopedDiffMetaAsync({
+      repoRoot,
+      baseBranch: "main",
+      headSha,
+      handoffFiles: ["src/auth.ts"],
+      scopeFiles: ["src/auth.ts"],
+      maxFiles: 5,
+      taskId,
+    });
+    expect(coldMeta.total_files).toBe(1);
+
+    const warmDiffTimes: number[] = [];
+    const warmPackTimes: number[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      const tDiff = performance.now();
+      const diffMeta = await collectScopedDiffMetaAsync({
+        repoRoot,
+        baseBranch: "main",
+        headSha,
+        handoffFiles: ["src/auth.ts"],
+        scopeFiles: ["src/auth.ts"],
+        maxFiles: 5,
+        taskId,
+      });
+      warmDiffTimes.push(performance.now() - tDiff);
+      expect(diffMeta.total_files).toBe(1);
+
+      const tPack = performance.now();
+      const pack = await buildReviewContextPackFromSnapshot(snapshot, repoRoot);
+      warmPackTimes.push(performance.now() - tPack);
+      expect(pack.byte_length).toBeLessThanOrEqual(REVIEW_CONTEXT_PACK_MAX_BYTES);
+    }
+    const warmDiffP50Ms = percentile(warmDiffTimes, 50);
+    const warmPackP50Ms = percentile(warmPackTimes, 50);
+    expect(warmDiffP50Ms).toBeLessThan(15);
+    expect(warmPackP50Ms).toBeLessThan(15);
+
+    // Ensure SQLite file exists on disk, then verify prepareReviewPullRequest runs without touching
+    // repoRoot and enrichReviewResult runs asynchronously outside the SQLite writer lock.
+    await service.callTool("session_brief", {});
+    const dbPath = join(repoRoot, ".catenext", "catenext.sqlite");
+    const tasksMap = new Map([[task.id, task]]);
+    const prepared = prepareReviewPullRequest(
+      {
+        action: "claim",
+        task_id: task.id,
+        agent_alias: "reviewer",
+        include_context: true,
+        compact: true,
+      },
+      {
+        project,
+        tasks: tasksMap,
+        repoRoot: "/nonexistent-inside-tx",
+        repo: "catenext",
+        overrides: undefined,
+        now,
+        iso,
+        personaForAlias: (alias) => ({
+          alias,
+          role: alias === "reviewer" ? "reviewer" : "backend",
+          rules: [],
+          repos: [],
+        }),
+        dirty: () => {},
+        recordEvent: () => {},
+      },
+    );
+    expect(prepared.contextSnapshot).toBeDefined();
+    expect("review_context_pack" in prepared.result).toBe(false);
+
+    clearReviewContextCache();
+    const db = openDatabaseAt(dbPath);
+    let writerLockAcquireMs = 0;
+    try {
+      const [enriched] = await Promise.all([
+        enrichReviewResult(prepared, repoRoot),
+        (async () => {
+          expect(existsSync(`${dbPath}.lock`)).toBe(false);
+          const tLock = performance.now();
+          db.exec("BEGIN IMMEDIATE; ROLLBACK;");
+          writerLockAcquireMs = performance.now() - tLock;
+        })(),
+      ]);
+      if ("reviews" in enriched || !enriched.review_context_pack) {
+        throw new Error("Expected enriched review_context_pack");
+      }
+      expect(enriched.review_context_pack.diff_meta.changed_files[0]?.path).toBe("src/auth.ts");
+      expect(enriched.review_context_pack.byte_length).toBeLessThanOrEqual(
+        REVIEW_CONTEXT_PACK_MAX_BYTES,
+      );
+      expect(writerLockAcquireMs).toBeLessThan(50);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("enforces microReindexModifiedFiles, mapScopeFilesToTests/snapshotClaimContext latency, <= 4096 B ClaimContextPack cap, and dist bundle budget if built", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "catenext-bench-claim-"));
+    tempRoots.push(repoRoot);
+    await mkdir(join(repoRoot, "src"), { recursive: true });
+    await mkdir(join(repoRoot, ".catenext"), { recursive: true });
+    await writeFile(join(repoRoot, "src/auth.ts"), "export const version = 1;\n", "utf8");
+    await writeFile(
+      join(repoRoot, "src/auth.test.ts"),
+      'import { version } from "./auth.js";\nexport const ok = version === 1;\n',
+      "utf8",
+    );
+    await writeFile(join(repoRoot, "src/util.ts"), "export const flag = true;\n", "utf8");
+    await writeFile(
+      join(repoRoot, "src/util.test.ts"),
+      'import { flag } from "./util.js";\nexport const ok = flag;\n',
+      "utf8",
+    );
+
+    const dbPath = join(repoRoot, ".catenext", "bench-graph.sqlite");
+    const projectId = randomUUID();
+    const initDb = openDatabaseAt(dbPath);
+    try {
+      initDb
+        .prepare("INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?)")
+        .run(projectId, "2026-01-01T00:00:00.000Z");
+    } finally {
+      initDb.close();
+    }
+
+    await indexProjectGraph(dbPath, projectId, repoRoot);
+
+    await writeFile(
+      join(repoRoot, "src/auth.ts"),
+      "export const version = 2;\nexport function verifyToken() { return true; }\n",
+      "utf8",
+    );
+    const tMicro = performance.now();
+    const micro = await microReindexModifiedFiles(
+      dbPath,
+      projectId,
+      [{ rootId: null, dir: repoRoot }],
+      ["src/auth.ts"],
+    );
+    const microMs = performance.now() - tMicro;
+    expect(micro.applied).toBe(true);
+    expect(micro.reindexed).toBe(1);
+    expect(microMs).toBeLessThan(500);
+
+    const epicId = randomUUID();
+    const taskId = randomUUID();
+    const project: LocalProject = {
+      repos: ["catenext"],
+      epics: [{ id: epicId, title: "Claim Context Bench", description: "Measure claim latency" }],
+      personas: [],
+      tasks: [],
+      documents: [
+        {
+          slug: "sync-board",
+          title: "Sync Board",
+          kind: "decision",
+          version: 1,
+          updated_by: "be",
+          updated_at: "2026-01-01T00:00:00.000Z",
+          size: 120,
+          content: buildSyncBoardContent([{ taskId, decision: "DECISION-CLAIM-9" }]),
+        },
+      ],
+      permissions: [],
+      workspace_roots: [],
+      session_prefs: {},
+      platform_setup: [],
+    };
+    const task: LocalTask = {
+      id: taskId,
+      epicId,
+      title: "Claim context latency task",
+      instruction: "Implement auth verification",
+      status: "IN_PROGRESS",
+      dependencies: [],
+      target: "catenext",
+      role: "backend",
+      persona: "be",
+      position: 0,
+      requiresApproval: false,
+      revision: 0,
+      stale: false,
+      scope_files: ["src/auth.ts"],
+    };
+
+    const db = openDatabaseAt(dbPath);
+    try {
+      const mapTimes: number[] = [];
+      const snapTimes: number[] = [];
+      let lastSnap!: ReturnType<typeof snapshotClaimContext>;
+      for (let i = 0; i < 10; i += 1) {
+        const tMap = performance.now();
+        const mapped = mapScopeFilesToTests(db, projectId, ["src/auth.ts"], { limit: 6 });
+        mapTimes.push(performance.now() - tMap);
+        expect(mapped).toContain("src/auth.test.ts");
+
+        const tSnap = performance.now();
+        lastSnap = snapshotClaimContext({
+          project,
+          task,
+          db,
+          projectId,
+          graphRootDirs: () => [{ rootId: null, dir: repoRoot }],
+        });
+        snapTimes.push(performance.now() - tSnap);
+      }
+
+      expect(percentile(mapTimes, 50)).toBeLessThan(25);
+      expect(percentile(snapTimes, 50)).toBeLessThan(25);
+      expect(lastSnap.pack.test_files).toContain("src/auth.test.ts");
+
+      const fitted = boundClaimContextPack(lastSnap.pack);
+      expect(Buffer.byteLength(JSON.stringify(fitted), "utf8")).toBeLessThanOrEqual(
+        CLAIM_CONTEXT_PACK_MAX_BYTES,
+      );
+      expect(CLAIM_CONTEXT_PACK_MAX_BYTES).toBe(4096);
+
+      const oversized = boundClaimContextPack({
+        ...lastSnap.pack,
+        sync_board_excerpt: "x".repeat(4050),
+      });
+      expect(oversized.truncated).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(oversized), "utf8")).toBeLessThanOrEqual(4096);
+    } finally {
+      db.close();
+    }
+
+    // Check dist/index.js bundle size budget only when already built so unbuilt runs never fail.
+    const distBundlePath = resolve(dirname(fileURLToPath(import.meta.url)), "../../dist/index.js");
+    if (existsSync(distBundlePath)) {
+      expect(statSync(distBundlePath).size).toBeLessThan(1_000_000);
+    }
+  });
 });

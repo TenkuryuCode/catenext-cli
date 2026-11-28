@@ -4,10 +4,12 @@ import { chmod } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  BRIEF_LIMITS,
   briefText,
   type CatenextConfig,
   DOCUMENT_LIMITS,
   findCycle,
+  findScopeFileOverlaps,
   GENERAL_RULES,
   IdSchema,
   isMcpCrudTool,
@@ -17,6 +19,8 @@ import {
   type McpToolOutput,
   type Persona,
   type ProjectDocument,
+  type ReviewResult,
+  type ScopeFileOverlap,
   type SearchHit,
   SetDependenciesInput,
   type TaskSummary,
@@ -29,6 +33,7 @@ import {
   ApprovalSnapshotSchema,
   HUMAN_APPROVAL_COMMANDS,
   requireHumanApproval,
+  requireHumanEpicRunApproval,
 } from "./approval-policy.js";
 import { keywordFallback, searchLocalCode } from "./code-search.js";
 import { checkGraphFreshness, queryGraphNeighbors, symbolSearch } from "./db/graph-index.js";
@@ -97,7 +102,13 @@ import {
   UpsertEpicSummaryInput,
   upsertVersionedEpicSummary,
 } from "./local-retention.js";
-import { offlineReview, reviewPullRequest, reviseTask } from "./local-review-workflow.js";
+import {
+  enrichReviewResult,
+  offlineReview,
+  type PreparedReviewResult,
+  prepareReviewPullRequest,
+  reviseTask,
+} from "./local-review-workflow.js";
 import { type LocalSearchItem, searchLocalContext } from "./local-search.js";
 import {
   allowsRepo,
@@ -115,6 +126,7 @@ import { saveSkill } from "./skills.js";
 import {
   type ActiveWorktreeLease,
   readWorktreeOverlapHint,
+  readWorktreeStatus,
   snapshotWorktreeLeases,
 } from "./worktree-status.js";
 
@@ -123,14 +135,16 @@ export { LocalServiceError } from "./errors.js";
 
 type Parsed<N extends McpToolName> = z.output<(typeof MCP_TOOLS)[N]["input"]>;
 type Handlers = {
-  [N in Exclude<McpToolName, McpCrudToolName | "claim_task" | "session_brief">]: (
-    input: Parsed<N>,
-  ) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
+  [N in Exclude<
+    McpToolName,
+    McpCrudToolName | "claim_task" | "session_brief" | "review_pull_request"
+  >]: (input: Parsed<N>) => McpToolOutput<N> | Promise<McpToolOutput<N>>;
 };
 
 interface SessionBriefHintSnapshot {
   graphRoots: GraphRootDir[];
   worktreeLeases?: ActiveWorktreeLease[];
+  scopeOverlaps?: ScopeFileOverlap[];
 }
 const directives = [
   ...GENERAL_RULES,
@@ -1004,7 +1018,7 @@ export class LocalService {
       try {
         const overlaps = await readWorktreeOverlapHint(this.repoRoot, snapshot.worktreeLeases);
         if (overlaps.length > 0) {
-          const files = overlaps.slice(0, 3).map((o) => o.file);
+          const files = overlaps.slice(0, 3).map((o) => scrubText(o.file));
           const more = overlaps.length > 3 ? `, +${overlaps.length - 3} more` : "";
           hints.push(
             briefText(
@@ -1017,15 +1031,27 @@ export class LocalService {
         // Worktree hints are optional, even if the scanner fails unexpectedly.
       }
     }
+    if (snapshot.scopeOverlaps && snapshot.scopeOverlaps.length > 0) {
+      const files = snapshot.scopeOverlaps.slice(0, 3).map((o) => scrubText(o.path));
+      const more =
+        snapshot.scopeOverlaps.length > 3 ? `, +${snapshot.scopeOverlaps.length - 3} more` : "";
+      const taskCount = new Set(snapshot.scopeOverlaps.flatMap((o) => o.task_ids)).size;
+      hints.push(
+        briefText(
+          `Parallel scope_files overlap (${snapshot.scopeOverlaps.length} across ${taskCount} tasks): ${files.join(", ")}${more} — sequence or isolate.`,
+          BRIEF_LIMITS.line,
+        ),
+      );
+    }
     if (this.caller === "agent" && process.env.CATENEXT_MCP_ROLE === "") {
       hints.push(
         briefText(
           "MCP launched without --role — prefer --role orchestrator|worker to shrink tools/list.",
-          160,
+          BRIEF_LIMITS.line,
         ),
       );
     }
-    return hints.slice(0, 6);
+    return hints.slice(0, BRIEF_LIMITS.hints);
   }
 
   async callTool<K extends McpToolName>(
@@ -1055,8 +1081,11 @@ export class LocalService {
     if (name === "manage_task") {
       requireHumanApproval(this.caller, MCP_TOOLS.manage_task.input.parse(parsed.data));
     }
+    if (name === "epic_run") {
+      requireHumanEpicRunApproval(this.caller, MCP_TOOLS.epic_run.input.parse(parsed.data));
+    }
     const existed = existsSync(this.stateFile);
-    const { out, hintSnapshot, claimContext } = await this.store.transaction(
+    const { out, hintSnapshot, claimContext, reviewContext } = await this.store.transaction(
       this.config.project_id,
       this.config.repo_name,
       async (project, dirty, db, afterSave) => {
@@ -1080,10 +1109,19 @@ export class LocalService {
         }
         let result: unknown;
         let claimContext: ClaimContextSnapshot | undefined;
+        let reviewContext: PreparedReviewResult | undefined;
         if (toolName === "claim_task") {
           ({ result, context: claimContext } = tools.claim(
             MCP_TOOLS.claim_task.input.parse(parsed.data),
           ));
+        } else if (toolName === "review_pull_request") {
+          const prepared = tools.reviewPullRequest(
+            MCP_TOOLS.review_pull_request.input.parse(parsed.data),
+          );
+          result = prepared.result;
+          if (prepared.contextSnapshot || prepared.includeByteLength) {
+            reviewContext = prepared;
+          }
         } else if (name === "manage_task" && local?.approvalSnapshot !== undefined) {
           result = tools.manageTask(
             MCP_TOOLS.manage_task.input.parse(parsed.data),
@@ -1103,7 +1141,7 @@ export class LocalService {
             insertTaskEvents(txDb, this.config.project_id, events);
           });
         }
-        return { out: validated, claimContext };
+        return { out: validated, claimContext, reviewContext };
       },
     );
     if (!existed && process.platform !== "win32" && existsSync(this.stateFile)) {
@@ -1117,6 +1155,13 @@ export class LocalService {
     if (claimContext) {
       const pack = await enrichClaimContext(claimContext, this.repoRoot, this.config.platforms);
       if (pack) return { ...out, context_pack: pack };
+    }
+    if (reviewContext) {
+      const enriched = await enrichReviewResult(
+        { ...reviewContext, result: out as ReviewResult },
+        this.repoRoot,
+      );
+      return contract.output.parse(enriched) as McpToolOutput<K>;
     }
     return out;
   }
@@ -1367,19 +1412,6 @@ class LocalWorkflow {
     archive_document: (input) => this.archiveDocument(input),
     restore_document: (input) => this.restoreDocument(input),
     search_context: (input) => this.search(input),
-    review_pull_request: ({ request }) =>
-      reviewPullRequest(request, {
-        project: this.project,
-        tasks: this.tasks,
-        repoRoot: this.root,
-        repo: this.repo,
-        overrides: this.config.overrides,
-        now: this.now,
-        iso: this.iso,
-        personaForAlias: (alias) => this.persona(alias),
-        dirty: this.dirty,
-        recordEvent: (event) => this.recordEvent(event),
-      }),
     load_skill: async ({ name, revision, source_id }) => {
       const skill = await loadCatalogSkill(this.root, name, {
         platforms: this.config.platforms,
@@ -1413,7 +1445,83 @@ class LocalWorkflow {
       summarizeProjectGraph(this.db, this.config.project_id, input, this.graphRootDirs()),
     graph_impact: (input) =>
       analyzeGraphImpact(this.db, this.config.project_id, input, this.graphRootDirs()),
+    worktree_status: (input) =>
+      readWorktreeStatus(this.root, {
+        leases: snapshotWorktreeLeases(this.project.tasks, this.config.repo_name),
+        ...(input.merge_dry_run !== undefined ? { mergeDryRun: input.merge_dry_run } : {}),
+      }),
+    epic_run: (input) => this.handleEpicRun(input),
   };
+
+  private handleEpicRun(input: Parsed<"epic_run">): McpToolOutput<"epic_run"> {
+    if (input.action === "preview") {
+      const check = input.check!;
+      if (scrubText(check) !== check) {
+        fail("invalid_input", "Verification command must not contain credentials.");
+      }
+      return previewRun(this.root, this.config, this.project, this.db, input.epic_id, {
+        base: input.base!,
+        check,
+      });
+    }
+
+    let run = readRun(this.db, this.config.project_id, input.epic_id);
+    if (run && run.plan.repo !== this.config.repo_name) {
+      fail("wrong_repo", "Run belongs to another repo.");
+    }
+
+    if (input.action === "start") {
+      const base = input.base!;
+      const check = input.check!;
+      const snapshot = input.snapshot!;
+      if (scrubText(check) !== check) {
+        fail("invalid_input", "Verification command must not contain credentials.");
+      }
+      if (run) {
+        if (
+          run.snapshot === snapshot &&
+          run.plan.base === base &&
+          run.plan.check === check &&
+          run.status !== "CLOSED"
+        ) {
+          return this.runView(run);
+        }
+        fail(
+          "run_state",
+          "Epic already has a local run. Start a new epic for a new authorization.",
+        );
+      }
+      if (
+        this.db
+          .prepare("SELECT 1 FROM epic_runs WHERE project_id = ? AND repo = ? AND closed = 0")
+          .get(this.config.project_id, this.config.repo_name)
+      ) {
+        fail("run_state", "Close the existing local run before starting another in this repo.");
+      }
+      const preview = previewRun(this.root, this.config, this.project, this.db, input.epic_id, {
+        base,
+        check,
+      });
+      if (snapshot !== preview.snapshot) {
+        fail("stale_approval", "Plan changed since preview. Request fresh confirmation.");
+      }
+      run = this.startRun(preview.plan, preview.snapshot);
+      this.runs.push(run);
+      return this.runView(run);
+    }
+
+    if (!run) fail("not_found", "No local run for this epic.");
+    const before = JSON.stringify(run);
+    if (input.action === "pause") {
+      this.advanceRun(run, { action: "pause", reason: scrubText(input.reason!) });
+    } else if (input.action === "resume") {
+      this.advanceRun(run, { action: "resume" });
+    } else {
+      this.advanceRun(run, { action: "close" });
+    }
+    if (before !== JSON.stringify(run)) this.runs.push(run);
+    return this.runView(run);
+  }
 
   private graphRootDirs(): GraphRootDir[] {
     return [
@@ -1684,6 +1792,7 @@ class LocalWorkflow {
   }
 
   private board(input: Parsed<"get_project_board">): McpToolOutput<"get_project_board"> {
+    const compact = Boolean(input.compact);
     const personas = this.personas();
     const includeArchived = Boolean(input.include_archived);
     const epics = this.epicSummaries(includeArchived).filter(
@@ -1707,14 +1816,16 @@ class LocalWorkflow {
         counts: task_counts,
         ...(archived_at ? { archived_at } : {}),
       })),
-      repos: this.repos().map((repo) => ({
-        repo,
-        personas: personas.filter((p) => p.repos.includes(repo)).map((p) => p.alias),
-      })),
-      personas,
+      repos: compact
+        ? []
+        : this.repos().map((repo) => ({
+            repo,
+            personas: personas.filter((p) => p.repos.includes(repo)).map((p) => p.alias),
+          })),
+      personas: compact ? [] : personas,
       tasks: rows.slice(0, input.limit).map((task) => ({
         id: task.id,
-        title: briefText(task.title, 120),
+        title: briefText(task.title, compact ? 60 : 120),
         epic_id: task.epicId,
         status: task.status,
         role: task.role,
@@ -1726,7 +1837,7 @@ class LocalWorkflow {
         revision_count: task.revision,
         locked_by_repo: this.activeLease(task)?.repo ?? null,
         blocker_reason: task.blocker
-          ? briefText(task.blocker.reason, input.verbose ? 1000 : 160)
+          ? briefText(task.blocker.reason, compact ? 80 : input.verbose ? 1000 : 160)
           : null,
         ...(task.archived_at ? { archived_at: task.archived_at } : {}),
       })),
@@ -1897,6 +2008,17 @@ class LocalWorkflow {
     } else {
       lines.push({ kind: "info", text: "No ready tasks. Plan or unblock next." });
     }
+    const activeInProgress = activeTasks.filter(
+      (task) => task.status === "IN_PROGRESS" && Boolean(this.activeLease(task)),
+    );
+    const scopeOverlaps = findScopeFileOverlaps(
+      [...activeInProgress, ...ready].map((task) => ({
+        id: task.id,
+        target_repo: task.target,
+        dependencies: task.dependencies,
+        scope_files: task.scope_files,
+      })),
+    );
     return {
       brief: {
         lines: lines.slice(0, 24),
@@ -1915,6 +2037,7 @@ class LocalWorkflow {
         ...(activeWorktrees.length > 1
           ? { worktreeLeases: snapshotWorktreeLeases(this.project.tasks, this.repo) }
           : {}),
+        ...(scopeOverlaps.length > 0 ? { scopeOverlaps } : {}),
       },
     };
   }
@@ -2046,6 +2169,21 @@ class LocalWorkflow {
       workspace_roots: this.workspaceRootSummaries(),
       ...(this.project.session_prefs?.locale ? { locale: this.project.session_prefs.locale } : {}),
     };
+  }
+
+  reviewPullRequest({ request }: Parsed<"review_pull_request">): PreparedReviewResult {
+    return prepareReviewPullRequest(request, {
+      project: this.project,
+      tasks: this.tasks,
+      repoRoot: this.root,
+      repo: this.repo,
+      overrides: this.config.overrides,
+      now: this.now,
+      iso: this.iso,
+      personaForAlias: (alias) => this.persona(alias),
+      dirty: this.dirty,
+      recordEvent: (event) => this.recordEvent(event),
+    });
   }
 
   claim(input: Parsed<"claim_task">): {

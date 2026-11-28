@@ -152,6 +152,8 @@ export const GetProjectBoardInput = z.object({
   limit: z.number().int().min(1).max(200).default(100),
   /** Include longer blocker text; default compact. */
   verbose: z.boolean().optional(),
+  /** Compact mode: return minimal board payload for token-cheap reads. */
+  compact: z.boolean().optional(),
   /** Sertakan epic dan task yang sudah diarsipkan; default hanya yang aktif. */
   include_archived: z.boolean().optional(),
 });
@@ -217,6 +219,7 @@ export const ClaimContextPackSchema = z.object({
   sync_board_excerpt: z.string().optional(),
   skills_hint: z.array(z.string()).optional(),
   graph_slice: z.array(ClaimGraphFileSchema).optional(),
+  test_files: z.array(z.string()).max(10).optional(),
   /** Set when optional context was dropped or shortened to fit the byte budget. */
   truncated: z.literal(true).optional(),
 });
@@ -607,6 +610,102 @@ export const RemovePersonaOutput = z.object({
   removed: z.literal(true),
 });
 
+// --- worktree_status (orchestrator) -----------------------------------------
+
+export const WorktreeStatusInput = z.object({
+  /** Run bounded read-only `git merge-tree --write-tree` conflict dry-runs between active branches/base. */
+  merge_dry_run: z.boolean().optional(),
+});
+export const WorktreeStatusLeaseSchema = z.object({
+  task_id: IdSchema,
+  persona: AgentAliasSchema.nullable(),
+});
+export const WorktreeStatusEntrySchema = z.object({
+  path: z.string(),
+  branch: z.string().nullable(),
+  head: z.string().nullable(),
+  prunable: z.boolean(),
+  dirty_count: z.number().int().min(0),
+  modified_files: z.array(z.string()),
+  ahead_count: z.number().int().min(0),
+  ahead_files: z.array(z.string()),
+  lease: WorktreeStatusLeaseSchema.optional(),
+});
+export const WorktreeFileOverlapSchema = z.object({
+  file: z.string(),
+  worktrees: z.array(z.string()),
+});
+export const WorktreeMergeConflictSchema = z.object({
+  source: z.string(),
+  target: z.string(),
+  conflicts: z.array(z.string()),
+  conflict_count: z.number().int().min(1),
+});
+export const WorktreeStatusOutput = z.object({
+  worktrees: z.array(WorktreeStatusEntrySchema),
+  overlaps: z.array(WorktreeFileOverlapSchema),
+  merge_conflicts: z.array(WorktreeMergeConflictSchema).optional(),
+});
+
+// --- epic_run (orchestrator) ------------------------------------------------
+
+export const EPIC_RUN_ACTIONS = ["preview", "start", "resume", "pause", "close"] as const;
+export const EpicRunActionSchema = z.enum(EPIC_RUN_ACTIONS);
+export type EpicRunAction = z.infer<typeof EpicRunActionSchema>;
+
+const EpicRunSnapshotSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const EpicRunReasonSchema = z.string().trim().min(5).max(1000);
+
+export const EpicRunInput = z
+  .object({
+    epic_id: IdSchema,
+    action: EpicRunActionSchema,
+    base: z.string().min(1).max(255).optional(),
+    check: TaskVerifyCommandSchema.optional(),
+    snapshot: EpicRunSnapshotSchema.optional(),
+    reason: EpicRunReasonSchema.optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.action === "preview" || v.action === "start") {
+      if (!v.base) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["base"],
+          message: `${v.action} butuh base branch.`,
+        });
+      }
+      if (!v.check) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["check"],
+          message: `${v.action} butuh check command.`,
+        });
+      }
+    }
+    if (v.action === "start" && !v.snapshot) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["snapshot"],
+        message: "start butuh snapshot dari preview.",
+      });
+    }
+    if (v.action === "pause" && !v.reason) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: "pause butuh reason.",
+      });
+    }
+  });
+
+export const EpicRunOutput = z.looseObject({
+  snapshot: EpicRunSnapshotSchema,
+  integration_branch: z.string(),
+  status: z.enum(["RUNNING", "PAUSED", "READY_FOR_PR", "CLOSED"]).optional(),
+  reason: z.string().optional(),
+  eligible: z.array(IdSchema).optional(),
+});
+
 // --- Registry ---------------------------------------------------------------
 
 export interface McpToolContract<I extends z.ZodType, O extends z.ZodType> {
@@ -788,6 +887,16 @@ export const MCP_TOOLS = {
     "Trace reverse transitive dependents of a file before editing or refactoring.",
     GraphImpactInput,
     GraphImpactOutput,
+  ),
+  worktree_status: tool(
+    "Read-only snapshot of local git worktrees, dirty/ahead counts, active task leases, and file overlaps.",
+    WorktreeStatusInput,
+    WorktreeStatusOutput,
+  ),
+  epic_run: tool(
+    "Orchestrate a local stepped epic run (preview, start, resume, pause, close).",
+    EpicRunInput,
+    EpicRunOutput,
   ),
 } as const;
 

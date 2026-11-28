@@ -8,7 +8,7 @@ import {
 } from "@catenext/shared";
 import { z } from "zod";
 
-export const MCP_ROLES = ["orchestrator", "worker"] as const;
+export const MCP_ROLES = ["orchestrator", "worker", "reviewer"] as const;
 export const McpRoleSchema = z.enum(MCP_ROLES);
 export type McpRole = z.infer<typeof McpRoleSchema>;
 
@@ -39,6 +39,8 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "graph_summary",
     "graph_impact",
     "review_pull_request",
+    "worktree_status",
+    "epic_run",
   ],
   worker: [
     "get_project_context",
@@ -51,11 +53,23 @@ export const ROLE_TOOLS: Record<McpRole, readonly McpToolName[]> = {
     "get_document",
     "search_context",
     "load_skill",
-    "save_repo_skill",
     "graph_neighbors",
     "symbol_search",
     "graph_summary",
     "graph_impact",
+  ],
+  reviewer: [
+    "get_project_board",
+    "get_project_context",
+    "list_epics",
+    "get_document",
+    "search_context",
+    "load_skill",
+    "graph_neighbors",
+    "symbol_search",
+    "graph_summary",
+    "graph_impact",
+    "review_pull_request",
   ],
 };
 
@@ -97,6 +111,8 @@ export const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   graph_summary:
     "Summarize module architecture, dependency groups, hubs, and Mermaid graph by prefix.",
   graph_impact: "Analyze reverse transitive dependents of a file before editing.",
+  worktree_status: "Inspect git worktrees, dirty/ahead counts, active leases, and file overlaps.",
+  epic_run: "Preview, start, resume, pause, or close a local stepped epic run.",
 };
 
 export interface McpToolAnnotations {
@@ -176,6 +192,8 @@ export const TOOL_ANNOTATIONS: Record<McpToolName, McpToolAnnotations> = {
   symbol_search: READ_ONLY,
   graph_summary: READ_ONLY,
   graph_impact: READ_ONLY,
+  worktree_status: READ_ONLY,
+  epic_run: MUTATE,
 };
 
 export interface CompactToolInputSchema {
@@ -201,7 +219,7 @@ export interface CompactMcpTool {
 
 /** Only trusted launch options grant CRUD; role can narrow but never grant it. */
 export function mcpCrudEnabled(role?: McpRole, allowCrud = false): boolean {
-  return allowCrud === true && role !== "worker";
+  return allowCrud === true && role !== "worker" && role !== "reviewer";
 }
 
 export function toolsForRole(role?: McpRole, allowCrud = false): McpToolName[] {

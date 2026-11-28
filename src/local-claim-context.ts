@@ -6,7 +6,7 @@ import {
   ClaimContextPackSchema,
 } from "@catenext/shared";
 import { getGraphCounts, queryClaimGraphSlice } from "./db/graph-index.js";
-import type { GraphRootDir } from "./db/graph-summary.js";
+import { type GraphRootDir, mapScopeFilesToTests } from "./db/graph-summary.js";
 import { resolveEpicSummaryText } from "./local-retention.js";
 import type { LocalProject, LocalTask } from "./local-state.js";
 import { type DiscoveredSkillEntry, discoverSkillCatalog } from "./skill-catalog.js";
@@ -40,13 +40,11 @@ export function snapshotClaimContext({
     if (excerpt) pack.sync_board_excerpt = excerpt;
   }
   if (task.scope_files?.length && getGraphCounts(db, projectId).files > 0) {
-    const files = queryClaimGraphSlice(
-      db,
-      projectId,
-      task.scope_files.slice(0, 5),
-      graphRootDirs(),
-    );
+    const scopeSlice = task.scope_files.slice(0, 5);
+    const files = queryClaimGraphSlice(db, projectId, scopeSlice, graphRootDirs());
     if (files.length > 0) pack.graph_slice = files;
+    const testFiles = mapScopeFilesToTests(db, projectId, scopeSlice, { limit: 6 });
+    if (testFiles.length > 0) pack.test_files = testFiles;
   }
   return {
     pack: ClaimContextPackSchema.parse(pack),
@@ -178,6 +176,8 @@ export function boundClaimContextPack(pack: ClaimContextPack): ClaimContextPack 
     bounded.graph_slice = pack.graph_slice.map(({ symbol_locations: _locations, ...file }) => file);
     if (fits(bounded)) return bounded;
   }
+  delete bounded.test_files;
+  if (fits(bounded)) return bounded;
   delete bounded.graph_slice;
   if (fits(bounded)) return bounded;
 

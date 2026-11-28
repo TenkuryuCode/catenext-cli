@@ -282,3 +282,62 @@ export async function readResource(
     },
   };
 }
+
+/** Map a mutating MCP tool call to its affected resource URI, if any. */
+export function mutatedResourceUri(toolName: string, args: unknown): string | null {
+  if (!isPlainObject(args)) return null;
+  if (
+    toolName === "save_document" ||
+    toolName === "archive_document" ||
+    toolName === "restore_document"
+  ) {
+    return typeof args.slug === "string" && args.slug.length > 0
+      ? documentResourceUri(args.slug)
+      : null;
+  }
+  if (toolName === "complete_handoff") {
+    return typeof args.task_id === "string" && args.task_id.length > 0
+      ? handoffResourceUri(args.task_id)
+      : null;
+  }
+  return null;
+}
+
+/** Subscribe a session to `notifications/resources/updated` for a valid Catenext resource URI. */
+export function subscribeResource(
+  subscriptions: Set<string>,
+  params: unknown,
+): HandlerResult<Record<string, never>> {
+  if (!isPlainObject(params) || typeof params.uri !== "string" || params.uri.length === 0) {
+    return {
+      ok: false,
+      code: JSONRPC_INVALID_PARAMS,
+      message: "Invalid resources/subscribe params.",
+    };
+  }
+  if (!parseResourceUri(params.uri)) {
+    return {
+      ok: false,
+      code: JSONRPC_RESOURCE_NOT_FOUND,
+      message: `Resource not found: ${params.uri}`,
+    };
+  }
+  subscriptions.add(params.uri);
+  return { ok: true, result: {} };
+}
+
+/** Unsubscribe a session from `notifications/resources/updated` for a URI. */
+export function unsubscribeResource(
+  subscriptions: Set<string>,
+  params: unknown,
+): HandlerResult<Record<string, never>> {
+  if (!isPlainObject(params) || typeof params.uri !== "string" || params.uri.length === 0) {
+    return {
+      ok: false,
+      code: JSONRPC_INVALID_PARAMS,
+      message: "Invalid resources/unsubscribe params.",
+    };
+  }
+  subscriptions.delete(params.uri);
+  return { ok: true, result: {} };
+}

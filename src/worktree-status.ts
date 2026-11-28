@@ -7,9 +7,12 @@ import { loadProjectState } from "./db/project-codec.js";
 import { isConsistent, LocalStore } from "./db/store.js";
 import { LocalServiceError } from "./errors.js";
 import type { LocalTask } from "./local-state.js";
+import { scrubText } from "./scrubber.js";
 import { WorktreeError } from "./worktrees.js";
 
 const MAX_MODIFIED_FILES = 50;
+const MAX_MERGE_DRY_RUN_PAIRS = 20;
+const MERGE_DRY_RUN_TIMEOUT_MS = 2500;
 export const WORKTREE_HINT_TIMEOUT_MS = 250;
 const exec = promisify(execFile);
 
@@ -35,9 +38,17 @@ export interface WorktreeFileOverlap {
   worktrees: string[];
 }
 
+export interface WorktreeMergeConflict {
+  source: string;
+  target: string;
+  conflicts: string[];
+  conflict_count: number;
+}
+
 export interface WorktreeStatusResult {
   worktrees: WorktreeStatusEntry[];
   overlaps: WorktreeFileOverlap[];
+  merge_conflicts?: WorktreeMergeConflict[];
 }
 
 interface RawGitWorktree {
@@ -57,11 +68,7 @@ export interface ActiveWorktreeLease extends WorktreeStatusLease {
 type GitRunner = (cwd: string, args: string[]) => Promise<string>;
 
 function cleanGitEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"]) {
-    delete env[key];
-  }
-  return env;
+  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
 }
 
 async function runGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
@@ -211,11 +218,47 @@ export function parseGitDiffNameOnly(raw: string): string[] {
   return files;
 }
 
+function isValidCommitSha(sha: string): boolean {
+  return /^[0-9a-f]{40,64}$/i.test(sha);
+}
+
+function isValidGitRef(ref: string): boolean {
+  if (!ref || ref.length > 255) return false;
+  if (ref.startsWith("-") || ref.includes("..") || ref.endsWith("/") || ref.endsWith(".lock")) {
+    return false;
+  }
+  if (/[\s~^:?*[\\]/.test(ref)) return false;
+  return !Array.from(ref).some((ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
+  });
+}
+
+export function parseMergeTreeConflicts(raw: string): string[] {
+  if (!raw) return [];
+  const tokens = raw.includes("\0") ? raw.split("\0") : raw.split(/\r?\n/);
+  const files: string[] = [];
+  const seen = new Set<string>();
+  let index = 0;
+  if (tokens[0] && isValidCommitSha(tokens[0].trim())) {
+    index = 1;
+  }
+  for (; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    files.push(token);
+  }
+  return files;
+}
+
 async function verifyCommitRef(git: GitRunner, cwd: string, ref: string): Promise<string | null> {
-  if (!ref || ref.startsWith("-") || ref.includes("..")) return null;
+  if (!isValidGitRef(ref)) return null;
   try {
-    const out = (await git(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).trim();
-    return /^[0-9a-f]{40,}$/i.test(out) ? out : null;
+    const out = (
+      await git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`])
+    ).trim();
+    return isValidCommitSha(out) ? out : null;
   } catch {
     return null;
   }
@@ -272,9 +315,7 @@ async function readMarkerBaseBranch(
     if (
       parsed.branch === branch &&
       typeof parsed.base_branch === "string" &&
-      parsed.base_branch.length > 0 &&
-      !parsed.base_branch.startsWith("-") &&
-      !parsed.base_branch.includes("..")
+      isValidGitRef(parsed.base_branch)
     ) {
       return parsed.base_branch;
     }
@@ -344,11 +385,67 @@ function matchLeaseRecord(
   return undefined;
 }
 
+function shortRefName(ref: string): string {
+  if (ref.startsWith("refs/heads/")) return ref.slice(11);
+  if (ref.startsWith("refs/remotes/")) return ref.slice(13);
+  return ref;
+}
+
+async function runMergeTreeDryRun(
+  cwd: string,
+  commitA: string,
+  commitB: string,
+  signal?: AbortSignal,
+): Promise<string[] | null> {
+  if (!isValidCommitSha(commitA) || !isValidCommitSha(commitB)) return null;
+  signal?.throwIfAborted();
+  const timeout = AbortSignal.timeout(MERGE_DRY_RUN_TIMEOUT_MS);
+  const combinedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const child = exec(
+    "git",
+    [
+      "--no-optional-locks",
+      "merge-tree",
+      "--write-tree",
+      "--name-only",
+      "--no-messages",
+      "-z",
+      "--end-of-options",
+      commitA,
+      commitB,
+    ],
+    {
+      cwd,
+      env: cleanGitEnv(),
+      encoding: "utf8",
+      signal: combinedSignal,
+      killSignal: "SIGKILL",
+      maxBuffer: 256 * 1024,
+    },
+  );
+  child.child.stdin?.end();
+  try {
+    await child;
+    return [];
+  } catch (error) {
+    signal?.throwIfAborted();
+    const err = error as { code?: unknown; stdout?: unknown };
+    if (err.code === 1 && typeof err.stdout === "string") {
+      return parseMergeTreeConflicts(err.stdout);
+    }
+    return null;
+  }
+}
+
 /** Full CLI status. Keep normal per-command Git timeouts and SQLite lease enrichment. */
 export async function readWorktreeStatus(
   cwd: string = process.cwd(),
+  options?: { leases?: readonly ActiveWorktreeLease[]; mergeDryRun?: boolean },
 ): Promise<WorktreeStatusResult> {
-  return scanWorktreeStatus(cwd);
+  return scanWorktreeStatus(cwd, {
+    ...(options?.leases ? { leases: options.leases } : {}),
+    ...(options?.mergeDryRun ? { mergeDryRun: true } : {}),
+  });
 }
 
 /** Best-effort scan from a lease snapshot. Never reopens SQLite or reads project config. */
@@ -376,7 +473,7 @@ export async function readWorktreeOverlapHint(
 
 async function scanWorktreeStatus(
   cwd: string,
-  hint?: { leases: readonly ActiveWorktreeLease[]; signal: AbortSignal },
+  hint?: { leases?: readonly ActiveWorktreeLease[]; signal?: AbortSignal; mergeDryRun?: boolean },
 ): Promise<WorktreeStatusResult> {
   const signal = hint?.signal;
   const git: GitRunner = (cwd, args) => runGit(cwd, args, signal);
@@ -407,7 +504,13 @@ async function scanWorktreeStatus(
   const defaultBase = await resolveDefaultBaseRef(git, primaryPath, primary.branch);
 
   const inspected: Array<
-    WorktreeStatusEntry & { allDirtyFiles: string[]; allAheadFiles: string[] }
+    WorktreeStatusEntry & {
+      allDirtyFiles: string[];
+      allAheadFiles: string[];
+      bare: boolean;
+      resolvedBaseRef: string | null;
+      resolvedBaseCommit: string | null;
+    }
   > = [];
   for (const [index, rawTree] of rawTrees.entries()) {
     signal?.throwIfAborted();
@@ -417,6 +520,8 @@ async function scanWorktreeStatus(
     let prunable = rawTree.prunable || missing;
     let allDirtyFiles: string[] = [];
     let allAheadFiles: string[] = [];
+    let baseRef: string | null = null;
+    let baseCommit: string | null = null;
 
     if (!prunable && !rawTree.bare) {
       try {
@@ -445,9 +550,7 @@ async function scanWorktreeStatus(
       const preferredBase =
         leaseRecord?.baseBranch ??
         (index > 0 ? await readMarkerBaseBranch(git, path, rawTree.branch, signal) : null);
-      let baseRef: string | null = null;
-      let baseCommit: string | null = null;
-      if (preferredBase) {
+      if (preferredBase && isValidGitRef(preferredBase)) {
         const candidates = preferredBase.startsWith("refs/")
           ? [preferredBase]
           : [`refs/heads/${preferredBase}`, preferredBase];
@@ -472,7 +575,16 @@ async function scanWorktreeStatus(
         baseRef !== `refs/heads/${rawTree.branch}`
       ) {
         try {
-          const diffRaw = await git(path, ["diff", "--name-only", "-z", `${baseRef}...HEAD`]);
+          const diffRaw = await git(path, [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            "--end-of-options",
+            `${baseRef}...HEAD`,
+            "--",
+          ]);
           allAheadFiles = parseGitDiffNameOnly(diffRaw);
         } catch {
           signal?.throwIfAborted();
@@ -493,6 +605,9 @@ async function scanWorktreeStatus(
       ...(lease ? { lease } : {}),
       allDirtyFiles,
       allAheadFiles,
+      bare: rawTree.bare,
+      resolvedBaseRef: baseRef,
+      resolvedBaseCommit: baseCommit,
     });
   }
 
@@ -510,14 +625,92 @@ async function scanWorktreeStatus(
   const overlaps: WorktreeFileOverlap[] = [];
   for (const [file, worktrees] of fileToWorktrees.entries()) {
     if (worktrees.length >= 2) {
-      overlaps.push({ file, worktrees });
+      overlaps.push({
+        file: scrubText(file),
+        worktrees: worktrees.map((worktreePath) => scrubText(worktreePath)),
+      });
     }
   }
   overlaps.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 
+  let mergeConflicts: WorktreeMergeConflict[] | undefined;
+  if (hint?.mergeDryRun) {
+    mergeConflicts = [];
+    const seenPairs = new Set<string>();
+    const pairs: Array<{
+      source: string;
+      target: string;
+      commitA: string;
+      commitB: string;
+    }> = [];
+
+    const activeHeads = inspected.filter(
+      (entry): entry is typeof entry & { head: string } =>
+        !entry.prunable && !entry.bare && entry.head !== null && isValidCommitSha(entry.head),
+    );
+
+    const addPair = (source: string, target: string, commitA: string, commitB: string) => {
+      if (pairs.length >= MAX_MERGE_DRY_RUN_PAIRS) return;
+      if (commitA === commitB) return;
+      const key = commitA < commitB ? `${commitA}:${commitB}` : `${commitB}:${commitA}`;
+      if (seenPairs.has(key)) return;
+      seenPairs.add(key);
+      pairs.push({ source, target, commitA, commitB });
+    };
+
+    for (const entry of activeHeads) {
+      const label = entry.branch ?? `(detached:${entry.head.slice(0, 7)})`;
+      if (
+        entry.resolvedBaseRef &&
+        entry.resolvedBaseCommit &&
+        entry.resolvedBaseCommit !== entry.head &&
+        entry.resolvedBaseRef !== (entry.branch ? `refs/heads/${entry.branch}` : null)
+      ) {
+        addPair(label, shortRefName(entry.resolvedBaseRef), entry.head, entry.resolvedBaseCommit);
+      }
+    }
+
+    for (const [i, a] of activeHeads.entries()) {
+      const labelA = a.branch ?? `(detached:${a.head.slice(0, 7)})`;
+      for (const b of activeHeads.slice(i + 1)) {
+        const labelB = b.branch ?? `(detached:${b.head.slice(0, 7)})`;
+        addPair(labelA, labelB, a.head, b.head);
+      }
+    }
+
+    for (const pair of pairs) {
+      signal?.throwIfAborted();
+      const conflicts = await runMergeTreeDryRun(primaryPath, pair.commitA, pair.commitB, signal);
+      if (conflicts && conflicts.length > 0) {
+        mergeConflicts.push({
+          source: scrubText(pair.source),
+          target: scrubText(pair.target),
+          conflicts: conflicts.slice(0, MAX_MODIFIED_FILES).map((c) => scrubText(c)),
+          conflict_count: conflicts.length,
+        });
+      }
+    }
+  }
+
   return {
-    worktrees: inspected.map(({ allDirtyFiles: _d, allAheadFiles: _a, ...entry }) => entry),
+    worktrees: inspected.map(
+      ({
+        allDirtyFiles: _d,
+        allAheadFiles: _a,
+        bare: _b,
+        resolvedBaseRef: _br,
+        resolvedBaseCommit: _bc,
+        ...entry
+      }) => ({
+        ...entry,
+        path: scrubText(entry.path),
+        branch: entry.branch !== null ? scrubText(entry.branch) : null,
+        modified_files: entry.modified_files.map((file) => scrubText(file)),
+        ahead_files: entry.ahead_files.map((file) => scrubText(file)),
+      }),
+    ),
     overlaps,
+    ...(mergeConflicts !== undefined ? { merge_conflicts: mergeConflicts } : {}),
   };
 }
 
@@ -546,6 +739,19 @@ export function formatWorktreeStatus(result: WorktreeStatusResult): string {
     }
   } else {
     lines.push("No cross-worktree file overlaps.");
+  }
+  if (result.merge_conflicts !== undefined) {
+    if (result.merge_conflicts.length > 0) {
+      for (const conflict of result.merge_conflicts) {
+        const preview = conflict.conflicts.slice(0, 5).join(", ");
+        const more = conflict.conflict_count > 5 ? `, +${conflict.conflict_count - 5} more` : "";
+        lines.push(
+          `MERGE CONFLICT: ${conflict.source} <-> ${conflict.target} (${conflict.conflict_count}): ${preview}${more}`,
+        );
+      }
+    } else {
+      lines.push("No merge-tree conflicts.");
+    }
   }
   return lines.join("\n");
 }

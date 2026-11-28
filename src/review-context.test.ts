@@ -14,9 +14,15 @@ import { taskReview } from "./fallback.js";
 import { LocalService } from "./local-service.js";
 import {
   boundReviewContextPack,
+  buildReviewContextPackFromSnapshot,
+  clearReviewContextCache,
   collectScopedDiffMeta,
+  collectScopedDiffMetaAsync,
   evaluateScopeDrift,
+  getReviewContextCacheSize,
   matchesScopePattern,
+  REVIEW_DIFF_CACHE_MAX_ENTRIES,
+  snapshotReviewContext,
 } from "./review-context.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -46,6 +52,7 @@ describe("review-context unit and integration tests", () => {
   });
 
   afterEach(async () => {
+    clearReviewContextCache();
     vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
@@ -434,5 +441,245 @@ describe("review-context unit and integration tests", () => {
         deletions: 0,
       },
     ]);
+  });
+
+  it("caches raw git diff by (task_id, head_sha), invalidates on head_sha change, supports compact mode, and bounds LRU size", async () => {
+    clearReviewContextCache();
+    git(root, "init", "-b", "main");
+    git(root, "config", "user.name", "Test User");
+    git(root, "config", "user.email", "test@example.com");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/base.ts"), "export const base = 0;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "init");
+
+    git(root, "checkout", "-b", "feat/cache");
+    for (let i = 0; i < 7; i += 1) {
+      await writeFile(join(root, `src/f${i}.ts`), `export const n${i} = ${i};\n`);
+    }
+    git(root, "add", ".");
+    git(root, "commit", "-m", "add 7 files");
+    const headSha1 = git(root, "rev-parse", "HEAD");
+    const taskId = randomUUID();
+
+    // First call populates (taskId, headSha1) cache entry.
+    const fullMeta = await collectScopedDiffMetaAsync({
+      repoRoot: root,
+      baseBranch: "main",
+      headSha: headSha1,
+      handoffFiles: ["src/f0.ts"],
+      scopeFiles: ["src/f0.ts"],
+      maxFiles: 15,
+      taskId,
+    });
+    expect(getReviewContextCacheSize()).toBe(1);
+    expect(fullMeta.total_files).toBe(7);
+    expect(fullMeta.changed_files).toHaveLength(7);
+
+    // Compact call on same (taskId, headSha1) hits cache (size stays 1) and applies compact file cap.
+    const compactMeta = await collectScopedDiffMetaAsync({
+      repoRoot: root,
+      baseBranch: "main",
+      headSha: headSha1,
+      handoffFiles: ["src/f0.ts"],
+      scopeFiles: ["src/f0.ts"],
+      maxFiles: 5,
+      taskId,
+    });
+    expect(getReviewContextCacheSize()).toBe(1);
+    expect(compactMeta.total_files).toBe(7);
+    expect(compactMeta.changed_files).toHaveLength(5);
+    expect(compactMeta.files_truncated).toBe(true);
+    expect(compactMeta.scope_drift?.drift_detected).toBe(true);
+
+    // Build packs from snapshot in both full and compact modes using cached diff.
+    const baseTask = {
+      id: taskId,
+      epicId: randomUUID(),
+      title: "Cache test",
+      instruction: "Test",
+      status: "NEEDS_REVIEW" as const,
+      dependencies: [],
+      target: "be",
+      role: "backend",
+      persona: "be",
+      position: 0,
+      requiresApproval: true,
+      revision: 0,
+      stale: false,
+      scope_files: ["src/f0.ts"],
+      handoff: {
+        files_modified: ["src/f0.ts"],
+        key_decisions: ["Decision 1"],
+        notes_for_next_agent: "Check",
+        verification_command: "pnpm test",
+        git_branch: "feat/cache",
+        last_commit_hash: headSha1,
+        pull_request: { base_branch: "main", head_sha: headSha1 },
+      },
+    };
+    const baseReview = {
+      ref: { base_branch: "main", head_sha: headSha1 },
+      repo: "be",
+      author: "be",
+      updatedAt: new Date().toISOString(),
+      approvedLocally: false,
+    };
+    const project = {
+      repos: ["be"],
+      epics: [],
+      personas: [],
+      tasks: [baseTask],
+      documents: [],
+      permissions: [],
+      workspace_roots: [],
+      session_prefs: {},
+      platform_setup: [],
+    };
+    const fullPack = await buildReviewContextPackFromSnapshot(
+      snapshotReviewContext({ project, task: baseTask, review: baseReview, compact: false }),
+      root,
+    );
+    const compactPack = await buildReviewContextPackFromSnapshot(
+      snapshotReviewContext({ project, task: baseTask, review: baseReview, compact: true }),
+      root,
+    );
+    expect(getReviewContextCacheSize()).toBe(1);
+    expect(fullPack.diff_meta.changed_files).toHaveLength(7);
+    expect(compactPack.diff_meta.changed_files).toHaveLength(5);
+    expect(compactPack.truncated).toBe(true);
+    expect(compactPack.byte_length).toBeLessThan(fullPack.byte_length);
+
+    // New commit changes headSha -> new cache entry with updated diff.
+    await writeFile(join(root, "src/f7.ts"), "export const n7 = 7;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "add 8th file");
+    const headSha2 = git(root, "rev-parse", "HEAD");
+    const updatedMeta = await collectScopedDiffMetaAsync({
+      repoRoot: root,
+      baseBranch: "main",
+      headSha: headSha2,
+      handoffFiles: ["src/f0.ts"],
+      taskId,
+    });
+    expect(getReviewContextCacheSize()).toBe(2);
+    expect(updatedMeta.total_files).toBe(8);
+
+    // LRU cache never grows past REVIEW_DIFF_CACHE_MAX_ENTRIES.
+    // Batch parallel fill to avoid ~5s sequential git overhead while keeping final evictions deterministic.
+    const batchSize = 16;
+    for (let offset = 0; offset < REVIEW_DIFF_CACHE_MAX_ENTRIES; offset += batchSize) {
+      const count = Math.min(batchSize, REVIEW_DIFF_CACHE_MAX_ENTRIES - offset);
+      await Promise.all(
+        Array.from({ length: count }, () =>
+          collectScopedDiffMetaAsync({
+            repoRoot: root,
+            baseBranch: "main",
+            headSha: headSha2,
+            handoffFiles: ["src/f0.ts"],
+            taskId: randomUUID(),
+          }),
+        ),
+      );
+    }
+    for (let i = 0; i < 5; i += 1) {
+      await collectScopedDiffMetaAsync({
+        repoRoot: root,
+        baseBranch: "main",
+        headSha: headSha2,
+        handoffFiles: ["src/f0.ts"],
+        taskId: randomUUID(),
+      });
+    }
+    expect(getReviewContextCacheSize()).toBe(REVIEW_DIFF_CACHE_MAX_ENTRIES);
+  }, 15_000);
+
+  it("rejects unsafe handoffFiles paths in handoff_only fallback while keeping safe repo-relative paths", () => {
+    const meta = collectScopedDiffMeta({
+      repoRoot: join(root, "missing-repo"),
+      baseBranch: "main",
+      headSha: "not-a-sha",
+      handoffFiles: [
+        "../outside.ts",
+        "src/../../etc/passwd",
+        "./../escape.ts",
+        "/etc/passwd",
+        "\\Windows\\System32\\cmd.exe",
+        "C:\\Users\\secret.txt",
+        "D:/drive/file.ts",
+        "E:relative.ts",
+        "src/null\0byte.ts",
+        "src/ansi\x1b[31m.ts",
+        "src/newline\n.ts",
+        ".",
+        "./",
+        "",
+        "src/safe.ts",
+        "./src/normalized.ts",
+        "src\\win-sep.ts",
+      ],
+      scopeFiles: ["src/**"],
+    });
+
+    expect(meta.source).toBe("handoff_only");
+    expect(meta.changed_files).toEqual([
+      { path: "src/safe.ts", status: "handoff", additions: 0, deletions: 0, in_scope: true },
+      {
+        path: "src/normalized.ts",
+        status: "handoff",
+        additions: 0,
+        deletions: 0,
+        in_scope: true,
+      },
+      { path: "src/win-sep.ts", status: "handoff", additions: 0, deletions: 0, in_scope: true },
+    ]);
+    expect(meta.scope_drift).toEqual({
+      scope_files: ["src/**"],
+      in_scope_files: ["src/safe.ts", "src/normalized.ts", "src/win-sep.ts"],
+      out_of_scope_files: [],
+      untouched_scope_files: [],
+      drift_detected: false,
+    });
+  });
+
+  it("scrubs secrets in diff_meta.base_ref, diff_meta.changed_files paths, and diff_meta.scope_drift entries", async () => {
+    const token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234";
+    git(root, "init", "-b", "main");
+    git(root, "config", "user.name", "Test User");
+    git(root, "config", "user.email", "test@example.com");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, `src/old-${token}.ts`), "export const a = 1;\n");
+    git(root, "add", ".");
+    git(root, "commit", "-m", "root commit");
+    const headSha = git(root, "rev-parse", "HEAD");
+
+    // Nonexistent baseBranch triggers diff-tree fallback where base_ref preserves baseBranch.
+    const meta = collectScopedDiffMeta({
+      repoRoot: root,
+      baseBranch: `base/${token}`,
+      headSha,
+      handoffFiles: [`src/old-${token}.ts`],
+      scopeFiles: [`src/scope-${token}.ts`],
+    });
+
+    expect(meta.source).toBe("git_diff");
+    expect(meta.base_ref).toBe("base/[REDACTED:github_token]");
+    expect(meta.changed_files).toEqual([
+      {
+        path: "src/old-[REDACTED:github_token].ts",
+        status: "added",
+        additions: 1,
+        deletions: 0,
+        in_scope: false,
+      },
+    ]);
+    expect(meta.scope_drift).toEqual({
+      scope_files: ["src/scope-[REDACTED:github_token].ts"],
+      in_scope_files: [],
+      out_of_scope_files: ["src/old-[REDACTED:github_token].ts"],
+      untouched_scope_files: ["src/scope-[REDACTED:github_token].ts"],
+      drift_detected: true,
+    });
+    expect(JSON.stringify(meta)).not.toContain(token);
   });
 });

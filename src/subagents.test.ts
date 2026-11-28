@@ -77,7 +77,7 @@ describe("subagent persona", () => {
     expect(anti).toContain("model: inherit");
     expect(anti).toContain("subagent: true");
     expect(anti).toContain("mainAgent: false");
-    expect(anti).toContain("tools: [read, search, write, edit, terminal]");
+    expect(anti).not.toContain("tools:");
     expect(anti).toContain("Tool capabilities: write/terminal enabled");
 
     const reviewer = {
@@ -92,7 +92,7 @@ describe("subagent persona", () => {
       { stack: ["node"], personas: [adel, reviewer] },
       "antigravity",
     );
-    expect(antiReviewer).toContain("tools: [read, search, verify]");
+    expect(antiReviewer).not.toContain("tools:");
     expect(antiReviewer).toContain("Tool capabilities: read/verify only");
 
     const scribe = {
@@ -107,7 +107,7 @@ describe("subagent persona", () => {
       { stack: ["node"], personas: [adel, reviewer, scribe] },
       "antigravity",
     );
-    expect(antiScribe).toContain("tools: [read, search, verify]");
+    expect(antiScribe).not.toContain("tools:");
     expect(antiScribe).toContain("Tool capabilities: read/verify only");
     expect(antiScribe).toContain("save_document");
 

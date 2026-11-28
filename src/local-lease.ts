@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { LOCK_LEASE_MS, nextStatus, type TaskEvent } from "@catenext/shared";
 import { LocalServiceError } from "./errors.js";
 import type { LocalTask } from "./local-state.js";
@@ -8,7 +8,18 @@ function fail(code: string, message: string, details?: unknown): never {
 }
 
 export function leaseEnd(now: number): string {
-  return new Date(now + LOCK_LEASE_MS).toISOString();
+  if (!Number.isFinite(now)) {
+    fail("invalid_timestamp", "Timestamp lease tidak valid.");
+  }
+  const end = now + LOCK_LEASE_MS;
+  if (!Number.isFinite(end)) {
+    fail("invalid_timestamp", "Timestamp lease tidak valid.");
+  }
+  const date = new Date(end);
+  if (Number.isNaN(date.getTime())) {
+    fail("invalid_timestamp", "Timestamp lease tidak valid.");
+  }
+  return date.toISOString();
 }
 
 /** State menyimpan hash token, bukan token yang bisa dipakai ulang oleh pembaca state. */
@@ -21,9 +32,12 @@ export function leaseKey(token: string): string {
  * State lama yang masih plaintext: cocokkan kesamaan langsung (bukan hash yang disalin dari state).
  */
 export function leaseMatches(stored: string, presented: string | undefined): boolean {
-  if (presented === undefined) return false;
-  if (stored.startsWith("sha256.")) return stored === leaseKey(presented);
-  return stored === presented;
+  if (stored.length === 0 || presented === undefined || presented.length === 0) return false;
+  const candidate = stored.startsWith("sha256.") ? leaseKey(presented) : presented;
+  const storedBuf = Buffer.from(stored, "utf8");
+  const candidateBuf = Buffer.from(candidate, "utf8");
+  if (storedBuf.length !== candidateBuf.length) return false;
+  return timingSafeEqual(storedBuf, candidateBuf);
 }
 
 export function claimable(task: LocalTask): boolean {

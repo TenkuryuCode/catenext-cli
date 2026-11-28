@@ -7,8 +7,112 @@ export const BRIEF_LIMITS = {
   title: 120,
   line: 160,
   sessionLines: 24,
+  hints: 6,
   instructionPreview: 240,
 } as const;
+
+export interface ScopeOverlapCandidate {
+  id: string;
+  target_repo?: string | null;
+  dependencies?: readonly string[];
+  scope_files?: readonly string[];
+}
+
+export interface ScopeFileOverlap {
+  path: string;
+  task_ids: string[];
+}
+
+function normalizeScopePath(p: string): string {
+  return p.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+function isGlobPattern(p: string): boolean {
+  return p.includes("*") || p.includes("?");
+}
+
+function scopeGlobToRegExp(globPattern: string): RegExp {
+  let regex = "^";
+  for (let i = 0; i < globPattern.length; i += 1) {
+    const ch = globPattern[i] ?? "";
+    if (ch === "*") {
+      if (globPattern[i + 1] === "*") {
+        if (globPattern[i + 2] === "/") {
+          regex += "(?:.+/)?";
+          i += 2;
+        } else {
+          regex += ".*";
+          i += 1;
+        }
+      } else {
+        regex += "[^/]*";
+      }
+    } else if (ch === "?") {
+      regex += "[^/]";
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      regex += `\\${ch}`;
+    } else {
+      regex += ch;
+    }
+  }
+  regex += "$";
+  return new RegExp(regex);
+}
+
+function overlappingScopeKey(aRaw: string, bRaw: string): string | null {
+  const a = normalizeScopePath(aRaw);
+  const b = normalizeScopePath(bRaw);
+  if (!a || !b) return null;
+  if (a === b) return a;
+  const aGlob = isGlobPattern(a);
+  const bGlob = isGlobPattern(b);
+  if (!aGlob && !bGlob) {
+    if (a.startsWith(`${b}/`)) return a;
+    if (b.startsWith(`${a}/`)) return b;
+    return null;
+  }
+  if (aGlob && !bGlob) {
+    return scopeGlobToRegExp(a).test(b) ? b : null;
+  }
+  if (bGlob && !aGlob) {
+    return scopeGlobToRegExp(b).test(a) ? a : null;
+  }
+  return null;
+}
+
+/** Find overlapping `scope_files` across independent parallel tasks in the same repo. */
+export function findScopeFileOverlaps(tasks: readonly ScopeOverlapCandidate[]): ScopeFileOverlap[] {
+  const scoped = tasks.filter((t) => t.scope_files && t.scope_files.length > 0);
+  if (scoped.length < 2) return [];
+
+  const overlaps = new Map<string, Set<string>>();
+  for (const [i, a] of scoped.entries()) {
+    for (const b of scoped.slice(i + 1)) {
+      if (a.id === b.id) continue;
+      if (a.target_repo && b.target_repo && a.target_repo !== b.target_repo) continue;
+      if (a.dependencies?.includes(b.id) || b.dependencies?.includes(a.id)) continue;
+
+      for (const entryA of a.scope_files ?? []) {
+        for (const entryB of b.scope_files ?? []) {
+          const key = overlappingScopeKey(entryA, entryB);
+          if (!key) continue;
+          let set = overlaps.get(key);
+          if (!set) {
+            set = new Set();
+            overlaps.set(key, set);
+          }
+          set.add(a.id);
+          set.add(b.id);
+        }
+      }
+    }
+  }
+
+  return [...overlaps.entries()]
+    .filter(([, ids]) => ids.size >= 2)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([path, ids]) => ({ path, task_ids: [...ids] }));
+}
 
 export function briefText(text: string, max: number = BRIEF_LIMITS.line): string {
   const one = text.replace(/\s+/g, " ").trim();
@@ -89,7 +193,7 @@ export const SessionBriefOutput = z.object({
   /** Session locale preference from session_prefs (when configured). */
   locale: z.string().optional(),
   /** Optional concise next-step hints for the orchestrator. */
-  hints: z.array(z.string().max(BRIEF_LIMITS.line)).max(6).optional(),
+  hints: z.array(z.string().max(BRIEF_LIMITS.line)).max(BRIEF_LIMITS.hints).optional(),
 });
 
 export const ManageRootsInput = z.object({

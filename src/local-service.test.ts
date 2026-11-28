@@ -2430,4 +2430,55 @@ describe("LocalService code graph tools", () => {
       ),
     ).toBeGreaterThan(4096);
   });
+
+  it("surfaces parallel active/ready scope_files overlap warnings in session_brief hints within cap", async () => {
+    await service.callTool("upsert_persona", {
+      alias: "be",
+      role: "backend",
+      repos: ["be", "fe"],
+    });
+    const { id } = await draft([
+      plan("t1", { persona: "be", target_repo: "be", scope_files: ["apps/api/src/routes.ts"] }),
+      plan("t2", {
+        persona: "be",
+        target_repo: "be",
+        scope_files: ["./apps/api/src/routes.ts", "apps/api/src/db.ts"],
+      }),
+      plan("t3", {
+        persona: "be",
+        target_repo: "be",
+        depends_on: ["t1"],
+        scope_files: ["apps/api/src/routes.ts", "apps/api/src/only-seq.ts"],
+      }),
+      plan("t4", {
+        persona: "be",
+        target_repo: "fe",
+        scope_files: ["apps/api/src/routes.ts"],
+      }),
+      plan("t5", {
+        persona: "be",
+        target_repo: "be",
+        scope_files: ["apps/api/src/*.ts"],
+      }),
+    ]);
+
+    for (const ref of ["t1", "t2", "t3", "t4", "t5"]) {
+      await manage("approve_plan", id(ref));
+    }
+
+    // Claim t1 so it is active IN_PROGRESS while t2, t4, t5 are parallel ready (t3 depends on t1).
+    await service.callTool("claim_task", { task_id: id("t1"), agent_alias: "be" });
+
+    const brief = await service.callTool("session_brief", {});
+    expect(brief.hints).toBeDefined();
+    expect(brief.hints?.length).toBeLessThanOrEqual(6);
+    for (const h of brief.hints ?? []) {
+      expect(h.length).toBeLessThanOrEqual(160);
+    }
+    const overlapHint = brief.hints?.find((h) => h.includes("Parallel scope_files overlap"));
+    expect(overlapHint).toBeDefined();
+    expect(overlapHint).toContain("apps/api/src/routes.ts");
+    expect(overlapHint).toContain("apps/api/src/db.ts");
+    expect(overlapHint).not.toContain("apps/api/src/only-seq.ts");
+  });
 });

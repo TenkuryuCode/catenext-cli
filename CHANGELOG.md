@@ -9,6 +9,26 @@ bagian itu diganti judul versi + tanggal (`## [X.Y.Z] - YYYY-MM-DD`), dan workfl
 menolak tag yang versinya belum ada di file ini. Entri versi tidak berarti paket sudah terbit di npm.
 Lihat [docs/STATUS.md](docs/STATUS.md) untuk status publikasi.
 
+## [0.19.0] - 2026-11-28
+
+### Ditambahkan
+- **MCP vNext (`apps/cli/src/mcp/`):**
+  - Menambahkan `--role reviewer` (**11** tool read-only/review) pada `catenext mcp`.
+  - Menambahkan tool MCP `worktree_status` (inspeksi dirty/ahead/overlap worktree & lease secara read-only, plus dry-run konflik `git merge-tree --write-tree`) dan `epic_run` berbatas (`preview`, `resume`, `pause`, `close`; `start` wajib lewat CLI).
+  - Menambahkan `resources/subscribe` dengan notifikasi `notifications/resources/updated`, serta `logging/setLevel` dengan notifikasi `notifications/message`.
+- **Peringatan overlap di `session_brief`:** mendeteksi tabrakan `scope_files` dan worktree secara lock-free di `hints`.
+- **Micro-reindex graf & pemetaan test scope:** menambahkan `microReindexModifiedFiles` (`<= 10` berkas) untuk `--summary`/`--impact` dan `mapScopeFilesToTests` untuk mengisi `ClaimContextPack.test_files` dalam batas `4096 B`.
+- **Gate regresi & benchmark CI (`apps/cli/src/mcp/context-benchmark.test.ts`):** menegaskan anggaran latensi warm-cache `< 15 ms` p50, lock-free `enrichReviewResult`, micro-reindex, batas byte `ClaimContextPack`, dan batas ukuran bundle CLI (`< 1 MB`).
+
+### Diubah
+- **RBAC & katalog MCP:** memperketat `--role worker` menjadi **14** tool (tanpa `save_repo_skill`); total katalog kini **31** tool default (**35** dengan `--allow-crud`).
+- **`get_project_board` kompak:** mendukung mode ringkas dan terfilter untuk menghemat token respons.
+- **`buildReviewContextPack` bebas kunci writer SQLite + cache LRU:** memindahkan pengambilan diff git & pengayaan pack (`enrichReviewResult`) ke luar transaksi writer SQLite dengan cache LRU 64 entri berbasis `(task_id, head_sha)` (p50 klaim review `3.31 ms` dari baseline `118.99 ms`).
+
+### Diperbaiki
+- **Hardening subprocess git, batas `realRoot`, dan scrubber:** membersihkan seluruh env `GIT_*`, menerapkan `--end-of-options` / `--` / `--no-ext-diff` / `--no-textconv`, menyaring path `handoffFiles` tidak aman pada fallback `handoff_only`, dan memperluas `scrubText` ke output diff, worktree, overlap, dan review.
+- **Stabilitas tes LRU `review-context.test.ts`:** memparalelkan pengisian cache per batch agar tidak timeout 5000 ms saat eksekusi paralel penuh.
+
 ## [0.18.0] - 2026-11-28
 
 ### Ditambahkan
